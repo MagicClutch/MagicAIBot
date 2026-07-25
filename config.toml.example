@@ -2,3 +2,17 @@
 server = "127.0.0.1:25565"
 username = "MagicBot"
 account_mode = "offline"
+
+[reconnect]
+enabled = false
+delay_seconds = 10
+maximum_attempts = 5
+
+[console]
+enabled = true
+send_plain_input_to_chat = true
+show_system_messages = true
+show_action_bar_messages = false
+
+[logging]
+level = "info"

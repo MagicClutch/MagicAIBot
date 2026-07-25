@@ -1,6 +1,17 @@
 [package]
-name = "MagicAIBot"
+name = "magic_ai_bot"
 version = "0.1.0"
 edition = "2024"
 
 [dependencies]
+anyhow = "1"
+azalea = { git = "https://github.com/azalea-rs/azalea", default-features = false, features = ["serde", "packet-event", "online-mode"] }
+dotenvy = "0.15"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "2"
+tokio = { version = "1", features = ["io-std", "io-util", "macros", "rt", "signal", "time"] }
+tokio-util = { version = "0.7", features = ["rt"] }
+toml = "0.8"
+tracing = "0.1"
+tracing-subscriber = "0.3"
