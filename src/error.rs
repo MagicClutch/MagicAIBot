@@ -10,6 +10,28 @@ pub enum AppError {
     InvalidLogLevel(String),
     #[error("invalid configuration: {0}")]
     InvalidConfiguration(String),
+    #[error("invalid world-state configuration: {0}")]
+    InvalidWorldStateConfiguration(String),
+    #[error("world state is unavailable")]
+    WorldStateUnavailable,
+    #[error("inventory is unavailable")]
+    InventoryUnavailable,
+    #[error("invalid entity query: {0}")]
+    InvalidEntityQuery(String),
+    #[error("world-state update failed: {0}")]
+    WorldStateUpdateFailure(String),
+    #[error("invalid movement configuration: {0}")]
+    InvalidMovementConfiguration(String),
+    #[error("invalid coordinates: {0}")]
+    InvalidCoordinates(String),
+    #[error("unknown player: {0}")]
+    UnknownPlayer(String),
+    #[error("movement is unavailable while disconnected")]
+    MovementUnavailable,
+    #[error("pathfinding failed: {0}")]
+    PathfindingFailure(String),
+    #[error("movement was cancelled")]
+    MovementCancelled,
     #[error("authentication failed: {0}")]
     AuthenticationFailure(String),
     #[error("network timeout after {seconds} seconds")]

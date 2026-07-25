@@ -16,3 +16,14 @@ show_action_bar_messages = false
 
 [logging]
 level = "info"
+debug = false
+
+[world_state]
+nearby_entity_radius = 64
+maximum_tracked_entities = 256
+stale_entity_seconds = 30
+
+[movement]
+follow_distance = 3.0
+repath_interval_ms = 500
+arrival_distance = 1.5

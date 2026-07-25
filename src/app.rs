@@ -1,8 +1,7 @@
-use std::{path::Path, time::Instant};
-
-use tokio::{sync::mpsc, task::JoinHandle};
-use tokio_util::sync::CancellationToken;
-use tracing::info;
+use std::{
+    path::Path,
+    time::{Duration, Instant},
+};
 
 use crate::{
     config::Config,
@@ -11,14 +10,19 @@ use crate::{
         commands::{ConsoleCommand, ConsoleInput, plain_chat_message},
     },
     error::AppError,
+    logging,
     minecraft::client::MinecraftClient,
+    movement::MovementService,
 };
+use tokio::{sync::mpsc, task::JoinHandle};
+use tokio_util::sync::CancellationToken;
 
 /// Application composition root. Future services will be owned by this type.
 pub struct App {
     config: Config,
     shutdown: CancellationToken,
     minecraft: MinecraftClient,
+    movement: MovementService,
     started_at: Instant,
 }
 
@@ -30,20 +34,15 @@ impl App {
         println!("Loading configuration...\n");
         let config = Config::load(Path::new("config.toml"))?;
         crate::config::init_logging(&config.logging)?;
-        info!(
-            server = %config.minecraft.server,
-            username = %config.minecraft.username,
-            account_mode = ?config.minecraft.account_mode,
-            "configuration loaded"
-        );
-        info!("application startup");
 
         Ok(Self {
             minecraft: MinecraftClient::new(
                 config.minecraft.clone(),
                 config.reconnect.clone(),
                 config.console.clone(),
+                config.world_state.clone(),
             ),
+            movement: MovementService::new(config.movement.clone()),
             config,
             shutdown: CancellationToken::new(),
             started_at: Instant::now(),
@@ -52,12 +51,18 @@ impl App {
 
     /// Waits for Ctrl+C and performs the application's graceful shutdown.
     pub async fn run(mut self) -> Result<(), AppError> {
-        println!("Connecting...\n");
-        self.minecraft.connect().await?;
-        println!("Connected!\n");
-        println!("Joined world successfully.\n");
+        logging::info(format!("Connecting to {}", self.config.minecraft.server));
+        if let Err(error) = self.minecraft.connect().await {
+            logging::warning(format!("Connection failed ({error})"));
+            return Err(error);
+        }
+        logging::info("Connected");
+        logging::info("Joined world");
 
         let (input_tx, mut input_rx) = mpsc::channel(32);
+        let mut movement_tick = tokio::time::interval(Duration::from_millis(
+            self.config.movement.repath_interval_ms,
+        ));
         let console_task = self.config.console.enabled.then(|| {
             tokio::task::spawn_local(console::read_input(input_tx, self.shutdown.child_token()))
         });
@@ -68,6 +73,7 @@ impl App {
                     result?;
                     break Ok(());
                 }
+                _ = movement_tick.tick() => self.movement.tick(&self.minecraft).await,
                 input = input_rx.recv() => match input {
                     Some(Ok(ConsoleInput::Empty)) => {}
                     Some(Ok(input)) => {
@@ -82,11 +88,11 @@ impl App {
         };
 
         self.shutdown.cancel();
+        let _ = self.movement.stop(&self.minecraft).await;
         self.minecraft.disconnect().await?;
         if let Some(task) = console_task {
             await_console_task(task).await;
         }
-        info!(server = %self.config.minecraft.server, "application shutdown");
         loop_result
     }
 
@@ -112,7 +118,36 @@ impl App {
                         println!("Chat error: {error}");
                     }
                 }
-                ConsoleCommand::Players => println!("Player tracking is not available yet."),
+                ConsoleCommand::Players => self.print_players().await,
+                ConsoleCommand::Inventory => self.print_inventory().await,
+                ConsoleCommand::Entities { radius } => self.print_entities(radius).await,
+                ConsoleCommand::Goto { x, y, z } => {
+                    if let Err(error) = self
+                        .movement
+                        .goto(
+                            &self.minecraft,
+                            crate::minecraft::world_state::PositionSnapshot {
+                                x: f64::from(x),
+                                y: f64::from(y),
+                                z: f64::from(z),
+                            },
+                        )
+                        .await
+                    {
+                        println!("Movement error: {error}");
+                    }
+                }
+                ConsoleCommand::Stop => {
+                    if let Err(error) = self.movement.stop(&self.minecraft).await {
+                        println!("Movement error: {error}");
+                    }
+                }
+                ConsoleCommand::Follow { player } => {
+                    if let Err(error) = self.movement.follow(&self.minecraft, &player).await {
+                        println!("Movement error: {error}");
+                    }
+                }
+                ConsoleCommand::Movement => self.print_movement().await,
                 ConsoleCommand::Reconnect => match self.minecraft.reconnect().await {
                     Ok(()) => println!("Reconnect successful."),
                     Err(error) => println!("Reconnect failed: {error}"),
@@ -131,8 +166,70 @@ impl App {
         println!("Bot username: {}", status.username);
         println!("Server address: {}", status.server);
         println!("Account mode: {}", status.account_mode);
-        println!("Joined world: {}", world.joined_world);
-        println!("Current position: not available");
+        println!("Joined world: {}", world.joined_world());
+        println!(
+            "Position: {}",
+            world.bot.position.map_or_else(
+                || "unknown".into(),
+                |p| format!("{:.2} {:.2} {:.2}", p.x, p.y, p.z)
+            )
+        );
+        println!(
+            "Block position: {}",
+            world
+                .bot
+                .block_position
+                .map_or_else(|| "unknown".into(), |p| format!("{} {} {}", p.x, p.y, p.z))
+        );
+        println!(
+            "Yaw/Pitch: {}/{}",
+            fmt_opt(world.bot.yaw),
+            fmt_opt(world.bot.pitch)
+        );
+        println!(
+            "Dimension: {}",
+            world.bot.dimension.as_deref().unwrap_or("unknown")
+        );
+        println!(
+            "Health: {}/{}",
+            fmt_opt(world.bot.health),
+            fmt_opt(world.bot.maximum_health)
+        );
+        println!(
+            "Food: {}",
+            world
+                .bot
+                .food_level
+                .map_or_else(|| "unknown".into(), |v| v.to_string())
+        );
+        println!(
+            "Selected hotbar slot: {}",
+            world
+                .bot
+                .selected_hotbar_slot
+                .map_or_else(|| "unknown".into(), |v| v.to_string())
+        );
+        println!(
+            "Inventory item count: {}",
+            world.inventory.total_counts.len()
+        );
+        println!("Nearby players: {}", world.players.len());
+        println!("Nearby entities: {}", world.entities.len());
+        println!(
+            "Current task: {}",
+            world
+                .current_task
+                .as_ref()
+                .map_or("none", |t| t.name.as_str())
+        );
+        println!(
+            "Time since last state update: {} seconds",
+            world
+                .last_updated_at
+                .elapsed()
+                .unwrap_or_default()
+                .as_secs()
+        );
         println!("Reconnect enabled: {}", status.reconnect.enabled);
         println!(
             "Reconnect delay: {} seconds",
@@ -147,6 +244,127 @@ impl App {
             self.started_at.elapsed().as_secs()
         );
     }
+
+    async fn print_players(&self) {
+        let world = self.minecraft.world_state_snapshot().await;
+        if world.players.is_empty() {
+            println!("No known players.");
+            return;
+        }
+        for player in world.players {
+            let distance = player
+                .distance
+                .map_or_else(|| "unknown".into(), |d| format!("{d:.1}"));
+            let position = player.position.map_or_else(
+                || "unknown".into(),
+                |p| format!("{:.1} {:.1} {:.1}", p.x, p.y, p.z),
+            );
+            println!(
+                "{} | {} | {} | {} | {}",
+                player.username, player.uuid, distance, position, player.loaded
+            );
+        }
+    }
+
+    async fn print_inventory(&self) {
+        let world = self.minecraft.world_state_snapshot().await;
+        println!(
+            "Selected slot: {}",
+            world
+                .inventory
+                .selected_hotbar_slot
+                .map_or_else(|| "unknown".into(), |v| v.to_string())
+        );
+        println!(
+            "Selected item: {}",
+            world.inventory.selected_item().map_or_else(
+                || "unknown".into(),
+                |i| format!("{} x{}", i.item_id.as_deref().unwrap_or("unknown"), i.count)
+            )
+        );
+        println!(
+            "Used slots: {}",
+            world
+                .inventory
+                .slots
+                .iter()
+                .filter(|s| s.item_id.is_some())
+                .count()
+        );
+        println!("Total item stacks: {}", world.inventory.total_counts.len());
+        let mut items: Vec<_> = world.inventory.total_counts.iter().collect();
+        items.sort_by_key(|(id, _)| *id);
+        for (id, count) in items {
+            println!("{id} x{count}");
+        }
+    }
+    async fn print_entities(&self, radius: Option<u32>) {
+        let world = self.minecraft.world_state_snapshot().await;
+        let radius = f64::from(radius.unwrap_or(64));
+        if !(radius > 0.0 && radius <= 256.0) {
+            println!("Entity query error: radius must be between 0 and 256");
+            return;
+        }
+        for entity in world
+            .entities
+            .iter()
+            .filter(|e| e.alive != Some(false) && e.health.is_none_or(|health| health > 0.0))
+            .filter(|e| e.distance <= radius)
+            .take(64)
+        {
+            println!(
+                "{} | distance {:.1} | {:.2} {:.2} {:.2}",
+                entity.entity_type,
+                entity.distance,
+                entity.position.x,
+                entity.position.y,
+                entity.position.z
+            );
+        }
+    }
+
+    async fn print_movement(&self) {
+        let world = self.minecraft.world_state_snapshot().await;
+        let movement = world.movement;
+        println!("Movement state: {:?}", movement.status);
+        println!(
+            "Destination: {}",
+            movement.destination.map_or_else(
+                || "unknown".into(),
+                |p| format!("{:.2} {:.2} {:.2}", p.x, p.y, p.z)
+            )
+        );
+        println!(
+            "Current position: {}",
+            world.bot.position.map_or_else(
+                || "unknown".into(),
+                |p| format!("{:.2} {:.2} {:.2}", p.x, p.y, p.z)
+            )
+        );
+        println!(
+            "Remaining distance: {}",
+            movement
+                .estimated_distance
+                .map_or_else(|| "unknown".into(), |d| format!("{d:.2}"))
+        );
+        println!(
+            "Target player: {}",
+            movement.target_player.as_deref().unwrap_or("none")
+        );
+        println!(
+            "Elapsed time: {} seconds",
+            movement
+                .started_at
+                .map_or(0, |at| at.elapsed().unwrap_or_default().as_secs())
+        );
+        if let Some(reason) = movement.failure_reason {
+            println!("Failure reason: {reason}");
+        }
+    }
+}
+
+fn fmt_opt<T: std::fmt::Display>(value: Option<T>) -> String {
+    value.map_or_else(|| "unknown".into(), |v| v.to_string())
 }
 
 fn print_help() {
@@ -154,6 +372,12 @@ fn print_help() {
     println!("/status     Show connection and application status");
     println!("/chat TEXT  Send TEXT to Minecraft chat");
     println!("/players    Show known online players");
+    println!("/inventory  Show inventory summary");
+    println!("/entities [RADIUS]  Show nearby entities");
+    println!("/goto X Y Z  Walk to coordinates");
+    println!("/stop       Stop movement immediately");
+    println!("/follow NAME Follow a player");
+    println!("/movement   Show movement status");
     println!("/reconnect  Reconnect to the configured server");
     println!("/quit       Shut down the application");
 }

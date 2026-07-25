@@ -1,6 +1,9 @@
 //! Parsing for local terminal input. Execution belongs to the application layer.
 
-use crate::error::AppError;
+use crate::{
+    error::AppError,
+    movement::commands::{parse_coordinates, parse_follow_name},
+};
 
 #[derive(Debug, Eq, PartialEq)]
 pub enum ConsoleCommand {
@@ -8,6 +11,12 @@ pub enum ConsoleCommand {
     Status,
     Chat { message: String },
     Players,
+    Inventory,
+    Entities { radius: Option<u32> },
+    Goto { x: i32, y: i32, z: i32 },
+    Stop,
+    Follow { player: String },
+    Movement,
     Reconnect,
     Quit,
 }
@@ -47,6 +56,37 @@ pub fn parse_input(input: &str) -> Result<ConsoleInput, AppError> {
         "help" => no_arguments(command, arguments, ConsoleCommand::Help)?,
         "status" => no_arguments(command, arguments, ConsoleCommand::Status)?,
         "players" => no_arguments(command, arguments, ConsoleCommand::Players)?,
+        "inventory" => no_arguments(command, arguments, ConsoleCommand::Inventory)?,
+        "entities" => {
+            let radius = if arguments.is_empty() {
+                None
+            } else {
+                Some(arguments.parse().map_err(|_| {
+                    AppError::InvalidEntityQuery(
+                        "radius must be a positive integer no greater than 256".into(),
+                    )
+                })?)
+            };
+            if radius.is_some_and(|value: u32| value == 0 || value > 256) {
+                return Err(AppError::InvalidEntityQuery(
+                    "radius must be between 1 and 256".into(),
+                ));
+            }
+            ConsoleCommand::Entities { radius }
+        }
+        "goto" => {
+            let destination = parse_coordinates(arguments)?;
+            ConsoleCommand::Goto {
+                x: destination.x as i32,
+                y: destination.y as i32,
+                z: destination.z as i32,
+            }
+        }
+        "stop" => no_arguments(command, arguments, ConsoleCommand::Stop)?,
+        "follow" => ConsoleCommand::Follow {
+            player: parse_follow_name(arguments)?,
+        },
+        "movement" => no_arguments(command, arguments, ConsoleCommand::Movement)?,
         "reconnect" => no_arguments(command, arguments, ConsoleCommand::Reconnect)?,
         "quit" => no_arguments(command, arguments, ConsoleCommand::Quit)?,
         "chat" => {

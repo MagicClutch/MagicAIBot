@@ -3,12 +3,28 @@
 //! Azalea types are deliberately kept in this module. Callers observe only
 //! our connection state and application errors.
 
-use std::{path::PathBuf, sync::Arc, time::Duration};
+use std::{
+    collections::HashSet,
+    path::PathBuf,
+    sync::Arc,
+    time::{Duration, SystemTime},
+};
 
 use azalea::{
     Client, Event,
     account::{Account, microsoft::MicrosoftAccountOpts},
     auto_reconnect::AutoReconnectDelay,
+    core::entity_id::MinecraftEntityId,
+    entity::{
+        Dead, EntityKindComponent, EntityUuid, LocalEntity, LookDirection, Physics, Position,
+        inventory::Inventory, metadata::Health,
+    },
+    pathfinder::{
+        PathfinderClientExt, PathfinderOpts,
+        goals::{BlockPosGoal, RadiusGoal},
+    },
+    player::GameProfileComponent,
+    world::WorldName,
 };
 use tokio::{
     sync::{Mutex, watch},
@@ -16,14 +32,18 @@ use tokio::{
     time::{sleep, timeout},
 };
 use tokio_util::sync::CancellationToken;
-use tracing::{error, info, warn};
+use tracing::debug;
 
 use crate::{
-    config::{AccountMode, ConsoleConfig, MinecraftConfig, ReconnectConfig},
+    config::{AccountMode, ConsoleConfig, MinecraftConfig, ReconnectConfig, WorldStateConfig},
     error::AppError,
+    logging,
     minecraft::{
         events::handle_chat,
-        world_state::{WorldState, WorldStateSnapshot},
+        world_state::{
+            InventorySlot, InventorySnapshot, MovementSnapshot, PlayerSnapshot, PositionSnapshot,
+            WorldConnectionState, WorldState, WorldStateSnapshot,
+        },
     },
 };
 
@@ -68,6 +88,13 @@ pub struct MinecraftStatus {
     pub reconnect: ReconnectConfig,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct NavigationStatus {
+    pub calculating: bool,
+    pub executing: bool,
+    pub reached: bool,
+}
+
 struct SupervisorContext {
     minecraft: MinecraftConfig,
     reconnect: ReconnectConfig,
@@ -83,8 +110,23 @@ impl MinecraftClient {
         minecraft: MinecraftConfig,
         reconnect: ReconnectConfig,
         console: ConsoleConfig,
+        world_config: WorldStateConfig,
     ) -> Self {
         let (state_tx, state) = watch::channel(ConnectionState::Disconnected);
+        let mut world = WorldState::with_limits(
+            world_config.nearby_entity_radius,
+            world_config.maximum_tracked_entities,
+            world_config.stale_entity_seconds,
+        )
+        .expect("validated world-state configuration");
+        world.set_connection_info(
+            minecraft.server.clone(),
+            minecraft.username.clone(),
+            match minecraft.account_mode {
+                AccountMode::Offline => "offline".into(),
+                AccountMode::Microsoft => "microsoft".into(),
+            },
+        );
         Self {
             minecraft,
             reconnect,
@@ -92,7 +134,7 @@ impl MinecraftClient {
             state,
             state_tx,
             current_client: Arc::new(Mutex::new(None)),
-            world_state: Arc::new(Mutex::new(WorldState::default())),
+            world_state: Arc::new(Mutex::new(world)),
             shutdown: CancellationToken::new(),
             supervisor: None,
         }
@@ -107,7 +149,6 @@ impl MinecraftClient {
         }
 
         self.set_state(ConnectionState::Connecting);
-        info!(server = %self.minecraft.server, "connecting");
 
         let (client, events) = self.join_once().await?;
         self.disable_azalea_reconnect(&client);
@@ -157,6 +198,10 @@ impl MinecraftClient {
 
     /// Disconnects the current Azalea client and stops supervision.
     pub async fn disconnect(&mut self) -> Result<(), AppError> {
+        self.world_state
+            .lock()
+            .await
+            .set_connection(WorldConnectionState::ShuttingDown);
         self.shutdown.cancel();
         if let Some(client) = self.current_client.lock().await.take() {
             client.disconnect();
@@ -164,9 +209,12 @@ impl MinecraftClient {
         if let Some(supervisor) = self.supervisor.take() {
             let _ = supervisor.await;
         }
-        self.world_state.lock().await.set_joined_world(false);
+        let mut world = self.world_state.lock().await;
+        world.set_joined_world(false);
+        world.set_connection(WorldConnectionState::Disconnected);
+        world.clear_inventory();
         self.set_state(ConnectionState::Disconnected);
-        info!("disconnected");
+        logging::info("Disconnected");
         Ok(())
     }
 
@@ -217,13 +265,78 @@ impl MinecraftClient {
             return Err(AppError::DuplicateChatSend);
         }
         client.chat(message.to_owned());
-        info!(character_count = length, "chat message sent");
+        logging::chat_outgoing(&self.minecraft.username, message);
         Ok(())
     }
 
     #[must_use]
     pub async fn world_state_snapshot(&self) -> WorldStateSnapshot {
         self.world_state.lock().await.snapshot()
+    }
+
+    pub async fn set_movement_snapshot(&self, movement: MovementSnapshot) {
+        self.world_state.lock().await.set_movement(movement);
+    }
+
+    pub async fn start_navigation_to(
+        &self,
+        destination: PositionSnapshot,
+        follow_distance: Option<f64>,
+    ) -> Result<(), AppError> {
+        if self.connection_state() != ConnectionState::Connected {
+            return Err(AppError::MovementUnavailable);
+        }
+        let client = self
+            .current_client
+            .lock()
+            .await
+            .clone()
+            .ok_or(AppError::MovementUnavailable)?;
+        if let Some(distance) = follow_distance {
+            client.start_goto_with_opts(
+                RadiusGoal::new(
+                    azalea::Vec3::new(destination.x, destination.y, destination.z),
+                    distance as f32,
+                ),
+                PathfinderOpts::new()
+                    .allow_mining(false)
+                    .retry_on_no_path(false),
+            );
+        } else {
+            let block = destination.block();
+            client.start_goto_with_opts(
+                BlockPosGoal(azalea::BlockPos::new(block.x, block.y, block.z)),
+                PathfinderOpts::new()
+                    .allow_mining(false)
+                    .retry_on_no_path(false),
+            );
+        }
+        Ok(())
+    }
+
+    pub async fn stop_navigation(&self) -> Result<(), AppError> {
+        let client = self
+            .current_client
+            .lock()
+            .await
+            .clone()
+            .ok_or(AppError::MovementUnavailable)?;
+        client.force_stop_pathfinding();
+        Ok(())
+    }
+
+    pub async fn navigation_status(&self) -> Result<NavigationStatus, AppError> {
+        let client = self
+            .current_client
+            .lock()
+            .await
+            .clone()
+            .ok_or(AppError::MovementUnavailable)?;
+        Ok(NavigationStatus {
+            calculating: client.is_calculating_path(),
+            executing: client.is_executing_path(),
+            reached: client.is_goto_target_reached(),
+        })
     }
 
     #[must_use]
@@ -262,7 +375,7 @@ impl MinecraftClient {
             AccountMode::Offline => Ok(Account::offline(&self.minecraft.username)),
             AccountMode::Microsoft => {
                 self.set_state(ConnectionState::Authenticating);
-                info!(username = %self.minecraft.username, "authenticating");
+                debug!(username = %self.minecraft.username, "authenticating");
                 let cache_file = auth_cache_file()?;
                 tokio::fs::create_dir_all(cache_file.parent().ok_or_else(|| {
                     AppError::InvalidConfiguration("invalid auth cache path".to_owned())
@@ -290,6 +403,16 @@ impl MinecraftClient {
 
     fn set_state(&self, state: ConnectionState) {
         let _ = self.state_tx.send(state);
+        if let Ok(mut world) = self.world_state.try_lock() {
+            world.set_connection(match state {
+                ConnectionState::Disconnected => WorldConnectionState::Disconnected,
+                ConnectionState::Connecting => WorldConnectionState::Connecting,
+                ConnectionState::Authenticating => WorldConnectionState::Authenticating,
+                ConnectionState::JoiningWorld => WorldConnectionState::JoiningWorld,
+                ConnectionState::Connected => WorldConnectionState::Connected,
+                ConnectionState::Reconnecting => WorldConnectionState::Reconnecting,
+            });
+        }
     }
 }
 
@@ -307,8 +430,15 @@ async fn supervise(
         shutdown,
     } = context;
     loop {
-        let outcome =
-            wait_for_disconnect(&mut events, &state_tx, &shutdown, &world_state, &console).await;
+        let outcome = wait_for_disconnect(
+            &mut events,
+            &state_tx,
+            &shutdown,
+            &world_state,
+            &console,
+            &current_client,
+        )
+        .await;
         if shutdown.is_cancelled() {
             return;
         }
@@ -318,16 +448,26 @@ async fn supervise(
             return;
         };
         let _ = state_tx.send(ConnectionState::Disconnected);
-        world_state.lock().await.set_joined_world(false);
+        {
+            let mut world = world_state.lock().await;
+            world.set_connection(WorldConnectionState::Disconnected);
+            world.set_joined_world(false);
+            match &reason {
+                DisconnectReason::Kicked(message) => world.set_disconnect_reason(message.clone()),
+                DisconnectReason::ConnectionFailure(message) => {
+                    world.set_connection_error(message.clone())
+                }
+            }
+        }
+        logging::info("Disconnected");
         match &reason {
             DisconnectReason::Kicked(reason) => {
-                info!(reason, "disconnected");
                 let kick_error = AppError::KickedByServer(reason.clone());
-                warn!(error = %kick_error, "kick reason");
+                logging::warning(format!("Disconnected ({kick_error})"));
             }
             DisconnectReason::ConnectionFailure(reason) => {
                 let connection_error = AppError::ConnectionFailure(reason.clone());
-                error!(error = %connection_error, "connection error");
+                logging::warning(format!("Connection failed ({connection_error})"));
             }
         }
 
@@ -336,13 +476,13 @@ async fn supervise(
         }
 
         let mut reconnected = false;
-        for attempt in 1..=reconnect.maximum_attempts {
+        logging::info("Reconnecting...");
+        for _attempt in 1..=reconnect.maximum_attempts {
             let _ = state_tx.send(ConnectionState::Reconnecting);
-            info!(
-                attempt,
-                maximum_attempts = reconnect.maximum_attempts,
-                "reconnect attempt"
-            );
+            world_state
+                .lock()
+                .await
+                .set_connection(WorldConnectionState::Reconnecting);
             if wait_for_reconnect_delay(reconnect.delay_seconds, &shutdown).await {
                 return;
             }
@@ -355,21 +495,27 @@ async fn supervise(
                         .insert_resource(AutoReconnectDelay::new(Duration::MAX));
                     *current_client.lock().await = Some(new_client.clone());
                     events = new_events;
-                    if wait_for_spawn(&mut events, &shutdown, &world_state, &console).await {
+                    if wait_for_spawn(&new_client, &mut events, &shutdown, &world_state, &console)
+                        .await
+                    {
                         let _ = state_tx.send(ConnectionState::Connected);
-                        info!("reconnect success");
+                        world_state
+                            .lock()
+                            .await
+                            .set_connection(WorldConnectionState::Connected);
+                        logging::success("Reconnected");
                         reconnected = true;
                         break;
                     }
                 }
                 Err(error) => {
-                    error!(attempt, error = %error, "reconnect failure");
+                    debug!(error = %error, "reconnect attempt failed");
                 }
             }
         }
 
         if !reconnected {
-            warn!("reconnect attempts exhausted");
+            logging::warning("Reconnect failed (attempts exhausted)");
             let _ = state_tx.send(ConnectionState::Disconnected);
             return;
         }
@@ -417,6 +563,7 @@ async fn wait_for_disconnect(
     shutdown: &CancellationToken,
     world_state: &Arc<Mutex<WorldState>>,
     console: &ConsoleConfig,
+    current_client: &Arc<Mutex<Option<Client>>>,
 ) -> Option<DisconnectReason> {
     loop {
         tokio::select! {
@@ -424,12 +571,38 @@ async fn wait_for_disconnect(
             event = events.recv() => match event? {
                 Event::Spawn => {
                     let _ = state_tx.send(ConnectionState::Connected);
-                    world_state.lock().await.set_joined_world(true);
-                    info!("joined world");
-                }
-                Event::Chat(packet) => {
                     let mut world = world_state.lock().await;
-                    handle_chat(&packet, console, &mut world);
+                    world.set_connection(WorldConnectionState::Connected);
+                    world.set_joined_world(true);
+                }
+                Event::AddPlayer(info) | Event::UpdatePlayer(info) => {
+                    world_state.lock().await.upsert_player(crate::minecraft::world_state::PlayerSnapshot { uuid: info.uuid, username: info.profile.name, position: None, distance: None, dimension: None, loaded: false, last_seen: SystemTime::now() });
+                }
+                Event::RemovePlayer(info) => world_state.lock().await.remove_player(info.uuid),
+                Event::Packet(packet) => {
+                    if let azalea::protocol::packets::game::ClientboundGamePacket::RemoveEntities(packet) = &*packet {
+                        let mut world = world_state.lock().await;
+                        for entity_id in &packet.entity_ids {
+                            world.remove_entity(entity_id.0 as u32);
+                        }
+                    }
+                }
+                Event::Tick => refresh_ecs_state(current_client, world_state).await,
+                Event::Chat(packet) => {
+                    let (bot_uuid, bot_username) = current_client
+                        .lock()
+                        .await
+                        .as_ref()
+                        .map(|client| (Some(client.uuid()), client.username()))
+                        .unwrap_or((None, String::new()));
+                    let mut world = world_state.lock().await;
+                    handle_chat(
+                        &packet,
+                        console,
+                        bot_uuid,
+                        &bot_username,
+                        &mut world,
+                    );
                 }
                 Event::Disconnect(reason) => return Some(DisconnectReason::Kicked(reason.map_or_else(|| "server closed the connection".to_owned(), |reason| reason.to_string()))),
                 Event::ConnectionFailed(error) => return Some(DisconnectReason::ConnectionFailure(error.to_string())),
@@ -439,7 +612,182 @@ async fn wait_for_disconnect(
     }
 }
 
+// The Azalea ECS guard is explicitly dropped before the first async state lock
+// below; the lint cannot prove this through the query construction.
+#[allow(clippy::await_holding_lock)]
+async fn refresh_ecs_state(
+    current_client: &Arc<Mutex<Option<Client>>>,
+    world_state: &Arc<Mutex<WorldState>>,
+) {
+    let Some(client) = current_client.lock().await.clone() else {
+        return;
+    };
+    let mut ecs = client.ecs.write();
+    let mut bot = crate::minecraft::world_state::BotSnapshot::default();
+    let mut bot_entity = None;
+    let mut bot_inventory = None;
+    let mut query = ecs.query_filtered::<(
+        azalea::ecs::entity::Entity,
+        Option<&Position>,
+        Option<&LookDirection>,
+        Option<&Health>,
+        Option<&azalea::local_player::Hunger>,
+        Option<&azalea::local_player::Experience>,
+        Option<&Inventory>,
+        Option<&WorldName>,
+        Option<&Physics>,
+        Option<&Dead>,
+    ), azalea::ecs::query::With<LocalEntity>>();
+    if let Some((
+        entity,
+        position,
+        direction,
+        health,
+        hunger,
+        experience,
+        inventory,
+        dimension,
+        physics,
+        dead,
+    )) = query.iter(&ecs).next()
+    {
+        bot_entity = Some(entity);
+        bot.position = position.map(|p| {
+            let v: azalea::Vec3 = **p;
+            crate::minecraft::world_state::PositionSnapshot {
+                x: v.x,
+                y: v.y,
+                z: v.z,
+            }
+        });
+        bot.yaw = direction.map(LookDirection::y_rot);
+        bot.pitch = direction.map(LookDirection::x_rot);
+        bot.health = health.map(|h| h.0);
+        bot.food_level = hunger.map(|h| h.food);
+        bot.saturation = hunger.map(|h| h.saturation);
+        bot.experience_level = experience.map(|e| e.level);
+        bot.selected_hotbar_slot = inventory.map(|i| i.selected_hotbar_slot);
+        bot_inventory = inventory;
+        bot.dimension = dimension.map(ToString::to_string);
+        bot.on_ground = physics.map(Physics::on_ground);
+        bot.alive = Some(dead.is_none());
+    }
+    let inventory_snapshot = inventory_from_component(&bot_inventory);
+    let mut entities = ecs.query::<(
+        azalea::ecs::entity::Entity,
+        &MinecraftEntityId,
+        &EntityUuid,
+        &EntityKindComponent,
+        &Position,
+        Option<&Dead>,
+        Option<&Health>,
+        Option<&WorldName>,
+    )>();
+    let mut updates = Vec::new();
+    let mut existing_ids = HashSet::new();
+    for (entity, minecraft_id, uuid, kind, position, dead, health, _dimension) in
+        entities.iter(&ecs)
+    {
+        if Some(entity) == bot_entity {
+            continue;
+        }
+        if dead.is_some() || health.is_some_and(|health| health.0 <= 0.0) {
+            continue;
+        }
+        let v: azalea::Vec3 = **position;
+        let entity_id = minecraft_id.0 as u32;
+        existing_ids.insert(entity_id);
+        updates.push(crate::minecraft::world_state::EntitySnapshot {
+            entity_id,
+            uuid: Some(**uuid),
+            entity_type: kind.0.to_string(),
+            position: crate::minecraft::world_state::PositionSnapshot {
+                x: v.x,
+                y: v.y,
+                z: v.z,
+            },
+            distance: 0.0,
+            alive: Some(true),
+            health: health.map(|health| health.0),
+            custom_name: None,
+            last_seen: SystemTime::now(),
+        });
+    }
+    let mut player_updates = Vec::new();
+    let mut players = ecs.query::<(
+        &EntityUuid,
+        &GameProfileComponent,
+        Option<&Position>,
+        Option<&WorldName>,
+    )>();
+    for (uuid, profile, position, dimension) in players.iter(&ecs) {
+        let position = position.map(|p| {
+            let v: azalea::Vec3 = **p;
+            PositionSnapshot {
+                x: v.x,
+                y: v.y,
+                z: v.z,
+            }
+        });
+        player_updates.push(PlayerSnapshot {
+            uuid: **uuid,
+            username: profile.0.name.clone(),
+            position,
+            distance: None,
+            dimension: dimension.map(ToString::to_string),
+            loaded: position.is_some(),
+            last_seen: SystemTime::now(),
+        });
+    }
+    drop(ecs);
+    let mut world = world_state.lock().await;
+    if bot_entity.is_some() {
+        if let Some(inventory) = inventory_snapshot {
+            world.update_inventory(inventory);
+        }
+        world.update_bot(bot);
+    }
+    for entity in updates {
+        world.upsert_entity(entity);
+    }
+    world.remove_entities_not_in(&existing_ids);
+    for player in player_updates {
+        world.upsert_player(player);
+    }
+    world.remove_stale_entities();
+}
+
+fn inventory_from_component(inventory: &Option<&Inventory>) -> Option<InventorySnapshot> {
+    let inventory = (*inventory)?;
+    let slots = inventory
+        .menu()
+        .slots()
+        .iter()
+        .enumerate()
+        .map(|(slot, item)| {
+            let (item_id, count) = if item.is_empty() {
+                (None, 0)
+            } else {
+                (Some(item.kind().to_string()), item.count().max(0) as u32)
+            };
+            InventorySlot {
+                slot,
+                item_id,
+                display_name: None,
+                count,
+            }
+        })
+        .collect();
+    Some(InventorySnapshot {
+        available: true,
+        slots,
+        selected_hotbar_slot: Some(inventory.selected_hotbar_slot),
+        total_counts: Default::default(),
+    })
+}
+
 async fn wait_for_spawn(
+    client: &Client,
     events: &mut tokio::sync::mpsc::UnboundedReceiver<Event>,
     shutdown: &CancellationToken,
     world_state: &Arc<Mutex<WorldState>>,
@@ -452,19 +800,29 @@ async fn wait_for_spawn(
                     _ = shutdown.cancelled() => return false,
                     event = events.recv() => match event {
                         Some(Event::Spawn) => {
-                            world_state.lock().await.set_joined_world(true);
+                            let mut world = world_state.lock().await;
+                            world.set_connection(WorldConnectionState::Connected);
+                            world.set_joined_world(true);
                             return true;
                         }
                         Some(Event::Chat(packet)) => {
+                            let bot_uuid = Some(client.uuid());
+                            let bot_username = client.username();
                             let mut world = world_state.lock().await;
-                            handle_chat(&packet, console, &mut world);
+                            handle_chat(
+                                &packet,
+                                console,
+                                bot_uuid,
+                                &bot_username,
+                                &mut world,
+                            );
                         }
                         Some(Event::Disconnect(reason)) => {
-                            warn!(reason = ?reason, "reconnect connection dropped before spawn");
+                            debug!(reason = ?reason, "reconnect connection dropped before spawn");
                             return false;
                         }
                         Some(Event::ConnectionFailed(error)) => {
-                            warn!(error = %error, "reconnect connection failed before spawn");
+                            debug!(error = %error, "reconnect connection failed before spawn");
                             return false;
                         }
                         Some(_) => {}
@@ -506,6 +864,7 @@ mod tests {
                 maximum_attempts: 5,
             },
             ConsoleConfig::default(),
+            WorldStateConfig::default(),
         )
     }
 

@@ -2,9 +2,18 @@ use std::{fs, path::Path};
 
 use serde::Deserialize;
 use tracing::level_filters::LevelFilter;
-use tracing_subscriber::fmt;
+use tracing_subscriber::{
+    Layer,
+    filter::{LevelFilter as TargetLevel, Targets},
+    fmt,
+    layer::SubscriberExt,
+    util::SubscriberInitExt,
+};
 
 use crate::error::AppError;
+use crate::minecraft::world_state::{
+    DEFAULT_ENTITY_RADIUS, DEFAULT_MAXIMUM_ENTITIES, DEFAULT_STALE_SECONDS, validate_limits,
+};
 
 #[derive(Debug, Deserialize)]
 pub struct Config {
@@ -13,6 +22,10 @@ pub struct Config {
     #[serde(default)]
     pub console: ConsoleConfig,
     pub logging: LoggingConfig,
+    #[serde(default)]
+    pub world_state: WorldStateConfig,
+    #[serde(default)]
+    pub movement: MovementConfig,
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -58,6 +71,64 @@ impl Default for ConsoleConfig {
 #[derive(Debug, Deserialize)]
 pub struct LoggingConfig {
     pub level: String,
+    #[serde(default)]
+    pub debug: bool,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+pub struct WorldStateConfig {
+    #[serde(default = "default_entity_radius")]
+    pub nearby_entity_radius: f64,
+    #[serde(default = "default_maximum_entities")]
+    pub maximum_tracked_entities: usize,
+    #[serde(default = "default_stale_seconds")]
+    pub stale_entity_seconds: u64,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+pub struct MovementConfig {
+    #[serde(default = "default_follow_distance")]
+    pub follow_distance: f64,
+    #[serde(default = "default_repath_interval_ms")]
+    pub repath_interval_ms: u64,
+    #[serde(default = "default_arrival_distance")]
+    pub arrival_distance: f64,
+}
+fn default_follow_distance() -> f64 {
+    3.0
+}
+fn default_repath_interval_ms() -> u64 {
+    500
+}
+fn default_arrival_distance() -> f64 {
+    1.5
+}
+impl Default for MovementConfig {
+    fn default() -> Self {
+        Self {
+            follow_distance: 3.0,
+            repath_interval_ms: 500,
+            arrival_distance: 1.5,
+        }
+    }
+}
+fn default_entity_radius() -> f64 {
+    DEFAULT_ENTITY_RADIUS
+}
+fn default_maximum_entities() -> usize {
+    DEFAULT_MAXIMUM_ENTITIES
+}
+fn default_stale_seconds() -> u64 {
+    DEFAULT_STALE_SECONDS
+}
+impl Default for WorldStateConfig {
+    fn default() -> Self {
+        Self {
+            nearby_entity_radius: DEFAULT_ENTITY_RADIUS,
+            maximum_tracked_entities: DEFAULT_MAXIMUM_ENTITIES,
+            stale_entity_seconds: DEFAULT_STALE_SECONDS,
+        }
+    }
 }
 
 impl Config {
@@ -85,6 +156,26 @@ impl Config {
                     .to_owned(),
             ));
         }
+        validate_limits(
+            self.world_state.nearby_entity_radius,
+            self.world_state.maximum_tracked_entities,
+            self.world_state.stale_entity_seconds,
+        )?;
+        if !(self.movement.follow_distance > 0.0 && self.movement.follow_distance <= 32.0) {
+            return Err(AppError::InvalidMovementConfiguration(
+                "follow_distance must be greater than zero and at most 32".into(),
+            ));
+        }
+        if !(50..=10_000).contains(&self.movement.repath_interval_ms) {
+            return Err(AppError::InvalidMovementConfiguration(
+                "repath_interval_ms must be between 50 and 10000".into(),
+            ));
+        }
+        if !(self.movement.arrival_distance > 0.0 && self.movement.arrival_distance <= 16.0) {
+            return Err(AppError::InvalidMovementConfiguration(
+                "arrival_distance must be greater than zero and at most 16".into(),
+            ));
+        }
         Ok(())
     }
 }
@@ -95,10 +186,22 @@ pub fn init_logging(config: &LoggingConfig) -> Result<(), AppError> {
         .parse::<LevelFilter>()
         .map_err(|_| AppError::InvalidLogLevel(config.level.clone()))?;
 
-    fmt()
-        .with_max_level(level)
+    let mut targets = Targets::new()
+        .with_default(TargetLevel::OFF)
+        .with_target(env!("CARGO_PKG_NAME"), level);
+    if config.debug {
+        targets = targets
+            .with_target("azalea", TargetLevel::DEBUG)
+            .with_target("azalea_client", TargetLevel::DEBUG)
+            .with_target("azalea_entity", TargetLevel::DEBUG)
+            .with_target("azalea_world", TargetLevel::DEBUG)
+            .with_target("bevy", TargetLevel::DEBUG);
+    }
+
+    tracing_subscriber::registry()
+        .with(fmt::layer().with_target(false).with_filter(targets))
         .try_init()
-        .map_err(AppError::Logging)?;
+        .map_err(|error| AppError::Logging(Box::new(error)))?;
     Ok(())
 }
 
@@ -154,6 +257,33 @@ mod tests {
             config.validate(),
             Err(AppError::InvalidConfiguration(message))
                 if message.contains("maximum_attempts")
+        ));
+    }
+
+    #[test]
+    fn rejects_invalid_movement_configuration() {
+        let config: Config = toml::from_str(
+            r#"
+                [minecraft]
+                server = "localhost"
+                username = "MagicBot"
+                account_mode = "offline"
+                [reconnect]
+                enabled = false
+                delay_seconds = 1
+                maximum_attempts = 1
+                [logging]
+                level = "info"
+                [movement]
+                follow_distance = 0
+                repath_interval_ms = 500
+                arrival_distance = 1.5
+            "#,
+        )
+        .unwrap();
+        assert!(matches!(
+            config.validate(),
+            Err(AppError::InvalidMovementConfiguration(_))
         ));
     }
 }

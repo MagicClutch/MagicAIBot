@@ -3,6 +3,7 @@ mod app;
 mod config;
 mod console;
 mod error;
+mod logging;
 pub mod minecraft;
 mod movement;
 mod skills;
