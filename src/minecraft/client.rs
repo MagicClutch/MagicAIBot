@@ -5,7 +5,7 @@
 
 use std::{
     cmp::Ordering,
-    collections::HashSet,
+    collections::{HashMap, HashSet},
     path::PathBuf,
     sync::Arc,
     time::{Duration, SystemTime},
@@ -450,6 +450,33 @@ impl MinecraftClient {
                 chunk_loaded: true,
             })
             .collect())
+    }
+
+    pub(crate) async fn block_ids_at(
+        &self,
+        positions: &[BlockPosition],
+    ) -> Result<HashMap<BlockPosition, Option<String>>, AppError> {
+        if self.connection_state() != ConnectionState::Connected {
+            return Err(AppError::BlockSearchCancelled);
+        }
+        let client = self
+            .current_client
+            .lock()
+            .await
+            .clone()
+            .ok_or(AppError::BlockSearchUnavailable)?;
+        let world = client
+            .world()
+            .map_err(|error| AppError::WorldStateUpdateFailure(error.to_string()))?;
+        let world_guard = world.read();
+        let mut result = HashMap::with_capacity(positions.len());
+        for &position in positions {
+            let state = world_guard
+                .get_block_state(azalea::BlockPos::new(position.x, position.y, position.z));
+            let block_id = state.map(|state| state.to_trait().as_block_kind().to_str().to_owned());
+            result.insert(position, block_id);
+        }
+        Ok(result)
     }
 
     pub async fn set_movement_snapshot(&self, movement: MovementSnapshot) {

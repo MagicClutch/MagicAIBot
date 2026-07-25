@@ -34,6 +34,8 @@ pub enum AppError {
     InvalidBlockSearchResultLimit { limit: usize, maximum: usize },
     #[error("invalid block-search vertical range: {0}")]
     InvalidBlockSearchVerticalRange(u32),
+    #[error("invalid block-navigation configuration: {0}")]
+    InvalidBlockNavigationConfiguration(String),
     #[error("bot position is unavailable")]
     BlockSearchPositionUnavailable,
     #[error("bot dimension is unavailable")]
@@ -48,6 +50,18 @@ pub enum AppError {
     BlockStateConversionFailure(String),
     #[error("block search is unavailable while disconnected")]
     BlockSearchUnavailable,
+    #[error("no matching block found")]
+    NoMatchingBlock,
+    #[error("no valid approach position")]
+    NoValidApproachPosition,
+    #[error("target block disappeared")]
+    TargetBlockDisappeared,
+    #[error("target chunk unloaded")]
+    TargetChunkUnloaded,
+    #[error("movement stalled")]
+    MovementStalled,
+    #[error("block navigation timed out")]
+    BlockNavigationTimeout,
     #[error("invalid coordinates: {0}")]
     InvalidCoordinates(String),
     #[error("unknown player: {0}")]

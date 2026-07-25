@@ -41,7 +41,7 @@ impl PositionSnapshot {
     }
 }
 
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Default, Eq, Hash, PartialEq)]
 pub struct BlockPosition {
     pub x: i32,
     pub y: i32,

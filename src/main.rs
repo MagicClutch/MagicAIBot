@@ -7,6 +7,7 @@ mod error;
 mod logging;
 pub mod minecraft;
 mod movement;
+mod navigation;
 mod skills;
 mod tasks;
 

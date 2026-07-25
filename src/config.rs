@@ -28,6 +28,8 @@ pub struct Config {
     pub movement: MovementConfig,
     #[serde(default)]
     pub block_search: BlockSearchConfig,
+    #[serde(default)]
+    pub block_navigation: BlockNavigationConfig,
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -138,6 +140,60 @@ impl Default for BlockSearchConfig {
         }
     }
 }
+
+#[derive(Clone, Debug, Deserialize)]
+pub struct BlockNavigationConfig {
+    #[serde(default = "default_block_search_radius")]
+    pub default_search_radius: u32,
+    #[serde(default = "default_block_search_maximum_radius")]
+    pub maximum_search_radius: u32,
+    #[serde(default = "default_block_search_result_limit")]
+    pub candidate_limit: usize,
+    #[serde(default = "default_interaction_distance")]
+    pub interaction_distance: f64,
+    #[serde(default = "default_arrival_distance")]
+    pub arrival_distance: f64,
+    #[serde(default = "default_maximum_target_attempts")]
+    pub maximum_target_attempts: usize,
+    #[serde(default = "default_stuck_timeout_seconds")]
+    pub stuck_timeout_seconds: u64,
+    #[serde(default = "default_maximum_navigation_seconds")]
+    pub maximum_navigation_seconds: u64,
+    #[serde(default = "default_block_repath_interval_ms")]
+    pub repath_interval_ms: u64,
+}
+
+fn default_interaction_distance() -> f64 {
+    4.5
+}
+fn default_maximum_target_attempts() -> usize {
+    8
+}
+fn default_stuck_timeout_seconds() -> u64 {
+    12
+}
+fn default_maximum_navigation_seconds() -> u64 {
+    120
+}
+fn default_block_repath_interval_ms() -> u64 {
+    1000
+}
+
+impl Default for BlockNavigationConfig {
+    fn default() -> Self {
+        Self {
+            default_search_radius: 32,
+            maximum_search_radius: 128,
+            candidate_limit: 20,
+            interaction_distance: 4.5,
+            arrival_distance: 1.5,
+            maximum_target_attempts: 8,
+            stuck_timeout_seconds: 12,
+            maximum_navigation_seconds: 120,
+            repath_interval_ms: 1000,
+        }
+    }
+}
 fn default_follow_distance() -> f64 {
     3.0
 }
@@ -245,6 +301,35 @@ impl Config {
                 "default_vertical_range must be between 1 and 384".into(),
             ));
         }
+        let navigation = &self.block_navigation;
+        if navigation.default_search_radius == 0
+            || navigation.maximum_search_radius == 0
+            || navigation.default_search_radius > navigation.maximum_search_radius
+            || navigation.maximum_search_radius > 256
+        {
+            return Err(AppError::InvalidBlockNavigationConfiguration(
+                "search radius values are invalid".into(),
+            ));
+        }
+        if navigation.candidate_limit == 0 || navigation.candidate_limit > 4096 {
+            return Err(AppError::InvalidBlockNavigationConfiguration(
+                "candidate_limit must be between 1 and 4096".into(),
+            ));
+        }
+        if !(navigation.interaction_distance > 0.0 && navigation.interaction_distance <= 16.0)
+            || !(navigation.arrival_distance > 0.0 && navigation.arrival_distance <= 16.0)
+            || navigation.maximum_target_attempts == 0
+            || navigation.maximum_target_attempts > 64
+            || navigation.stuck_timeout_seconds == 0
+            || navigation.stuck_timeout_seconds > 3600
+            || navigation.maximum_navigation_seconds == 0
+            || navigation.maximum_navigation_seconds > 3600
+            || !(100..=10_000).contains(&navigation.repath_interval_ms)
+        {
+            return Err(AppError::InvalidBlockNavigationConfiguration(
+                "navigation distances, attempts, timeouts, or repath interval are invalid".into(),
+            ));
+        }
         Ok(())
     }
 }
@@ -302,6 +387,7 @@ mod tests {
         assert_eq!(config.minecraft.server, "localhost");
         assert_eq!(config.block_search.default_radius, 32);
         assert_eq!(config.block_search.default_result_limit, 20);
+        assert_eq!(config.block_navigation.maximum_target_attempts, 8);
     }
 
     #[test]
@@ -392,6 +478,45 @@ mod tests {
         assert!(matches!(
             config.validate(),
             Err(AppError::InvalidBlockSearchConfiguration(_))
+        ));
+    }
+
+    #[test]
+    fn rejects_invalid_block_navigation_configuration() {
+        let mut config: Config = toml::from_str(
+            r#"
+                [minecraft]
+                server = "localhost"
+                username = "MagicBot"
+                account_mode = "offline"
+                [reconnect]
+                enabled = false
+                delay_seconds = 1
+                maximum_attempts = 1
+                [logging]
+                level = "info"
+                [block_navigation]
+                default_search_radius = 32
+                maximum_search_radius = 128
+                candidate_limit = 20
+                interaction_distance = 4.5
+                arrival_distance = 1.5
+                maximum_target_attempts = 0
+                stuck_timeout_seconds = 12
+                maximum_navigation_seconds = 120
+                repath_interval_ms = 1000
+            "#,
+        )
+        .unwrap();
+        assert!(matches!(
+            config.validate(),
+            Err(AppError::InvalidBlockNavigationConfiguration(_))
+        ));
+        config.block_navigation.maximum_target_attempts = 8;
+        config.block_navigation.maximum_search_radius = 0;
+        assert!(matches!(
+            config.validate(),
+            Err(AppError::InvalidBlockNavigationConfiguration(_))
         ));
     }
 }

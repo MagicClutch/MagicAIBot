@@ -37,6 +37,12 @@ pub enum ConsoleCommand {
         block_id: String,
         radius: Option<u32>,
     },
+    GotoBlock {
+        block_id: String,
+        search_radius: Option<u32>,
+    },
+    GotoBlockStatus,
+    CancelGotoBlock,
     Reconnect,
     Quit,
 }
@@ -109,6 +115,9 @@ pub fn parse_input(input: &str) -> Result<ConsoleInput, AppError> {
         "movement" => no_arguments(command, arguments, ConsoleCommand::Movement)?,
         "findblock" => parse_find_block(arguments)?,
         "nearestblock" => parse_nearest_block(arguments)?,
+        "gotoblock" => parse_goto_block(arguments)?,
+        "gotoblockstatus" => no_arguments(command, arguments, ConsoleCommand::GotoBlockStatus)?,
+        "cancelgotoblock" => no_arguments(command, arguments, ConsoleCommand::CancelGotoBlock)?,
         "reconnect" => no_arguments(command, arguments, ConsoleCommand::Reconnect)?,
         "quit" => no_arguments(command, arguments, ConsoleCommand::Quit)?,
         "chat" => {
@@ -181,6 +190,30 @@ fn parse_nearest_block(arguments: &str) -> Result<ConsoleCommand, AppError> {
     Ok(ConsoleCommand::NearestBlock {
         block_id: normalize_block_id(block_id)?,
         radius,
+    })
+}
+
+fn parse_goto_block(arguments: &str) -> Result<ConsoleCommand, AppError> {
+    let mut parts = arguments.split_whitespace();
+    let block_id = parts.next().ok_or_else(|| {
+        AppError::MissingConsoleArgument("/gotoblock <block_id> [search_radius]".into())
+    })?;
+    let search_radius = parts
+        .next()
+        .map(|value| {
+            value.parse().map_err(|_| {
+                AppError::InvalidEntityQuery("search_radius must be a positive integer".into())
+            })
+        })
+        .transpose()?;
+    if parts.next().is_some() {
+        return Err(AppError::InvalidConsoleSyntax(
+            "/gotoblock <block_id> [search_radius]".into(),
+        ));
+    }
+    Ok(ConsoleCommand::GotoBlock {
+        block_id: normalize_block_id(block_id)?,
+        search_radius,
     })
 }
 
@@ -278,5 +311,24 @@ mod tests {
         let input = ConsoleInput::ChatMessage("hello".to_owned());
         assert_eq!(plain_chat_message(&input, false), None);
         assert_eq!(plain_chat_message(&input, true), Some("hello"));
+    }
+
+    #[test]
+    fn parses_block_navigation_commands() {
+        assert_eq!(
+            parse_input("/gotoblock stone 64").unwrap(),
+            ConsoleInput::Command(ConsoleCommand::GotoBlock {
+                block_id: "minecraft:stone".into(),
+                search_radius: Some(64),
+            })
+        );
+        assert_eq!(
+            parse_input("/gotoblockstatus").unwrap(),
+            ConsoleInput::Command(ConsoleCommand::GotoBlockStatus)
+        );
+        assert_eq!(
+            parse_input("/cancelgotoblock").unwrap(),
+            ConsoleInput::Command(ConsoleCommand::CancelGotoBlock)
+        );
     }
 }

@@ -18,6 +18,7 @@ use crate::{
     logging,
     minecraft::client::MinecraftClient,
     movement::MovementService,
+    navigation::{BlockNavigationService, navigation_state::BlockNavigationState},
 };
 use tokio::{sync::mpsc, task::JoinHandle};
 use tokio_util::sync::CancellationToken;
@@ -29,6 +30,7 @@ pub struct App {
     minecraft: MinecraftClient,
     movement: MovementService,
     block_search: BlockSearchService,
+    block_navigation: BlockNavigationService,
     started_at: Instant,
 }
 
@@ -53,6 +55,14 @@ impl App {
                 config.block_search.maximum_radius,
                 config.block_search.maximum_result_limit,
                 config.block_search.default_vertical_range,
+            ),
+            block_navigation: BlockNavigationService::new(
+                config.block_navigation.clone(),
+                BlockSearchService::new(
+                    config.block_search.maximum_radius,
+                    config.block_search.maximum_result_limit,
+                    config.block_search.default_vertical_range,
+                ),
             ),
             config,
             shutdown: CancellationToken::new(),
@@ -84,7 +94,10 @@ impl App {
                     result?;
                     break Ok(());
                 }
-                _ = movement_tick.tick() => self.movement.tick(&self.minecraft).await,
+                _ = movement_tick.tick() => {
+                    self.movement.tick(&self.minecraft).await;
+                    self.block_navigation.tick(&self.minecraft, &self.movement).await;
+                },
                 input = input_rx.recv() => match input {
                     Some(Ok(ConsoleInput::Empty)) => {}
                     Some(Ok(input)) => {
@@ -99,6 +112,9 @@ impl App {
         };
 
         self.shutdown.cancel();
+        self.block_navigation
+            .cancel(&self.minecraft, &self.movement)
+            .await;
         let _ = self.movement.stop(&self.minecraft).await;
         self.minecraft.disconnect().await?;
         if let Some(task) = console_task {
@@ -133,6 +149,9 @@ impl App {
                 ConsoleCommand::Inventory => self.print_inventory().await,
                 ConsoleCommand::Entities { radius } => self.print_entities(radius).await,
                 ConsoleCommand::Goto { x, y, z } => {
+                    self.block_navigation
+                        .cancel(&self.minecraft, &self.movement)
+                        .await;
                     if let Err(error) = self
                         .movement
                         .goto(
@@ -149,11 +168,17 @@ impl App {
                     }
                 }
                 ConsoleCommand::Stop => {
+                    self.block_navigation
+                        .cancel(&self.minecraft, &self.movement)
+                        .await;
                     if let Err(error) = self.movement.stop(&self.minecraft).await {
                         println!("Movement error: {error}");
                     }
                 }
                 ConsoleCommand::Follow { player } => {
+                    self.block_navigation
+                        .cancel(&self.minecraft, &self.movement)
+                        .await;
                     if let Err(error) = self.movement.follow(&self.minecraft, &player).await {
                         println!("Movement error: {error}");
                     }
@@ -169,10 +194,35 @@ impl App {
                 ConsoleCommand::NearestBlock { block_id, radius } => {
                     self.find_blocks(block_id, radius, Some(1)).await;
                 }
-                ConsoleCommand::Reconnect => match self.minecraft.reconnect().await {
-                    Ok(()) => println!("Reconnect successful."),
-                    Err(error) => println!("Reconnect failed: {error}"),
-                },
+                ConsoleCommand::GotoBlock {
+                    block_id,
+                    search_radius,
+                } => {
+                    let radius =
+                        search_radius.unwrap_or(self.config.block_navigation.default_search_radius);
+                    if let Err(error) = self
+                        .block_navigation
+                        .start(&self.minecraft, &self.movement, block_id, radius)
+                        .await
+                    {
+                        logging::warning(format!("Block navigation failed: {error}"));
+                    }
+                }
+                ConsoleCommand::GotoBlockStatus => self.print_block_navigation_status().await,
+                ConsoleCommand::CancelGotoBlock => {
+                    self.block_navigation
+                        .cancel(&self.minecraft, &self.movement)
+                        .await;
+                }
+                ConsoleCommand::Reconnect => {
+                    self.block_navigation
+                        .cancel(&self.minecraft, &self.movement)
+                        .await;
+                    match self.minecraft.reconnect().await {
+                        Ok(()) => println!("Reconnect successful."),
+                        Err(error) => println!("Reconnect failed: {error}"),
+                    }
+                }
                 ConsoleCommand::Quit => return Ok(true),
             },
             ConsoleInput::Empty => {}
@@ -203,6 +253,81 @@ impl App {
             }
             Ok(results) => println!("{}", format_find_results(&query.block_id, radius, &results)),
             Err(error) => logging::warning(format!("Block search failed: {error}")),
+        }
+    }
+
+    async fn print_block_navigation_status(&self) {
+        let snapshot = self.block_navigation.snapshot().await;
+        if matches!(snapshot.state, BlockNavigationState::Idle) {
+            println!("No block navigation task is active.");
+            return;
+        }
+        let state = match snapshot.state {
+            BlockNavigationState::Moving | BlockNavigationState::Repathing => "Moving",
+            BlockNavigationState::Searching => "Searching",
+            BlockNavigationState::SelectingTarget => "SelectingTarget",
+            BlockNavigationState::Reached => "Reached",
+            BlockNavigationState::Cancelled => "Cancelled",
+            BlockNavigationState::Failed => "Failed",
+            BlockNavigationState::Idle => "Idle",
+        };
+        let position = self.minecraft.world_state_snapshot().await.bot.position;
+        let distance =
+            position
+                .zip(snapshot.selected_approach_position)
+                .map(|(current, target)| {
+                    ((current.x - f64::from(target.x)).powi(2)
+                        + (current.y - f64::from(target.y)).powi(2)
+                        + (current.z - f64::from(target.z)).powi(2))
+                    .sqrt()
+                });
+        println!("State: {state}");
+        println!(
+            "Block: {}",
+            snapshot.requested_block_id.as_deref().unwrap_or("unknown")
+        );
+        println!(
+            "Search radius: {}",
+            snapshot
+                .search_radius
+                .map_or_else(|| "unknown".into(), |value| value.to_string())
+        );
+        println!(
+            "Target block: {}",
+            snapshot
+                .selected_block_position
+                .map_or_else(|| "unknown".into(), |p| format!("{} {} {}", p.x, p.y, p.z))
+        );
+        println!(
+            "Approach position: {}",
+            snapshot
+                .selected_approach_position
+                .map_or_else(|| "unknown".into(), |p| format!("{} {} {}", p.x, p.y, p.z))
+        );
+        println!(
+            "Current position: {}",
+            position.map_or_else(
+                || "unknown".into(),
+                |p| format!("{:.1} {:.1} {:.1}", p.x, p.y, p.z)
+            )
+        );
+        println!(
+            "Distance to approach: {}",
+            distance.map_or_else(|| "unknown".into(), |value| format!("{value:.1}"))
+        );
+        println!("Candidates checked: {}", snapshot.candidates_checked);
+        println!(
+            "Attempts: {}/{}",
+            snapshot.current_attempt, snapshot.maximum_attempts
+        );
+        println!(
+            "Elapsed: {} seconds",
+            snapshot
+                .start_time
+                .map_or(0, |started| started.elapsed().unwrap_or_default().as_secs())
+        );
+        if let Some(reason) = snapshot.failure_reason {
+            println!("Failure reason: {reason}");
         }
     }
 
@@ -423,6 +548,9 @@ fn print_help() {
     println!("/entities [RADIUS]  Show nearby entities");
     println!("/findblock ID [RADIUS] [LIMIT]  Find loaded blocks");
     println!("/nearestblock ID [RADIUS]  Find nearest loaded block");
+    println!("/gotoblock ID [RADIUS]  Navigate to a matching block");
+    println!("/gotoblockstatus  Show block-navigation status");
+    println!("/cancelgotoblock  Cancel block navigation");
     println!("/goto X Y Z  Walk to coordinates");
     println!("/stop       Stop movement immediately");
     println!("/follow NAME Follow a player");

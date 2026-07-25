@@ -44,12 +44,7 @@ impl BlockSearchService {
             "Searching for {} within {} blocks",
             query.block_id, query.radius
         ));
-        let results = minecraft
-            .scan_loaded_blocks(&query)
-            .await?
-            .into_iter()
-            .map(|candidate| candidate.into_snapshot())
-            .collect::<Vec<_>>();
+        let results = self.search_raw(minecraft, query.clone()).await?;
         let results = sort_deduplicate_limit(results, query.maximum_results);
         if results.is_empty() {
             logging::info(format!("No {} blocks found", query.block_id));
@@ -57,6 +52,30 @@ impl BlockSearchService {
             logging::success(format!("Found {} {} blocks", results.len(), query.block_id));
         }
         Ok(results)
+    }
+
+    pub(crate) async fn search_raw(
+        &self,
+        minecraft: &MinecraftClient,
+        mut query: BlockSearchQuery,
+    ) -> Result<Vec<BlockSnapshot>, AppError> {
+        if query.vertical_range == 0 {
+            query.vertical_range = self.default_vertical_range;
+        }
+        crate::blocks::block_query::validate_search_values(
+            query.radius,
+            query.maximum_results,
+            query.vertical_range,
+            self.maximum_radius,
+            self.maximum_result_limit,
+        )?;
+        let results = minecraft
+            .scan_loaded_blocks(&query)
+            .await?
+            .into_iter()
+            .map(|candidate| candidate.into_snapshot())
+            .collect::<Vec<_>>();
+        Ok(sort_deduplicate_limit(results, query.maximum_results))
     }
 }
 

@@ -38,6 +38,23 @@ impl MovementService {
         minecraft: &MinecraftClient,
         destination: PositionSnapshot,
     ) -> Result<(), AppError> {
+        self.goto_internal(minecraft, destination, true).await
+    }
+
+    pub(crate) async fn goto_for_block_navigation(
+        &self,
+        minecraft: &MinecraftClient,
+        destination: PositionSnapshot,
+    ) -> Result<(), AppError> {
+        self.goto_internal(minecraft, destination, false).await
+    }
+
+    async fn goto_internal(
+        &self,
+        minecraft: &MinecraftClient,
+        destination: PositionSnapshot,
+        log_start: bool,
+    ) -> Result<(), AppError> {
         if !destination.x.is_finite() || !destination.y.is_finite() || !destination.z.is_finite() {
             return Err(AppError::InvalidCoordinates(
                 "coordinates must be finite".into(),
@@ -45,7 +62,9 @@ impl MovementService {
         }
         let world = minecraft.world_state_snapshot().await;
         minecraft.start_navigation_to(destination, None).await?;
-        logger::going_to(destination);
+        if log_start {
+            logger::going_to(destination);
+        }
         self.replace_and_publish(minecraft, moving_snapshot(destination, world.bot.position))
             .await;
         Ok(())
@@ -116,8 +135,22 @@ impl MovementService {
             return;
         }
         match minecraft.navigation_status().await {
-            Ok(status) if status.reached => {
+            Ok(status)
+                if status.reached
+                    && arrived(
+                        world.bot.position,
+                        snapshot.destination,
+                        self.config.arrival_distance,
+                    ) =>
+            {
                 snapshot.status = MovementStatus::Completed;
+                snapshot.last_movement_update = Some(SystemTime::now());
+                self.replace_and_publish(minecraft, snapshot).await;
+            }
+            Ok(status) if status.reached => {
+                snapshot.status = MovementStatus::Failed;
+                snapshot.failure_reason =
+                    Some("pathfinder reported completion before arrival".into());
                 snapshot.last_movement_update = Some(SystemTime::now());
                 self.replace_and_publish(minecraft, snapshot).await;
             }
