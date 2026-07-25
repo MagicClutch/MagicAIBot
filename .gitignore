@@ -1,0 +1,15 @@
+target/
+
+.env
+
+config.toml
+
+logs/
+
+auth-cache/
+
+*.db
+
+.vscode/
+
+.idea/
