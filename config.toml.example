@@ -28,6 +28,12 @@ follow_distance = 3.0
 repath_interval_ms = 500
 arrival_distance = 1.5
 
+[multitasking]
+normal_forward_angle = 35.0
+strafe_angle = 75.0
+backward_angle = 130.0
+extreme_angle = 160.0
+
 [block_search]
 default_radius = 32
 maximum_radius = 128
@@ -47,7 +53,53 @@ maximum_navigation_seconds = 120
 repath_interval_ms = 1000
 
 [look]
-maximum_yaw_speed = 180
-maximum_pitch_speed = 180
 update_rate = 20
-arrival_tolerance = 1.0
+reaction_delay_min_ms = 35
+reaction_delay_max_ms = 90
+moving_target_prediction = true
+prediction_strength = 0.35
+minimum_target_movement = 0.03
+
+[look.randomization]
+enabled = true
+block_randomization = true
+entity_randomization = true
+player_randomization = true
+horizontal_strength = 0.35
+vertical_strength = 0.30
+minimum_hold_time_ms = 350
+maximum_hold_time_ms = 1200
+retarget_chance_per_second = 0.35
+
+[look.motion]
+minimum_yaw_speed = 25.0
+maximum_yaw_speed = 220.0
+minimum_pitch_speed = 20.0
+maximum_pitch_speed = 160.0
+yaw_acceleration = 600.0
+pitch_acceleration = 450.0
+yaw_deceleration = 700.0
+pitch_deceleration = 550.0
+slowdown_angle = 18.0
+arrival_tolerance = 1.2
+micro_correction_enabled = true
+micro_correction_strength = 0.35
+speed_variation = 0.10
+overshoot_chance = 0.08
+maximum_overshoot_degrees = 1.8
+
+[interaction]
+maximum_reach = 4.5
+placement_reach = 4.5
+breaking_reach = 4.5
+retry_limit = 3
+retry_delay_ms = 150
+verification_timeout_ms = 1500
+auto_navigate = true
+auto_precise_look = true
+
+[interaction.face_targeting]
+face_inset = 0.001
+edge_margin = 0.12
+maximum_face_attempts = 6
+maximum_hit_points_per_face = 5

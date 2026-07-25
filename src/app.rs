@@ -15,11 +15,13 @@ use crate::{
         commands::{ConsoleCommand, ConsoleInput, plain_chat_message},
     },
     error::AppError,
+    interaction::{InteractionController, interaction_controller::InteractionState},
     logging,
     look::{LookController, LookTarget, look_controller::LookState},
     minecraft::client::MinecraftClient,
     movement::MovementService,
     navigation::{BlockNavigationService, navigation_state::BlockNavigationState},
+    tasks::TaskService,
 };
 use tokio::{sync::mpsc, task::JoinHandle};
 use tokio_util::sync::CancellationToken;
@@ -33,6 +35,8 @@ pub struct App {
     block_search: BlockSearchService,
     block_navigation: BlockNavigationService,
     look: LookController,
+    interaction: InteractionController,
+    tasks: TaskService,
     started_at: Instant,
 }
 
@@ -44,6 +48,14 @@ impl App {
         println!("Loading configuration...\n");
         let config = Config::load(Path::new("config.toml"))?;
         crate::config::init_logging(&config.logging)?;
+        let block_navigation = BlockNavigationService::new(
+            config.block_navigation.clone(),
+            BlockSearchService::new(
+                config.block_search.maximum_radius,
+                config.block_search.maximum_result_limit,
+                config.block_search.default_vertical_range,
+            ),
+        );
 
         Ok(Self {
             minecraft: MinecraftClient::new(
@@ -52,20 +64,13 @@ impl App {
                 config.console.clone(),
                 config.world_state.clone(),
             ),
-            movement: MovementService::new(config.movement.clone()),
+            movement: MovementService::new(config.movement.clone(), config.multitasking.clone()),
             block_search: BlockSearchService::new(
                 config.block_search.maximum_radius,
                 config.block_search.maximum_result_limit,
                 config.block_search.default_vertical_range,
             ),
-            block_navigation: BlockNavigationService::new(
-                config.block_navigation.clone(),
-                BlockSearchService::new(
-                    config.block_search.maximum_radius,
-                    config.block_search.maximum_result_limit,
-                    config.block_search.default_vertical_range,
-                ),
-            ),
+            block_navigation: block_navigation.clone(),
             look: LookController::new(
                 config.look.clone(),
                 BlockSearchService::new(
@@ -74,6 +79,16 @@ impl App {
                     config.block_search.default_vertical_range,
                 ),
             ),
+            interaction: InteractionController::new(
+                config.interaction.clone(),
+                BlockSearchService::new(
+                    config.block_search.maximum_radius,
+                    config.block_search.maximum_result_limit,
+                    config.block_search.default_vertical_range,
+                ),
+                block_navigation,
+            ),
+            tasks: TaskService::default(),
             config,
             shutdown: CancellationToken::new(),
             started_at: Instant::now(),
@@ -97,6 +112,7 @@ impl App {
         let mut look_tick = tokio::time::interval(Duration::from_millis(
             1000 / u64::from(self.config.look.update_rate),
         ));
+        let mut interaction_tick = tokio::time::interval(Duration::from_millis(50));
         let console_task = self.config.console.enabled.then(|| {
             tokio::task::spawn_local(console::read_input(input_tx, self.shutdown.child_token()))
         });
@@ -108,10 +124,12 @@ impl App {
                     break Ok(());
                 }
                 _ = movement_tick.tick() => {
-                    self.movement.tick(&self.minecraft).await;
+                    let explicit_look = self.look.snapshot().await.state == LookState::Looking;
+                    self.movement.tick(&self.minecraft, explicit_look).await;
                     self.block_navigation.tick(&self.minecraft, &self.movement).await;
                 },
                 _ = look_tick.tick() => self.look.tick(&self.minecraft).await,
+                _ = interaction_tick.tick() => self.interaction.tick(&self.minecraft, &self.movement, &self.look).await,
                 input = input_rx.recv() => match input {
                     Some(Ok(ConsoleInput::Empty)) => {}
                     Some(Ok(input)) => {
@@ -130,6 +148,9 @@ impl App {
             .cancel(&self.minecraft, &self.movement)
             .await;
         self.look.cancel().await;
+        self.interaction
+            .cancel(&self.minecraft, &self.movement, &self.look)
+            .await;
         let _ = self.movement.stop(&self.minecraft).await;
         self.minecraft.disconnect().await?;
         if let Some(task) = console_task {
@@ -164,13 +185,17 @@ impl App {
                 ConsoleCommand::Inventory => self.print_inventory().await,
                 ConsoleCommand::Entities { radius } => self.print_entities(radius).await,
                 ConsoleCommand::Goto { x, y, z } => {
+                    self.interaction
+                        .cancel(&self.minecraft, &self.movement, &self.look)
+                        .await;
                     self.block_navigation
                         .cancel(&self.minecraft, &self.movement)
                         .await;
                     if let Err(error) = self
-                        .movement
-                        .goto(
+                        .tasks
+                        .goto_position(
                             &self.minecraft,
+                            &self.movement,
                             crate::minecraft::world_state::PositionSnapshot {
                                 x: f64::from(x),
                                 y: f64::from(y),
@@ -183,6 +208,9 @@ impl App {
                     }
                 }
                 ConsoleCommand::Stop => {
+                    // `/stop` is the movement channel's stop command. A
+                    // separate look task remains active, even when it is
+                    // tracking a target while the bot walks.
                     self.block_navigation
                         .cancel(&self.minecraft, &self.movement)
                         .await;
@@ -190,7 +218,24 @@ impl App {
                         println!("Movement error: {error}");
                     }
                 }
+                ConsoleCommand::StopAll => {
+                    self.interaction
+                        .cancel(&self.minecraft, &self.movement, &self.look)
+                        .await;
+                    self.block_navigation
+                        .cancel(&self.minecraft, &self.movement)
+                        .await;
+                    if let Err(error) = self.movement.stop(&self.minecraft).await {
+                        println!("Movement error: {error}");
+                    }
+                    self.look.cancel().await;
+                    self.tasks.cancel(&self.minecraft).await;
+                }
+                ConsoleCommand::TaskStatus => self.print_task_status().await,
                 ConsoleCommand::Follow { player } => {
+                    self.interaction
+                        .cancel(&self.minecraft, &self.movement, &self.look)
+                        .await;
                     self.block_navigation
                         .cancel(&self.minecraft, &self.movement)
                         .await;
@@ -213,11 +258,20 @@ impl App {
                     block_id,
                     search_radius,
                 } => {
+                    self.interaction
+                        .cancel(&self.minecraft, &self.movement, &self.look)
+                        .await;
                     let radius =
                         search_radius.unwrap_or(self.config.block_navigation.default_search_radius);
                     if let Err(error) = self
-                        .block_navigation
-                        .start(&self.minecraft, &self.movement, block_id, radius)
+                        .tasks
+                        .goto_block(
+                            &self.minecraft,
+                            &self.movement,
+                            &self.block_navigation,
+                            block_id,
+                            radius,
+                        )
                         .await
                     {
                         logging::warning(format!("Block navigation failed: {error}"));
@@ -230,10 +284,14 @@ impl App {
                         .await;
                 }
                 ConsoleCommand::Look { x, y, z } => {
+                    self.interaction
+                        .cancel(&self.minecraft, &self.movement, &self.look)
+                        .await;
                     if let Err(error) = self
-                        .look
+                        .tasks
                         .look_at(
                             &self.minecraft,
+                            &self.look,
                             LookTarget::World(crate::minecraft::world_state::PositionSnapshot {
                                 x: f64::from(x),
                                 y: f64::from(y),
@@ -246,21 +304,33 @@ impl App {
                     }
                 }
                 ConsoleCommand::LookBlock { block_id } => {
-                    if let Err(error) = self.look.look_at_block_id(&self.minecraft, block_id).await
+                    self.interaction
+                        .cancel(&self.minecraft, &self.movement, &self.look)
+                        .await;
+                    if let Err(error) = self
+                        .tasks
+                        .look_at_block(&self.minecraft, &self.look, block_id)
+                        .await
                     {
                         logging::warning(format!("Look failed: {error}"));
                     }
                 }
                 ConsoleCommand::LookPlayer { player } => {
+                    self.interaction
+                        .cancel(&self.minecraft, &self.movement, &self.look)
+                        .await;
                     if let Err(error) = self
-                        .look
-                        .look_at(&self.minecraft, LookTarget::Player(player))
+                        .tasks
+                        .look_at(&self.minecraft, &self.look, LookTarget::Player(player))
                         .await
                     {
                         logging::warning(format!("Look failed: {error}"));
                     }
                 }
                 ConsoleCommand::LookEntity { entity_type } => {
+                    self.interaction
+                        .cancel(&self.minecraft, &self.movement, &self.look)
+                        .await;
                     let world = self.minecraft.world_state_snapshot().await;
                     let entity = world.entities.iter().find(|entity| {
                         entity
@@ -272,8 +342,12 @@ impl App {
                     match entity {
                         Some(entity) => {
                             if let Err(error) = self
-                                .look
-                                .look_at(&self.minecraft, LookTarget::Entity(entity.entity_id))
+                                .tasks
+                                .look_at(
+                                    &self.minecraft,
+                                    &self.look,
+                                    LookTarget::Entity(entity.entity_id),
+                                )
                                 .await
                             {
                                 logging::warning(format!("Look failed: {error}"));
@@ -284,11 +358,123 @@ impl App {
                 }
                 ConsoleCommand::LookStop => self.look.cancel().await,
                 ConsoleCommand::LookStatus => self.print_look_status().await,
+                ConsoleCommand::BreakBlock => {
+                    self.block_navigation
+                        .cancel(&self.minecraft, &self.movement)
+                        .await;
+                    if let Err(error) = self
+                        .tasks
+                        .break_looked_block(
+                            &self.minecraft,
+                            &self.movement,
+                            &self.look,
+                            &self.interaction,
+                        )
+                        .await
+                    {
+                        logging::warning(format!("Cannot break block: {error}"));
+                    }
+                }
+                ConsoleCommand::Break { x, y, z } => {
+                    self.block_navigation
+                        .cancel(&self.minecraft, &self.movement)
+                        .await;
+                    if let Err(error) = self
+                        .tasks
+                        .break_block(
+                            &self.minecraft,
+                            &self.movement,
+                            &self.look,
+                            &self.interaction,
+                            crate::minecraft::world_state::BlockPosition { x, y, z },
+                        )
+                        .await
+                    {
+                        logging::warning(format!("Cannot break block: {error}"));
+                    }
+                }
+                ConsoleCommand::BreakNearest { block_id } => {
+                    self.block_navigation
+                        .cancel(&self.minecraft, &self.movement)
+                        .await;
+                    if let Err(error) = self
+                        .tasks
+                        .break_nearest_block(
+                            &self.minecraft,
+                            &self.movement,
+                            &self.look,
+                            &self.interaction,
+                            block_id,
+                        )
+                        .await
+                    {
+                        logging::warning(format!("Cannot break block: {error}"));
+                    }
+                }
+                ConsoleCommand::PlaceLooked { block_id } => {
+                    self.block_navigation
+                        .cancel(&self.minecraft, &self.movement)
+                        .await;
+                    if let Err(error) = self
+                        .tasks
+                        .place_looked_block(
+                            &self.minecraft,
+                            &self.movement,
+                            &self.look,
+                            &self.interaction,
+                            block_id,
+                        )
+                        .await
+                    {
+                        logging::warning(format!("Cannot place block: {error}"));
+                    }
+                }
+                ConsoleCommand::PlaceAt { x, y, z, block_id } => {
+                    self.block_navigation
+                        .cancel(&self.minecraft, &self.movement)
+                        .await;
+                    if let Err(error) = self
+                        .tasks
+                        .place_block(
+                            &self.minecraft,
+                            &self.movement,
+                            &self.look,
+                            &self.interaction,
+                            crate::minecraft::world_state::BlockPosition { x, y, z },
+                            block_id,
+                        )
+                        .await
+                    {
+                        logging::warning(format!("Cannot place block: {error}"));
+                    }
+                }
+                ConsoleCommand::StopInteraction => {
+                    self.interaction
+                        .cancel(&self.minecraft, &self.movement, &self.look)
+                        .await
+                }
+                ConsoleCommand::InteractionStatus => self.print_interaction_status().await,
+                ConsoleCommand::TestOakLog => {
+                    self.block_navigation
+                        .cancel(&self.minecraft, &self.movement)
+                        .await;
+                    if let Err(error) = self
+                        .interaction
+                        .test_oak_log(&self.minecraft, &self.movement, &self.look)
+                        .await
+                    {
+                        logging::warning(format!("Oak-log test failed: {error}"));
+                    }
+                }
                 ConsoleCommand::Reconnect => {
+                    let _ = self.movement.stop(&self.minecraft).await;
                     self.block_navigation
                         .cancel(&self.minecraft, &self.movement)
                         .await;
                     self.look.cancel().await;
+                    self.interaction
+                        .cancel(&self.minecraft, &self.movement, &self.look)
+                        .await;
                     match self.minecraft.reconnect().await {
                         Ok(()) => println!("Reconnect successful."),
                         Err(error) => println!("Reconnect failed: {error}"),
@@ -312,8 +498,8 @@ impl App {
         };
         let nearest_only = limit == 1;
         match self
-            .block_search
-            .search_nearby(&self.minecraft, query.clone())
+            .tasks
+            .find_block(&self.minecraft, &self.block_search, query.clone())
             .await
         {
             Ok(results) if nearest_only => {
@@ -420,8 +606,25 @@ impl App {
             "Target: {}",
             snapshot.target.as_deref().unwrap_or("unknown")
         );
+        println!(
+            "Precision: {}",
+            snapshot
+                .precision
+                .map_or("unknown", |precision| match precision {
+                    crate::look::aim_point::LookPrecision::Natural => "Natural",
+                    crate::look::aim_point::LookPrecision::Precise => "Precise",
+                    crate::look::aim_point::LookPrecision::Instant => "Instant",
+                })
+        );
+        println!("Priority: {:?}", snapshot.priority);
+        println!(
+            "Target point: {}",
+            snapshot.target_point.as_deref().unwrap_or("not available")
+        );
         println!("Yaw: {}", fmt_opt(snapshot.yaw));
         println!("Pitch: {}", fmt_opt(snapshot.pitch));
+        println!("Yaw speed: {} deg/s", fmt_opt(snapshot.yaw_speed));
+        println!("Pitch speed: {} deg/s", fmt_opt(snapshot.pitch_speed));
         println!(
             "Elapsed: {:.1}s",
             snapshot.started_at.map_or(0.0, |started| started
@@ -429,6 +632,42 @@ impl App {
                 .unwrap_or_default()
                 .as_secs_f64())
         );
+        if let Some(reason) = snapshot.failure_reason {
+            println!("Failure reason: {reason}");
+        }
+    }
+
+    async fn print_interaction_status(&self) {
+        let snapshot = self.interaction.snapshot().await;
+        if snapshot.state == InteractionState::Idle {
+            println!("No interaction is active.");
+            return;
+        }
+        println!("State: {:?}", snapshot.state);
+        println!(
+            "Target: {}",
+            snapshot.target.as_deref().unwrap_or("unknown")
+        );
+        println!(
+            "Progress: {}",
+            snapshot
+                .progress_percent
+                .map_or_else(|| "not available".into(), |value| format!("{value}%"))
+        );
+        println!(
+            "Distance: {}",
+            snapshot
+                .distance
+                .map_or_else(|| "unknown".into(), |value| format!("{value:.1}"))
+        );
+        println!(
+            "Elapsed: {:.1}s",
+            snapshot.started_at.map_or(0.0, |started| started
+                .elapsed()
+                .unwrap_or_default()
+                .as_secs_f64())
+        );
+        println!("Retries: {}", snapshot.retries);
         if let Some(reason) = snapshot.failure_reason {
             println!("Failure reason: {reason}");
         }
@@ -601,6 +840,7 @@ impl App {
     async fn print_movement(&self) {
         let world = self.minecraft.world_state_snapshot().await;
         let movement = world.movement;
+        let local_input = self.movement.local_input().await;
         println!("Movement state: {:?}", movement.status);
         println!(
             "Destination: {}",
@@ -632,8 +872,61 @@ impl App {
                 .started_at
                 .map_or(0, |at| at.elapsed().unwrap_or_default().as_secs())
         );
+        println!(
+            "Movement adaptation: forward={} backward={} left={} right={} sprint={} speed={:.0}%",
+            local_input.forward,
+            local_input.backward,
+            local_input.left,
+            local_input.right,
+            local_input.sprint,
+            local_input.speed_multiplier * 100.0,
+        );
         if let Some(reason) = movement.failure_reason {
             println!("Failure reason: {reason}");
+        }
+    }
+
+    async fn print_task_status(&self) {
+        let workflow = self.tasks.status().await;
+        let movement = self.movement.snapshot().await;
+        let movement_text = match movement.status {
+            crate::minecraft::world_state::MovementStatus::FollowingPlayer => format!(
+                "Following {}",
+                movement.target_player.as_deref().unwrap_or("unknown")
+            ),
+            crate::minecraft::world_state::MovementStatus::MovingToPosition => {
+                movement.destination.map_or_else(
+                    || "Navigating".to_owned(),
+                    |position| {
+                        format!(
+                            "Navigating to {:.0} {:.0} {:.0}",
+                            position.x, position.y, position.z
+                        )
+                    },
+                )
+            }
+            crate::minecraft::world_state::MovementStatus::Completed => "Completed".to_owned(),
+            crate::minecraft::world_state::MovementStatus::Cancelled => "Cancelled".to_owned(),
+            crate::minecraft::world_state::MovementStatus::Failed => "Failed".to_owned(),
+            crate::minecraft::world_state::MovementStatus::Idle => "Idle".to_owned(),
+        };
+        let look = self.look.snapshot().await;
+        let look_text = match look.state {
+            LookState::Looking => {
+                format!("Tracking {}", look.target.as_deref().unwrap_or("target"))
+            }
+            LookState::Completed => {
+                format!("Looking at {}", look.target.as_deref().unwrap_or("target"))
+            }
+            LookState::Idle | LookState::Cancelled | LookState::Failed => "Idle".to_owned(),
+        };
+        println!("Movement: {movement_text}");
+        println!("Look: {look_text}");
+        if let Some(name) = workflow.name {
+            println!("Workflow: {name} ({:?})", workflow.state);
+            if let Some(step) = workflow.current_step {
+                println!("Current task: {step}");
+            }
         }
     }
 }
@@ -655,7 +948,9 @@ fn print_help() {
     println!("/gotoblockstatus  Show block-navigation status");
     println!("/cancelgotoblock  Cancel block navigation");
     println!("/goto X Y Z  Walk to coordinates");
-    println!("/stop       Stop movement immediately");
+    println!("/stop or /stopmovement  Stop movement only");
+    println!("/stopall    Stop movement and looking");
+    println!("/taskstatus Show movement and look tasks");
     println!("/follow NAME Follow a player");
     println!("/movement   Show movement status");
     println!("/look X Y Z  Look at a world position");
@@ -664,6 +959,14 @@ fn print_help() {
     println!("/lookentity TYPE  Look at an entity");
     println!("/lookstop   Stop looking");
     println!("/lookstatus Show look status");
+    println!("/breakblock  Break the block in the crosshair");
+    println!("/break X Y Z  Break a block");
+    println!("/breaknearest ID  Find, navigate to, and break a block");
+    println!("/place ID  Place the held block beside the crosshair target");
+    println!("/place X Y Z ID  Place a block at coordinates");
+    println!("/stopinteraction  Cancel block interaction");
+    println!("/interactionstatus  Show interaction status");
+    println!("/testoaklog  Break and restore the nearest oak log");
     println!("/reconnect  Reconnect to the configured server");
     println!("/quit       Shut down the application");
 }

@@ -32,6 +32,10 @@ pub struct Config {
     pub block_navigation: BlockNavigationConfig,
     #[serde(default)]
     pub look: LookConfig,
+    #[serde(default)]
+    pub interaction: InteractionConfig,
+    #[serde(default)]
+    pub multitasking: MultitaskingConfig,
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -99,6 +103,45 @@ pub struct MovementConfig {
     pub repath_interval_ms: u64,
     #[serde(default = "default_arrival_distance")]
     pub arrival_distance: f64,
+}
+
+/// Angles used by the movement adapter when pathfinding direction and camera
+/// direction differ.  Keeping these in configuration prevents command code
+/// from hardcoding a particular movement style.
+#[derive(Clone, Debug, Deserialize)]
+pub struct MultitaskingConfig {
+    #[serde(default = "default_normal_forward_angle")]
+    pub normal_forward_angle: f32,
+    #[serde(default = "default_strafe_angle")]
+    pub strafe_angle: f32,
+    #[serde(default = "default_backward_angle")]
+    pub backward_angle: f32,
+    #[serde(default = "default_extreme_angle")]
+    pub extreme_angle: f32,
+}
+
+fn default_normal_forward_angle() -> f32 {
+    35.0
+}
+fn default_strafe_angle() -> f32 {
+    75.0
+}
+fn default_backward_angle() -> f32 {
+    130.0
+}
+fn default_extreme_angle() -> f32 {
+    160.0
+}
+
+impl Default for MultitaskingConfig {
+    fn default() -> Self {
+        Self {
+            normal_forward_angle: default_normal_forward_angle(),
+            strafe_angle: default_strafe_angle(),
+            backward_angle: default_backward_angle(),
+            extreme_angle: default_extreme_angle(),
+        }
+    }
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -199,33 +242,288 @@ impl Default for BlockNavigationConfig {
 
 #[derive(Clone, Debug, Deserialize)]
 pub struct LookConfig {
-    #[serde(default = "default_look_speed")]
-    pub maximum_yaw_speed: f64,
-    #[serde(default = "default_look_speed")]
-    pub maximum_pitch_speed: f64,
     #[serde(default = "default_look_update_rate")]
     pub update_rate: u32,
-    #[serde(default = "default_look_arrival_tolerance")]
-    pub arrival_tolerance: f64,
+    #[serde(default = "default_reaction_delay_min_ms")]
+    pub reaction_delay_min_ms: u64,
+    #[serde(default = "default_reaction_delay_max_ms")]
+    pub reaction_delay_max_ms: u64,
+    #[serde(default = "default_true")]
+    pub moving_target_prediction: bool,
+    #[serde(default = "default_prediction_strength")]
+    pub prediction_strength: f64,
+    #[serde(default = "default_minimum_target_movement")]
+    pub minimum_target_movement: f64,
+    #[serde(default)]
+    pub randomization: LookRandomizationConfig,
+    #[serde(default)]
+    pub motion: LookMotionConfig,
 }
 
-fn default_look_speed() -> f64 {
-    180.0
-}
 fn default_look_update_rate() -> u32 {
     20
 }
+fn default_reaction_delay_min_ms() -> u64 {
+    35
+}
+fn default_reaction_delay_max_ms() -> u64 {
+    90
+}
+fn default_prediction_strength() -> f64 {
+    0.35
+}
+fn default_minimum_target_movement() -> f64 {
+    0.03
+}
+
+#[derive(Clone, Debug, Deserialize)]
+pub struct LookRandomizationConfig {
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+    #[serde(default = "default_true")]
+    pub block_randomization: bool,
+    #[serde(default = "default_true")]
+    pub entity_randomization: bool,
+    #[serde(default = "default_true")]
+    pub player_randomization: bool,
+    #[serde(default = "default_horizontal_strength")]
+    pub horizontal_strength: f64,
+    #[serde(default = "default_vertical_strength")]
+    pub vertical_strength: f64,
+    #[serde(default = "default_minimum_hold_time_ms")]
+    pub minimum_hold_time_ms: u64,
+    #[serde(default = "default_maximum_hold_time_ms")]
+    pub maximum_hold_time_ms: u64,
+    #[serde(default = "default_retarget_chance")]
+    pub retarget_chance_per_second: f64,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+pub struct LookMotionConfig {
+    #[serde(default = "default_minimum_yaw_speed")]
+    pub minimum_yaw_speed: f64,
+    #[serde(default = "default_maximum_yaw_speed")]
+    pub maximum_yaw_speed: f64,
+    #[serde(default = "default_minimum_pitch_speed")]
+    pub minimum_pitch_speed: f64,
+    #[serde(default = "default_maximum_pitch_speed")]
+    pub maximum_pitch_speed: f64,
+    #[serde(default = "default_yaw_acceleration")]
+    pub yaw_acceleration: f64,
+    #[serde(default = "default_pitch_acceleration")]
+    pub pitch_acceleration: f64,
+    #[serde(default = "default_yaw_deceleration")]
+    pub yaw_deceleration: f64,
+    #[serde(default = "default_pitch_deceleration")]
+    pub pitch_deceleration: f64,
+    #[serde(default = "default_slowdown_angle")]
+    pub slowdown_angle: f64,
+    #[serde(default = "default_look_arrival_tolerance")]
+    pub arrival_tolerance: f64,
+    #[serde(default = "default_true")]
+    pub micro_correction_enabled: bool,
+    #[serde(default = "default_micro_correction_strength")]
+    pub micro_correction_strength: f64,
+    #[serde(default = "default_speed_variation")]
+    pub speed_variation: f64,
+    #[serde(default = "default_overshoot_chance")]
+    pub overshoot_chance: f64,
+    #[serde(default = "default_maximum_overshoot_degrees")]
+    pub maximum_overshoot_degrees: f64,
+}
+
+fn default_true() -> bool {
+    true
+}
+fn default_horizontal_strength() -> f64 {
+    0.35
+}
+fn default_vertical_strength() -> f64 {
+    0.30
+}
+fn default_minimum_hold_time_ms() -> u64 {
+    350
+}
+fn default_maximum_hold_time_ms() -> u64 {
+    1200
+}
+fn default_retarget_chance() -> f64 {
+    0.35
+}
+fn default_minimum_yaw_speed() -> f64 {
+    25.0
+}
+fn default_maximum_yaw_speed() -> f64 {
+    220.0
+}
+fn default_minimum_pitch_speed() -> f64 {
+    20.0
+}
+fn default_maximum_pitch_speed() -> f64 {
+    160.0
+}
+fn default_yaw_acceleration() -> f64 {
+    600.0
+}
+fn default_pitch_acceleration() -> f64 {
+    450.0
+}
+fn default_yaw_deceleration() -> f64 {
+    700.0
+}
+fn default_pitch_deceleration() -> f64 {
+    550.0
+}
+fn default_slowdown_angle() -> f64 {
+    18.0
+}
 fn default_look_arrival_tolerance() -> f64 {
-    1.0
+    1.2
+}
+fn default_micro_correction_strength() -> f64 {
+    0.35
+}
+fn default_speed_variation() -> f64 {
+    0.10
+}
+fn default_overshoot_chance() -> f64 {
+    0.08
+}
+fn default_maximum_overshoot_degrees() -> f64 {
+    1.8
 }
 
 impl Default for LookConfig {
     fn default() -> Self {
         Self {
-            maximum_yaw_speed: 180.0,
-            maximum_pitch_speed: 180.0,
             update_rate: 20,
-            arrival_tolerance: 1.0,
+            reaction_delay_min_ms: 35,
+            reaction_delay_max_ms: 90,
+            moving_target_prediction: true,
+            prediction_strength: 0.35,
+            minimum_target_movement: 0.03,
+            randomization: LookRandomizationConfig::default(),
+            motion: LookMotionConfig::default(),
+        }
+    }
+}
+
+impl Default for LookRandomizationConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            block_randomization: true,
+            entity_randomization: true,
+            player_randomization: true,
+            horizontal_strength: 0.35,
+            vertical_strength: 0.30,
+            minimum_hold_time_ms: 350,
+            maximum_hold_time_ms: 1200,
+            retarget_chance_per_second: 0.35,
+        }
+    }
+}
+
+impl Default for LookMotionConfig {
+    fn default() -> Self {
+        Self {
+            minimum_yaw_speed: 25.0,
+            maximum_yaw_speed: 220.0,
+            minimum_pitch_speed: 20.0,
+            maximum_pitch_speed: 160.0,
+            yaw_acceleration: 600.0,
+            pitch_acceleration: 450.0,
+            yaw_deceleration: 700.0,
+            pitch_deceleration: 550.0,
+            slowdown_angle: 18.0,
+            arrival_tolerance: 1.2,
+            micro_correction_enabled: true,
+            micro_correction_strength: 0.35,
+            speed_variation: 0.10,
+            overshoot_chance: 0.08,
+            maximum_overshoot_degrees: 1.8,
+        }
+    }
+}
+
+#[derive(Clone, Debug, Deserialize)]
+pub struct InteractionConfig {
+    #[serde(default = "default_interaction_reach")]
+    pub maximum_reach: f64,
+    #[serde(default = "default_interaction_reach")]
+    pub placement_reach: f64,
+    #[serde(default = "default_interaction_reach")]
+    pub breaking_reach: f64,
+    #[serde(default = "default_interaction_retry_limit")]
+    pub retry_limit: u32,
+    #[serde(default = "default_interaction_retry_delay")]
+    pub retry_delay_ms: u64,
+    #[serde(default = "default_interaction_verification_timeout")]
+    pub verification_timeout_ms: u64,
+    #[serde(default = "default_true")]
+    pub auto_navigate: bool,
+    #[serde(default = "default_true")]
+    pub auto_precise_look: bool,
+    #[serde(default)]
+    pub face_targeting: FaceTargetingConfig,
+}
+#[derive(Clone, Debug, Deserialize)]
+pub struct FaceTargetingConfig {
+    #[serde(default = "default_face_inset")]
+    pub face_inset: f64,
+    #[serde(default = "default_edge_margin")]
+    pub edge_margin: f64,
+    #[serde(default = "default_face_attempts")]
+    pub maximum_face_attempts: usize,
+    #[serde(default = "default_hit_points_per_face")]
+    pub maximum_hit_points_per_face: usize,
+}
+fn default_face_inset() -> f64 {
+    0.001
+}
+fn default_edge_margin() -> f64 {
+    0.12
+}
+fn default_face_attempts() -> usize {
+    6
+}
+fn default_hit_points_per_face() -> usize {
+    5
+}
+impl Default for FaceTargetingConfig {
+    fn default() -> Self {
+        Self {
+            face_inset: default_face_inset(),
+            edge_margin: default_edge_margin(),
+            maximum_face_attempts: default_face_attempts(),
+            maximum_hit_points_per_face: default_hit_points_per_face(),
+        }
+    }
+}
+fn default_interaction_reach() -> f64 {
+    4.5
+}
+fn default_interaction_retry_limit() -> u32 {
+    3
+}
+fn default_interaction_retry_delay() -> u64 {
+    150
+}
+fn default_interaction_verification_timeout() -> u64 {
+    1500
+}
+impl Default for InteractionConfig {
+    fn default() -> Self {
+        Self {
+            maximum_reach: 4.5,
+            placement_reach: 4.5,
+            breaking_reach: 4.5,
+            retry_limit: 3,
+            retry_delay_ms: 150,
+            verification_timeout_ms: 1500,
+            auto_navigate: true,
+            auto_precise_look: true,
+            face_targeting: FaceTargetingConfig::default(),
         }
     }
 }
@@ -311,6 +609,17 @@ impl Config {
                 "arrival_distance must be greater than zero and at most 16".into(),
             ));
         }
+        let multitasking = &self.multitasking;
+        if !(0.0 < multitasking.normal_forward_angle
+            && multitasking.normal_forward_angle <= multitasking.strafe_angle
+            && multitasking.strafe_angle <= multitasking.backward_angle
+            && multitasking.backward_angle <= multitasking.extreme_angle
+            && multitasking.extreme_angle <= 180.0)
+        {
+            return Err(AppError::InvalidMovementConfiguration(
+                "multitasking angles must be ordered between 0 and 180 degrees".into(),
+            ));
+        }
         if self.block_search.default_radius == 0
             || self.block_search.maximum_radius == 0
             || self.block_search.default_radius > self.block_search.maximum_radius
@@ -365,13 +674,61 @@ impl Config {
                 "navigation distances, attempts, timeouts, or repath interval are invalid".into(),
             ));
         }
-        if !(self.look.maximum_yaw_speed > 0.0 && self.look.maximum_yaw_speed <= 720.0)
-            || !(self.look.maximum_pitch_speed > 0.0 && self.look.maximum_pitch_speed <= 720.0)
-            || !(1..=120).contains(&self.look.update_rate)
-            || !(self.look.arrival_tolerance > 0.0 && self.look.arrival_tolerance <= 45.0)
+        let randomization = &self.look.randomization;
+        let motion = &self.look.motion;
+        if !(1..=120).contains(&self.look.update_rate)
+            || self.look.reaction_delay_max_ms < self.look.reaction_delay_min_ms
+            || !(0.0..=1.0).contains(&self.look.prediction_strength)
+            || !(self.look.minimum_target_movement >= 0.0
+                && self.look.minimum_target_movement <= 4.0)
+            || !(0.0..=1.0).contains(&randomization.horizontal_strength)
+            || !(0.0..=1.0).contains(&randomization.vertical_strength)
+            || randomization.minimum_hold_time_ms == 0
+            || randomization.maximum_hold_time_ms < randomization.minimum_hold_time_ms
+            || !(0.0..=1.0).contains(&randomization.retarget_chance_per_second)
+            || !(motion.minimum_yaw_speed > 0.0
+                && motion.minimum_yaw_speed <= motion.maximum_yaw_speed
+                && motion.maximum_yaw_speed <= 720.0)
+            || !(motion.minimum_pitch_speed > 0.0
+                && motion.minimum_pitch_speed <= motion.maximum_pitch_speed
+                && motion.maximum_pitch_speed <= 720.0)
+            || !(motion.yaw_acceleration > 0.0 && motion.yaw_acceleration <= 5000.0)
+            || !(motion.pitch_acceleration > 0.0 && motion.pitch_acceleration <= 5000.0)
+            || !(motion.yaw_deceleration > 0.0 && motion.yaw_deceleration <= 5000.0)
+            || !(motion.pitch_deceleration > 0.0 && motion.pitch_deceleration <= 5000.0)
+            || !(motion.slowdown_angle > 0.0 && motion.slowdown_angle <= 180.0)
+            || !(motion.arrival_tolerance > 0.0 && motion.arrival_tolerance <= 45.0)
+            || !(0.0..=1.0).contains(&motion.micro_correction_strength)
+            || !(0.0..=0.5).contains(&motion.speed_variation)
+            || !(0.0..=1.0).contains(&motion.overshoot_chance)
+            || !(0.0..=10.0).contains(&motion.maximum_overshoot_degrees)
         {
             return Err(AppError::InvalidLookConfiguration(
-                "look speeds, update_rate, or arrival_tolerance are invalid".into(),
+                "look randomization or motion configuration is invalid".into(),
+            ));
+        }
+        let interaction = &self.interaction;
+        if !(interaction.maximum_reach > 0.0 && interaction.maximum_reach <= 10.0)
+            || !(interaction.placement_reach > 0.0
+                && interaction.placement_reach <= interaction.maximum_reach)
+            || !(interaction.breaking_reach > 0.0
+                && interaction.breaking_reach <= interaction.maximum_reach)
+            || interaction.retry_limit > 10
+            || interaction.retry_delay_ms == 0
+            || interaction.retry_delay_ms > 10_000
+            || interaction.verification_timeout_ms == 0
+            || interaction.verification_timeout_ms > 30_000
+            || !(interaction.face_targeting.face_inset > 0.0
+                && interaction.face_targeting.face_inset < 0.5)
+            || !(interaction.face_targeting.edge_margin > interaction.face_targeting.face_inset
+                && interaction.face_targeting.edge_margin < 0.5)
+            || interaction.face_targeting.maximum_face_attempts == 0
+            || interaction.face_targeting.maximum_face_attempts > 36
+            || interaction.face_targeting.maximum_hit_points_per_face == 0
+            || interaction.face_targeting.maximum_hit_points_per_face > 5
+        {
+            return Err(AppError::InvalidInteractionConfiguration(
+                "reach, retry, or verification values are invalid".into(),
             ));
         }
         Ok(())
@@ -432,8 +789,14 @@ mod tests {
         assert_eq!(config.block_search.default_radius, 32);
         assert_eq!(config.block_search.default_result_limit, 20);
         assert_eq!(config.block_navigation.maximum_target_attempts, 8);
-        assert_eq!(config.look.maximum_yaw_speed, 180.0);
+        assert_eq!(config.look.motion.maximum_yaw_speed, 220.0);
         assert_eq!(config.look.update_rate, 20);
+        assert!(config.look.randomization.enabled);
+        assert_eq!(config.look.reaction_delay_min_ms, 35);
+        assert!(config.look.moving_target_prediction);
+        assert_eq!(config.interaction.maximum_reach, 4.5);
+        assert_eq!(config.multitasking.normal_forward_angle, 35.0);
+        assert_eq!(config.multitasking.extreme_angle, 160.0);
     }
 
     #[test]
@@ -465,7 +828,7 @@ mod tests {
 
     #[test]
     fn rejects_invalid_movement_configuration() {
-        let config: Config = toml::from_str(
+        let mut config: Config = toml::from_str(
             r#"
                 [minecraft]
                 server = "localhost"
@@ -484,6 +847,12 @@ mod tests {
             "#,
         )
         .unwrap();
+        assert!(matches!(
+            config.validate(),
+            Err(AppError::InvalidMovementConfiguration(_))
+        ));
+        config.movement.follow_distance = 3.0;
+        config.multitasking.strafe_angle = 20.0;
         assert!(matches!(
             config.validate(),
             Err(AppError::InvalidMovementConfiguration(_))
@@ -521,6 +890,29 @@ mod tests {
         config
             .validate()
             .expect("restored look configuration is valid");
+        config.look.randomization.horizontal_strength = 1.1;
+        assert!(matches!(
+            config.validate(),
+            Err(AppError::InvalidLookConfiguration(_))
+        ));
+        config.look.randomization.horizontal_strength = 0.35;
+        config.look.motion.minimum_yaw_speed = 221.0;
+        assert!(matches!(
+            config.validate(),
+            Err(AppError::InvalidLookConfiguration(_))
+        ));
+        config.look.motion.minimum_yaw_speed = 25.0;
+        config.look.reaction_delay_max_ms = 20;
+        assert!(matches!(
+            config.validate(),
+            Err(AppError::InvalidLookConfiguration(_))
+        ));
+        config.look.reaction_delay_max_ms = 90;
+        config.interaction.retry_limit = 11;
+        assert!(matches!(
+            config.validate(),
+            Err(AppError::InvalidInteractionConfiguration(_))
+        ));
     }
 
     #[test]

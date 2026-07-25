@@ -1,10 +1,19 @@
-use crate::minecraft::world_state::{BlockPosition, PositionSnapshot};
+use crate::{
+    look::aim_point::BlockAimMode,
+    minecraft::world_state::{BlockPosition, PositionSnapshot},
+};
 
 #[derive(Clone, Debug, PartialEq)]
 pub enum LookTarget {
     Block {
         position: BlockPosition,
         block_id: Option<String>,
+        aim_mode: BlockAimMode,
+    },
+    BlockFacePoint {
+        position: BlockPosition,
+        block_id: Option<String>,
+        point: [f64; 3],
     },
     World(PositionSnapshot),
     Entity(u32),
@@ -16,9 +25,16 @@ pub enum LookTarget {
 impl LookTarget {
     pub fn label(&self) -> String {
         match self {
-            Self::Block { position, block_id } => block_id
+            Self::Block {
+                position, block_id, ..
+            } => block_id
                 .clone()
                 .unwrap_or_else(|| format!("block {} {} {}", position.x, position.y, position.z)),
+            Self::BlockFacePoint {
+                position, block_id, ..
+            } => block_id.clone().unwrap_or_else(|| {
+                format!("block face {} {} {}", position.x, position.y, position.z)
+            }),
             Self::World(position) => format!(
                 "position ({:.1}, {:.1}, {:.1})",
                 position.x, position.y, position.z

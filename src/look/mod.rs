@@ -1,6 +1,8 @@
+pub mod aim_point;
 pub mod interpolation;
 pub mod look_controller;
 pub mod look_target;
+pub mod reaction;
 pub mod rotation;
 pub mod visibility;
 

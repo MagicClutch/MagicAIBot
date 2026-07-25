@@ -139,6 +139,56 @@ impl BlockNavigationService {
         Ok(())
     }
 
+    /// Navigate to the existing exact block position using the same safe
+    /// approach generation and pathfinding flow as `/gotoblock`.
+    pub async fn start_exact(
+        &self,
+        minecraft: &MinecraftClient,
+        movement: &MovementService,
+        position: BlockPosition,
+        block_id: String,
+    ) -> Result<(), AppError> {
+        let cells = minecraft.block_ids_at(&[position]).await?;
+        if cells.get(&position).and_then(Option::as_ref) != Some(&block_id) {
+            return Err(AppError::TargetBlockDisappeared);
+        }
+        let dimension = minecraft.world_state_snapshot().await.bot.dimension;
+        let generation = {
+            let mut inner = self.inner.lock().await;
+            let generation = inner.snapshot.generation.wrapping_add(1);
+            inner.snapshot = BlockNavigationSnapshot {
+                state: BlockNavigationState::SelectingTarget,
+                requested_block_id: Some(block_id.clone()),
+                search_radius: Some(0),
+                start_time: Some(SystemTime::now()),
+                last_progress_time: Some(SystemTime::now()),
+                maximum_attempts: self.config.maximum_target_attempts,
+                generation,
+                ..BlockNavigationSnapshot::default()
+            };
+            inner.candidates = vec![BlockSnapshot {
+                position,
+                block_id: block_id.clone(),
+                distance: 0.0,
+                dimension,
+                chunk_loaded: true,
+            }];
+            inner.failed_blocks.clear();
+            inner.failed_approaches.clear();
+            generation
+        };
+        let _ = movement.stop(minecraft).await;
+        if !self
+            .try_next_target(minecraft, movement, generation)
+            .await?
+        {
+            self.fail(generation, "no reachable approach position".into())
+                .await;
+            return Err(AppError::NoValidApproachPosition);
+        }
+        Ok(())
+    }
+
     pub async fn cancel(&self, minecraft: &MinecraftClient, movement: &MovementService) {
         let _ = movement.stop(minecraft).await;
         let mut inner = self.inner.lock().await;

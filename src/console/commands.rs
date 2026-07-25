@@ -24,6 +24,8 @@ pub enum ConsoleCommand {
         z: i32,
     },
     Stop,
+    StopAll,
+    TaskStatus,
     Follow {
         player: String,
     },
@@ -59,6 +61,27 @@ pub enum ConsoleCommand {
     },
     LookStop,
     LookStatus,
+    BreakBlock,
+    Break {
+        x: i32,
+        y: i32,
+        z: i32,
+    },
+    BreakNearest {
+        block_id: String,
+    },
+    PlaceLooked {
+        block_id: String,
+    },
+    PlaceAt {
+        x: i32,
+        y: i32,
+        z: i32,
+        block_id: String,
+    },
+    StopInteraction,
+    InteractionStatus,
+    TestOakLog,
     Reconnect,
     Quit,
 }
@@ -124,7 +147,9 @@ pub fn parse_input(input: &str) -> Result<ConsoleInput, AppError> {
                 z: destination.z as i32,
             }
         }
-        "stop" => no_arguments(command, arguments, ConsoleCommand::Stop)?,
+        "stop" | "stopmovement" => no_arguments(command, arguments, ConsoleCommand::Stop)?,
+        "stopall" => no_arguments(command, arguments, ConsoleCommand::StopAll)?,
+        "taskstatus" => no_arguments(command, arguments, ConsoleCommand::TaskStatus)?,
         "follow" => ConsoleCommand::Follow {
             player: parse_follow_name(arguments)?,
         },
@@ -134,7 +159,7 @@ pub fn parse_input(input: &str) -> Result<ConsoleInput, AppError> {
         "gotoblock" => parse_goto_block(arguments)?,
         "gotoblockstatus" => no_arguments(command, arguments, ConsoleCommand::GotoBlockStatus)?,
         "cancelgotoblock" => no_arguments(command, arguments, ConsoleCommand::CancelGotoBlock)?,
-        "look" => {
+        "look" | "lookat" => {
             let position = parse_coordinates(arguments)?;
             ConsoleCommand::Look {
                 x: position.x as i32,
@@ -158,6 +183,26 @@ pub fn parse_input(input: &str) -> Result<ConsoleInput, AppError> {
         },
         "lookstop" => no_arguments(command, arguments, ConsoleCommand::LookStop)?,
         "lookstatus" => no_arguments(command, arguments, ConsoleCommand::LookStatus)?,
+        "breakblock" => no_arguments(command, arguments, ConsoleCommand::BreakBlock)?,
+        "break" => {
+            let position = parse_coordinates(arguments)?;
+            ConsoleCommand::Break {
+                x: position.x as i32,
+                y: position.y as i32,
+                z: position.z as i32,
+            }
+        }
+        "breaknearest" => ConsoleCommand::BreakNearest {
+            block_id: normalize_block_id(single_argument(
+                command,
+                arguments,
+                "/breaknearest <block_id>",
+            )?)?,
+        },
+        "place" => parse_place(arguments)?,
+        "stopinteraction" => no_arguments(command, arguments, ConsoleCommand::StopInteraction)?,
+        "interactionstatus" => no_arguments(command, arguments, ConsoleCommand::InteractionStatus)?,
+        "testoaklog" => no_arguments(command, arguments, ConsoleCommand::TestOakLog)?,
         "reconnect" => no_arguments(command, arguments, ConsoleCommand::Reconnect)?,
         "quit" => no_arguments(command, arguments, ConsoleCommand::Quit)?,
         "chat" => {
@@ -174,6 +219,27 @@ pub fn parse_input(input: &str) -> Result<ConsoleInput, AppError> {
     };
 
     Ok(ConsoleInput::Command(parsed))
+}
+
+fn parse_place(arguments: &str) -> Result<ConsoleCommand, AppError> {
+    let parts: Vec<_> = arguments.split_whitespace().collect();
+    match parts.as_slice() {
+        [block_id] => Ok(ConsoleCommand::PlaceLooked {
+            block_id: normalize_block_id(block_id)?,
+        }),
+        [x, y, z, block_id] => Ok(ConsoleCommand::PlaceAt {
+            x: x.parse()
+                .map_err(|_| AppError::InvalidCoordinates("x must be an integer".into()))?,
+            y: y.parse()
+                .map_err(|_| AppError::InvalidCoordinates("y must be an integer".into()))?,
+            z: z.parse()
+                .map_err(|_| AppError::InvalidCoordinates("z must be an integer".into()))?,
+            block_id: normalize_block_id(block_id)?,
+        }),
+        _ => Err(AppError::InvalidConsoleSyntax(
+            "/place <block_id> or /place <x> <y> <z> <block_id>".into(),
+        )),
+    }
 }
 
 fn parse_find_block(arguments: &str) -> Result<ConsoleCommand, AppError> {
@@ -412,6 +478,64 @@ mod tests {
             ConsoleInput::Command(ConsoleCommand::LookEntity {
                 entity_type: "zombie".into()
             })
+        );
+    }
+
+    #[test]
+    fn parses_independent_task_control_commands() {
+        assert_eq!(
+            parse_input("/stopmovement").unwrap(),
+            ConsoleInput::Command(ConsoleCommand::Stop)
+        );
+        assert_eq!(
+            parse_input("/stopall").unwrap(),
+            ConsoleInput::Command(ConsoleCommand::StopAll)
+        );
+        assert_eq!(
+            parse_input("/taskstatus").unwrap(),
+            ConsoleInput::Command(ConsoleCommand::TaskStatus)
+        );
+        assert_eq!(
+            parse_input("/lookat 1 64 -2").unwrap(),
+            ConsoleInput::Command(ConsoleCommand::Look { x: 1, y: 64, z: -2 })
+        );
+    }
+
+    #[test]
+    fn parses_interaction_commands() {
+        assert_eq!(
+            parse_input("/breakblock").unwrap(),
+            ConsoleInput::Command(ConsoleCommand::BreakBlock)
+        );
+        assert_eq!(
+            parse_input("/break 1 64 -2").unwrap(),
+            ConsoleInput::Command(ConsoleCommand::Break { x: 1, y: 64, z: -2 })
+        );
+        assert_eq!(
+            parse_input("/breaknearest oak_log").unwrap(),
+            ConsoleInput::Command(ConsoleCommand::BreakNearest {
+                block_id: "minecraft:oak_log".into()
+            })
+        );
+        assert_eq!(
+            parse_input("/place cobblestone").unwrap(),
+            ConsoleInput::Command(ConsoleCommand::PlaceLooked {
+                block_id: "minecraft:cobblestone".into()
+            })
+        );
+        assert_eq!(
+            parse_input("/place 1 64 -2 cobblestone").unwrap(),
+            ConsoleInput::Command(ConsoleCommand::PlaceAt {
+                x: 1,
+                y: 64,
+                z: -2,
+                block_id: "minecraft:cobblestone".into()
+            })
+        );
+        assert!(parse_input("/place 1 2").is_err());
+        assert_eq!(
+            parse_input("/testoaklog").unwrap(),
+            ConsoleInput::Command(ConsoleCommand::TestOakLog)
         );
     }
 }

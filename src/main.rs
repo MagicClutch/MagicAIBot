@@ -4,6 +4,7 @@ mod blocks;
 mod config;
 mod console;
 mod error;
+mod interaction;
 mod logging;
 mod look;
 pub mod minecraft;

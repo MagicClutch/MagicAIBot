@@ -6,31 +6,44 @@ use std::{
 use tokio::sync::Mutex;
 
 use crate::{
-    config::MovementConfig,
+    config::{MovementConfig, MultitaskingConfig},
     error::AppError,
     minecraft::{
         client::MinecraftClient,
         world_state::{MovementSnapshot, MovementStatus, PositionSnapshot},
     },
     movement::logger,
+    movement::multitasking::{LocalMovementInput, local_input_for_direction},
     movement::navigator::{arrived, distance, following_snapshot, moving_snapshot},
 };
 
 #[derive(Clone)]
 pub struct MovementService {
     config: MovementConfig,
+    multitasking: MultitaskingConfig,
     state: Arc<Mutex<MovementSnapshot>>,
+    local_input: Arc<Mutex<LocalMovementInput>>,
 }
 
 impl MovementService {
-    pub fn new(config: MovementConfig) -> Self {
+    pub fn new(config: MovementConfig, multitasking: MultitaskingConfig) -> Self {
         Self {
             config,
+            multitasking,
             state: Arc::new(Mutex::new(MovementSnapshot::default())),
+            local_input: Arc::new(Mutex::new(LocalMovementInput::default())),
         }
     }
     pub async fn snapshot(&self) -> MovementSnapshot {
         self.state.lock().await.clone()
+    }
+
+    /// The latest camera-relative movement recommendation. Azalea's
+    /// pathfinder remains the sole writer of live movement controls; exposing
+    /// this bounded adapter lets navigation and tests share human-like
+    /// direction policy without creating a competing controller.
+    pub async fn local_input(&self) -> LocalMovementInput {
+        *self.local_input.lock().await
     }
 
     pub async fn goto(
@@ -112,17 +125,33 @@ impl MovementService {
         Ok(())
     }
 
-    pub async fn tick(&self, minecraft: &MinecraftClient) {
+    pub async fn tick(&self, minecraft: &MinecraftClient, explicit_look: bool) {
         let snapshot = self.snapshot().await;
         match snapshot.status {
-            MovementStatus::MovingToPosition => self.tick_goto(minecraft, snapshot).await,
-            MovementStatus::FollowingPlayer => self.tick_follow(minecraft, snapshot).await,
+            MovementStatus::MovingToPosition => {
+                self.tick_goto(minecraft, snapshot, explicit_look).await
+            }
+            MovementStatus::FollowingPlayer => {
+                self.tick_follow(minecraft, snapshot, explicit_look).await
+            }
             _ => {}
         }
     }
 
-    async fn tick_goto(&self, minecraft: &MinecraftClient, mut snapshot: MovementSnapshot) {
+    async fn tick_goto(
+        &self,
+        minecraft: &MinecraftClient,
+        mut snapshot: MovementSnapshot,
+        explicit_look: bool,
+    ) {
         let world = minecraft.world_state_snapshot().await;
+        self.update_local_input(
+            world.bot.position,
+            snapshot.destination,
+            world.bot.yaw,
+            explicit_look,
+        )
+        .await;
         if arrived(
             world.bot.position,
             snapshot.destination,
@@ -173,7 +202,12 @@ impl MovementService {
         }
     }
 
-    async fn tick_follow(&self, minecraft: &MinecraftClient, mut snapshot: MovementSnapshot) {
+    async fn tick_follow(
+        &self,
+        minecraft: &MinecraftClient,
+        mut snapshot: MovementSnapshot,
+        explicit_look: bool,
+    ) {
         let world = minecraft.world_state_snapshot().await;
         let Some(name) = snapshot.target_player.clone() else {
             return self
@@ -192,6 +226,13 @@ impl MovementService {
         let Some(destination) = player.position else {
             return;
         };
+        self.update_local_input(
+            world.bot.position,
+            Some(destination),
+            world.bot.yaw,
+            explicit_look,
+        )
+        .await;
         snapshot.destination = Some(destination);
         snapshot.estimated_distance = world
             .bot
@@ -265,5 +306,29 @@ impl MovementService {
             }
         }
         minecraft.set_movement_snapshot(snapshot).await;
+    }
+
+    async fn update_local_input(
+        &self,
+        position: Option<PositionSnapshot>,
+        destination: Option<PositionSnapshot>,
+        camera_yaw: Option<f32>,
+        explicit_look: bool,
+    ) {
+        let Some((position, destination, camera_yaw)) = position
+            .zip(destination)
+            .zip(camera_yaw)
+            .map(|((a, b), c)| (a, b, c))
+        else {
+            return;
+        };
+        let dx = destination.x - position.x;
+        let dz = destination.z - position.z;
+        if dx.hypot(dz) < 0.01 {
+            return;
+        }
+        let travel_yaw = (-dx).atan2(dz).to_degrees() as f32;
+        *self.local_input.lock().await =
+            local_input_for_direction(travel_yaw, camera_yaw, explicit_look, &self.multitasking);
     }
 }

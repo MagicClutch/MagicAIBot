@@ -51,10 +51,33 @@ use crate::{
         events::handle_chat,
         world_state::{
             BlockPosition, InventorySlot, InventorySnapshot, MovementSnapshot, PlayerSnapshot,
-            PositionSnapshot, WorldConnectionState, WorldState, WorldStateSnapshot,
+            PositionSnapshot, TaskSnapshot, WorldConnectionState, WorldState, WorldStateSnapshot,
         },
     },
 };
+
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct HitboxSnapshot {
+    pub position: [f64; 3],
+    pub width: f64,
+    pub height: f64,
+}
+
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct LookedBlockSnapshot {
+    pub position: BlockPosition,
+    pub face: RaycastFace,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum RaycastFace {
+    Up,
+    Down,
+    North,
+    South,
+    West,
+    East,
+}
 
 const CONNECTION_TIMEOUT: Duration = Duration::from_secs(30);
 const MAX_CHAT_MESSAGE_LENGTH: usize = 256;
@@ -504,6 +527,53 @@ impl MinecraftClient {
             .map_err(|error| AppError::LookUnavailableWithReason(error.to_string()))
     }
 
+    pub(crate) async fn entity_hitbox(&self, entity_id: u32) -> Result<HitboxSnapshot, AppError> {
+        let client = self
+            .current_client
+            .lock()
+            .await
+            .clone()
+            .ok_or(AppError::LookUnavailable)?;
+        let Some(entity) = client
+            .entity_id_by_minecraft_id(MinecraftEntityId(entity_id as i32))
+            .map_err(|error| AppError::LookUnavailableWithReason(error.to_string()))?
+        else {
+            return Err(AppError::LookTargetDisappeared);
+        };
+        client
+            .query_entity::<(&Position, &EntityDimensions), _>(entity, |(position, dimensions)| {
+                let position: azalea::Vec3 = **position;
+                HitboxSnapshot {
+                    position: [position.x, position.y, position.z],
+                    width: f64::from(dimensions.width),
+                    height: f64::from(dimensions.height),
+                }
+            })
+            .map_err(|_| AppError::LookTargetDisappeared)
+    }
+
+    pub(crate) async fn player_hitbox(&self, uuid: uuid::Uuid) -> Result<HitboxSnapshot, AppError> {
+        let client = self
+            .current_client
+            .lock()
+            .await
+            .clone()
+            .ok_or(AppError::LookUnavailable)?;
+        let Some(entity) = client.entity_id_by_uuid(uuid) else {
+            return Err(AppError::LookTargetDisappeared);
+        };
+        client
+            .query_entity::<(&Position, &EntityDimensions), _>(entity, |(position, dimensions)| {
+                let position: azalea::Vec3 = **position;
+                HitboxSnapshot {
+                    position: [position.x, position.y, position.z],
+                    width: f64::from(dimensions.width),
+                    height: f64::from(dimensions.height),
+                }
+            })
+            .map_err(|_| AppError::LookTargetDisappeared)
+    }
+
     pub(crate) async fn set_look_direction(&self, yaw: f32, pitch: f32) -> Result<(), AppError> {
         let client = self
             .current_client
@@ -516,8 +586,107 @@ impl MinecraftClient {
             .map_err(|error| AppError::LookUpdateFailure(error.to_string()))
     }
 
+    pub(crate) async fn looked_block(&self) -> Result<LookedBlockSnapshot, AppError> {
+        let client = self
+            .current_client
+            .lock()
+            .await
+            .clone()
+            .ok_or(AppError::LookUnavailable)?;
+        let hit = client
+            .hit_result()
+            .map_err(|error| AppError::LookUnavailableWithReason(error.to_string()))?;
+        let block = hit
+            .as_block_hit_result_if_not_miss()
+            .ok_or(AppError::LookTargetUnloaded)?;
+        Ok(LookedBlockSnapshot {
+            position: BlockPosition {
+                x: block.block_pos.x,
+                y: block.block_pos.y,
+                z: block.block_pos.z,
+            },
+            face: match block.direction {
+                azalea::core::direction::Direction::Up => RaycastFace::Up,
+                azalea::core::direction::Direction::Down => RaycastFace::Down,
+                azalea::core::direction::Direction::North => RaycastFace::North,
+                azalea::core::direction::Direction::South => RaycastFace::South,
+                azalea::core::direction::Direction::West => RaycastFace::West,
+                azalea::core::direction::Direction::East => RaycastFace::East,
+            },
+        })
+    }
+
+    pub(crate) async fn begin_breaking(&self, position: BlockPosition) -> Result<(), AppError> {
+        let client = self
+            .current_client
+            .lock()
+            .await
+            .clone()
+            .ok_or(AppError::MovementUnavailable)?;
+        client.start_mining(azalea::BlockPos::new(position.x, position.y, position.z));
+        Ok(())
+    }
+
+    pub(crate) async fn stop_breaking(&self) {
+        let Some(client) = self.current_client.lock().await.clone() else {
+            return;
+        };
+        if client.is_mining() {
+            client
+                .ecs
+                .write()
+                .write_message(azalea_client::mining::StopMiningBlockEvent {
+                    entity: client.entity,
+                });
+        }
+    }
+
+    pub(crate) async fn use_item_at_look_target(&self) -> Result<(), AppError> {
+        let client = self
+            .current_client
+            .lock()
+            .await
+            .clone()
+            .ok_or(AppError::MovementUnavailable)?;
+        client.start_use_item();
+        Ok(())
+    }
+
+    pub(crate) async fn select_item_in_hotbar(&self, item_id: &str) -> Result<bool, AppError> {
+        let client = self
+            .current_client
+            .lock()
+            .await
+            .clone()
+            .ok_or(AppError::InventoryUnavailable)?;
+        let menu = client.menu().map_err(|_| AppError::InventoryUnavailable)?;
+        let slot = menu
+            .hotbar_slots_range()
+            .enumerate()
+            .find_map(|(hotbar_slot, menu_slot)| {
+                menu.slots()
+                    .get(menu_slot)
+                    .filter(|item| !item.is_empty() && item.kind().to_string() == item_id)
+                    .map(|_| hotbar_slot as u8)
+            });
+        if let Some(slot) = slot {
+            client.set_selected_hotbar_slot(slot);
+            Ok(true)
+        } else {
+            Ok(false)
+        }
+    }
+
     pub async fn set_movement_snapshot(&self, movement: MovementSnapshot) {
         self.world_state.lock().await.set_movement(movement);
+    }
+
+    pub(crate) async fn set_current_task(&self, task: TaskSnapshot) {
+        self.world_state.lock().await.set_current_task(task);
+    }
+
+    pub(crate) async fn clear_current_task(&self) {
+        self.world_state.lock().await.clear_current_task();
     }
 
     pub async fn start_navigation_to(

@@ -6,6 +6,7 @@ edition = "2024"
 [dependencies]
 anyhow = "1"
 azalea = { git = "https://github.com/azalea-rs/azalea", default-features = false, features = ["serde", "packet-event", "online-mode"] }
+azalea-client = { git = "https://github.com/azalea-rs/azalea" }
 dotenvy = "0.15"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"

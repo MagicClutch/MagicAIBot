@@ -38,6 +38,20 @@ pub enum AppError {
     InvalidBlockNavigationConfiguration(String),
     #[error("invalid look configuration: {0}")]
     InvalidLookConfiguration(String),
+    #[error("invalid interaction configuration: {0}")]
+    InvalidInteractionConfiguration(String),
+    #[error("interaction target is out of reach")]
+    InteractionOutOfReach,
+    #[error("cannot break air")]
+    CannotBreakAir,
+    #[error("inventory does not contain {0}")]
+    InteractionItemMissing(String),
+    #[error("cannot place block: {0}")]
+    CannotPlaceBlock(String),
+    #[error("interaction timed out")]
+    InteractionTimeout,
+    #[error("interaction was cancelled")]
+    InteractionCancelled,
     #[error("bot position is unavailable")]
     BlockSearchPositionUnavailable,
     #[error("bot dimension is unavailable")]
