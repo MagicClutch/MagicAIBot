@@ -30,6 +30,8 @@ pub struct Config {
     pub block_search: BlockSearchConfig,
     #[serde(default)]
     pub block_navigation: BlockNavigationConfig,
+    #[serde(default)]
+    pub look: LookConfig,
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -194,6 +196,39 @@ impl Default for BlockNavigationConfig {
         }
     }
 }
+
+#[derive(Clone, Debug, Deserialize)]
+pub struct LookConfig {
+    #[serde(default = "default_look_speed")]
+    pub maximum_yaw_speed: f64,
+    #[serde(default = "default_look_speed")]
+    pub maximum_pitch_speed: f64,
+    #[serde(default = "default_look_update_rate")]
+    pub update_rate: u32,
+    #[serde(default = "default_look_arrival_tolerance")]
+    pub arrival_tolerance: f64,
+}
+
+fn default_look_speed() -> f64 {
+    180.0
+}
+fn default_look_update_rate() -> u32 {
+    20
+}
+fn default_look_arrival_tolerance() -> f64 {
+    1.0
+}
+
+impl Default for LookConfig {
+    fn default() -> Self {
+        Self {
+            maximum_yaw_speed: 180.0,
+            maximum_pitch_speed: 180.0,
+            update_rate: 20,
+            arrival_tolerance: 1.0,
+        }
+    }
+}
 fn default_follow_distance() -> f64 {
     3.0
 }
@@ -330,6 +365,15 @@ impl Config {
                 "navigation distances, attempts, timeouts, or repath interval are invalid".into(),
             ));
         }
+        if !(self.look.maximum_yaw_speed > 0.0 && self.look.maximum_yaw_speed <= 720.0)
+            || !(self.look.maximum_pitch_speed > 0.0 && self.look.maximum_pitch_speed <= 720.0)
+            || !(1..=120).contains(&self.look.update_rate)
+            || !(self.look.arrival_tolerance > 0.0 && self.look.arrival_tolerance <= 45.0)
+        {
+            return Err(AppError::InvalidLookConfiguration(
+                "look speeds, update_rate, or arrival_tolerance are invalid".into(),
+            ));
+        }
         Ok(())
     }
 }
@@ -388,6 +432,8 @@ mod tests {
         assert_eq!(config.block_search.default_radius, 32);
         assert_eq!(config.block_search.default_result_limit, 20);
         assert_eq!(config.block_navigation.maximum_target_attempts, 8);
+        assert_eq!(config.look.maximum_yaw_speed, 180.0);
+        assert_eq!(config.look.update_rate, 20);
     }
 
     #[test]
@@ -442,6 +488,39 @@ mod tests {
             config.validate(),
             Err(AppError::InvalidMovementConfiguration(_))
         ));
+    }
+
+    #[test]
+    fn rejects_invalid_look_configuration() {
+        let mut config: Config = toml::from_str(
+            r#"
+                [minecraft]
+                server = "localhost"
+                username = "MagicBot"
+                account_mode = "offline"
+
+                [reconnect]
+                enabled = false
+                delay_seconds = 1
+                maximum_attempts = 1
+
+                [logging]
+                level = "info"
+
+                [look]
+                update_rate = 0
+            "#,
+        )
+        .expect("test configuration should parse");
+
+        assert!(matches!(
+            config.validate(),
+            Err(AppError::InvalidLookConfiguration(_))
+        ));
+        config.look.update_rate = 20;
+        config
+            .validate()
+            .expect("restored look configuration is valid");
     }
 
     #[test]

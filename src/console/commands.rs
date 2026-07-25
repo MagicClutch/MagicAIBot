@@ -43,6 +43,22 @@ pub enum ConsoleCommand {
     },
     GotoBlockStatus,
     CancelGotoBlock,
+    Look {
+        x: i32,
+        y: i32,
+        z: i32,
+    },
+    LookBlock {
+        block_id: String,
+    },
+    LookPlayer {
+        player: String,
+    },
+    LookEntity {
+        entity_type: String,
+    },
+    LookStop,
+    LookStatus,
     Reconnect,
     Quit,
 }
@@ -118,6 +134,30 @@ pub fn parse_input(input: &str) -> Result<ConsoleInput, AppError> {
         "gotoblock" => parse_goto_block(arguments)?,
         "gotoblockstatus" => no_arguments(command, arguments, ConsoleCommand::GotoBlockStatus)?,
         "cancelgotoblock" => no_arguments(command, arguments, ConsoleCommand::CancelGotoBlock)?,
+        "look" => {
+            let position = parse_coordinates(arguments)?;
+            ConsoleCommand::Look {
+                x: position.x as i32,
+                y: position.y as i32,
+                z: position.z as i32,
+            }
+        }
+        "lookblock" => ConsoleCommand::LookBlock {
+            block_id: normalize_block_id(single_argument(
+                command,
+                arguments,
+                "/lookblock <block_id>",
+            )?)?,
+        },
+        "lookplayer" => ConsoleCommand::LookPlayer {
+            player: parse_follow_name(arguments)?,
+        },
+        "lookentity" => ConsoleCommand::LookEntity {
+            entity_type: single_argument(command, arguments, "/lookentity <entity_type>")?
+                .to_ascii_lowercase(),
+        },
+        "lookstop" => no_arguments(command, arguments, ConsoleCommand::LookStop)?,
+        "lookstatus" => no_arguments(command, arguments, ConsoleCommand::LookStatus)?,
         "reconnect" => no_arguments(command, arguments, ConsoleCommand::Reconnect)?,
         "quit" => no_arguments(command, arguments, ConsoleCommand::Quit)?,
         "chat" => {
@@ -231,6 +271,23 @@ fn no_arguments(
     }
 }
 
+fn single_argument<'a>(
+    command: &str,
+    arguments: &'a str,
+    usage: &str,
+) -> Result<&'a str, AppError> {
+    let mut parts = arguments.split_whitespace();
+    let value = parts
+        .next()
+        .ok_or_else(|| AppError::MissingConsoleArgument(usage.to_owned()))?;
+    if parts.next().is_some() {
+        return Err(AppError::InvalidConsoleSyntax(format!(
+            "/{command} accepts one argument"
+        )));
+    }
+    Ok(value)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -329,6 +386,32 @@ mod tests {
         assert_eq!(
             parse_input("/cancelgotoblock").unwrap(),
             ConsoleInput::Command(ConsoleCommand::CancelGotoBlock)
+        );
+    }
+
+    #[test]
+    fn parses_look_commands() {
+        assert_eq!(
+            parse_input("/look 1 64 -2").unwrap(),
+            ConsoleInput::Command(ConsoleCommand::Look { x: 1, y: 64, z: -2 })
+        );
+        assert_eq!(
+            parse_input("/lookblock stone").unwrap(),
+            ConsoleInput::Command(ConsoleCommand::LookBlock {
+                block_id: "minecraft:stone".into()
+            })
+        );
+        assert_eq!(
+            parse_input("/lookplayer Steve").unwrap(),
+            ConsoleInput::Command(ConsoleCommand::LookPlayer {
+                player: "Steve".into()
+            })
+        );
+        assert_eq!(
+            parse_input("/lookentity zombie").unwrap(),
+            ConsoleInput::Command(ConsoleCommand::LookEntity {
+                entity_type: "zombie".into()
+            })
         );
     }
 }

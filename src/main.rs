@@ -5,6 +5,7 @@ mod config;
 mod console;
 mod error;
 mod logging;
+mod look;
 pub mod minecraft;
 mod movement;
 mod navigation;

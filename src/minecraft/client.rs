@@ -21,7 +21,7 @@ use azalea::{
     core::entity_id::MinecraftEntityId,
     entity::{
         Dead, EntityKindComponent, EntityUuid, LocalEntity, LookDirection, Physics, Position,
-        inventory::Inventory, metadata::Health,
+        dimensions::EntityDimensions, inventory::Inventory, metadata::Health,
     },
     pathfinder::{
         PathfinderClientExt, PathfinderOpts,
@@ -477,6 +477,43 @@ impl MinecraftClient {
             result.insert(position, block_id);
         }
         Ok(result)
+    }
+
+    pub(crate) async fn look_data(&self) -> Result<([f64; 3], f32, f32), AppError> {
+        let client = self
+            .current_client
+            .lock()
+            .await
+            .clone()
+            .ok_or(AppError::LookUnavailable)?;
+        client
+            .query_self::<(&Position, &EntityDimensions, &LookDirection), _>(
+                |(position, dimensions, direction)| {
+                    let position: azalea::Vec3 = **position;
+                    (
+                        [
+                            position.x,
+                            position.y + f64::from(dimensions.eye_height),
+                            position.z,
+                        ],
+                        direction.y_rot(),
+                        direction.x_rot(),
+                    )
+                },
+            )
+            .map_err(|error| AppError::LookUnavailableWithReason(error.to_string()))
+    }
+
+    pub(crate) async fn set_look_direction(&self, yaw: f32, pitch: f32) -> Result<(), AppError> {
+        let client = self
+            .current_client
+            .lock()
+            .await
+            .clone()
+            .ok_or(AppError::LookUnavailable)?;
+        client
+            .set_direction(yaw, pitch)
+            .map_err(|error| AppError::LookUpdateFailure(error.to_string()))
     }
 
     pub async fn set_movement_snapshot(&self, movement: MovementSnapshot) {

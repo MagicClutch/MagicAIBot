@@ -16,6 +16,7 @@ use crate::{
     },
     error::AppError,
     logging,
+    look::{LookController, LookTarget, look_controller::LookState},
     minecraft::client::MinecraftClient,
     movement::MovementService,
     navigation::{BlockNavigationService, navigation_state::BlockNavigationState},
@@ -31,6 +32,7 @@ pub struct App {
     movement: MovementService,
     block_search: BlockSearchService,
     block_navigation: BlockNavigationService,
+    look: LookController,
     started_at: Instant,
 }
 
@@ -64,6 +66,14 @@ impl App {
                     config.block_search.default_vertical_range,
                 ),
             ),
+            look: LookController::new(
+                config.look.clone(),
+                BlockSearchService::new(
+                    config.block_search.maximum_radius,
+                    config.block_search.maximum_result_limit,
+                    config.block_search.default_vertical_range,
+                ),
+            ),
             config,
             shutdown: CancellationToken::new(),
             started_at: Instant::now(),
@@ -84,6 +94,9 @@ impl App {
         let mut movement_tick = tokio::time::interval(Duration::from_millis(
             self.config.movement.repath_interval_ms,
         ));
+        let mut look_tick = tokio::time::interval(Duration::from_millis(
+            1000 / u64::from(self.config.look.update_rate),
+        ));
         let console_task = self.config.console.enabled.then(|| {
             tokio::task::spawn_local(console::read_input(input_tx, self.shutdown.child_token()))
         });
@@ -98,6 +111,7 @@ impl App {
                     self.movement.tick(&self.minecraft).await;
                     self.block_navigation.tick(&self.minecraft, &self.movement).await;
                 },
+                _ = look_tick.tick() => self.look.tick(&self.minecraft).await,
                 input = input_rx.recv() => match input {
                     Some(Ok(ConsoleInput::Empty)) => {}
                     Some(Ok(input)) => {
@@ -115,6 +129,7 @@ impl App {
         self.block_navigation
             .cancel(&self.minecraft, &self.movement)
             .await;
+        self.look.cancel().await;
         let _ = self.movement.stop(&self.minecraft).await;
         self.minecraft.disconnect().await?;
         if let Some(task) = console_task {
@@ -214,10 +229,66 @@ impl App {
                         .cancel(&self.minecraft, &self.movement)
                         .await;
                 }
+                ConsoleCommand::Look { x, y, z } => {
+                    if let Err(error) = self
+                        .look
+                        .look_at(
+                            &self.minecraft,
+                            LookTarget::World(crate::minecraft::world_state::PositionSnapshot {
+                                x: f64::from(x),
+                                y: f64::from(y),
+                                z: f64::from(z),
+                            }),
+                        )
+                        .await
+                    {
+                        logging::warning(format!("Look failed: {error}"));
+                    }
+                }
+                ConsoleCommand::LookBlock { block_id } => {
+                    if let Err(error) = self.look.look_at_block_id(&self.minecraft, block_id).await
+                    {
+                        logging::warning(format!("Look failed: {error}"));
+                    }
+                }
+                ConsoleCommand::LookPlayer { player } => {
+                    if let Err(error) = self
+                        .look
+                        .look_at(&self.minecraft, LookTarget::Player(player))
+                        .await
+                    {
+                        logging::warning(format!("Look failed: {error}"));
+                    }
+                }
+                ConsoleCommand::LookEntity { entity_type } => {
+                    let world = self.minecraft.world_state_snapshot().await;
+                    let entity = world.entities.iter().find(|entity| {
+                        entity
+                            .entity_type
+                            .rsplit(':')
+                            .next()
+                            .is_some_and(|kind| kind.eq_ignore_ascii_case(&entity_type))
+                    });
+                    match entity {
+                        Some(entity) => {
+                            if let Err(error) = self
+                                .look
+                                .look_at(&self.minecraft, LookTarget::Entity(entity.entity_id))
+                                .await
+                            {
+                                logging::warning(format!("Look failed: {error}"));
+                            }
+                        }
+                        None => logging::warning(format!("Unknown entity: {entity_type}")),
+                    }
+                }
+                ConsoleCommand::LookStop => self.look.cancel().await,
+                ConsoleCommand::LookStatus => self.print_look_status().await,
                 ConsoleCommand::Reconnect => {
                     self.block_navigation
                         .cancel(&self.minecraft, &self.movement)
                         .await;
+                    self.look.cancel().await;
                     match self.minecraft.reconnect().await {
                         Ok(()) => println!("Reconnect successful."),
                         Err(error) => println!("Reconnect failed: {error}"),
@@ -325,6 +396,38 @@ impl App {
             snapshot
                 .start_time
                 .map_or(0, |started| started.elapsed().unwrap_or_default().as_secs())
+        );
+        if let Some(reason) = snapshot.failure_reason {
+            println!("Failure reason: {reason}");
+        }
+    }
+
+    async fn print_look_status(&self) {
+        let snapshot = self.look.snapshot().await;
+        if snapshot.state == LookState::Idle {
+            println!("No look task is active.");
+            return;
+        }
+        let state = match snapshot.state {
+            LookState::Looking => "Looking",
+            LookState::Completed => "Completed",
+            LookState::Cancelled => "Cancelled",
+            LookState::Failed => "Failed",
+            LookState::Idle => "Idle",
+        };
+        println!("State: {state}");
+        println!(
+            "Target: {}",
+            snapshot.target.as_deref().unwrap_or("unknown")
+        );
+        println!("Yaw: {}", fmt_opt(snapshot.yaw));
+        println!("Pitch: {}", fmt_opt(snapshot.pitch));
+        println!(
+            "Elapsed: {:.1}s",
+            snapshot.started_at.map_or(0.0, |started| started
+                .elapsed()
+                .unwrap_or_default()
+                .as_secs_f64())
         );
         if let Some(reason) = snapshot.failure_reason {
             println!("Failure reason: {reason}");
@@ -555,6 +658,12 @@ fn print_help() {
     println!("/stop       Stop movement immediately");
     println!("/follow NAME Follow a player");
     println!("/movement   Show movement status");
+    println!("/look X Y Z  Look at a world position");
+    println!("/lookblock ID  Look at a loaded block");
+    println!("/lookplayer NAME  Look at a player");
+    println!("/lookentity TYPE  Look at an entity");
+    println!("/lookstop   Stop looking");
+    println!("/lookstatus Show look status");
     println!("/reconnect  Reconnect to the configured server");
     println!("/quit       Shut down the application");
 }

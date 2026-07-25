@@ -36,6 +36,8 @@ pub enum AppError {
     InvalidBlockSearchVerticalRange(u32),
     #[error("invalid block-navigation configuration: {0}")]
     InvalidBlockNavigationConfiguration(String),
+    #[error("invalid look configuration: {0}")]
+    InvalidLookConfiguration(String),
     #[error("bot position is unavailable")]
     BlockSearchPositionUnavailable,
     #[error("bot dimension is unavailable")]
@@ -62,6 +64,20 @@ pub enum AppError {
     MovementStalled,
     #[error("block navigation timed out")]
     BlockNavigationTimeout,
+    #[error("look controller is unavailable")]
+    LookUnavailable,
+    #[error("look controller is unavailable: {0}")]
+    LookUnavailableWithReason(String),
+    #[error("look update failed: {0}")]
+    LookUpdateFailure(String),
+    #[error("look target is unloaded")]
+    LookTargetUnloaded,
+    #[error("look target disappeared")]
+    LookTargetDisappeared,
+    #[error("unknown entity: {0}")]
+    UnknownEntity(String),
+    #[error("look was cancelled")]
+    LookCancelled,
     #[error("invalid coordinates: {0}")]
     InvalidCoordinates(String),
     #[error("unknown player: {0}")]

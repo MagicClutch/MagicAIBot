@@ -45,3 +45,9 @@ maximum_target_attempts = 8
 stuck_timeout_seconds = 12
 maximum_navigation_seconds = 120
 repath_interval_ms = 1000
+
+[look]
+maximum_yaw_speed = 180
+maximum_pitch_speed = 180
+update_rate = 20
+arrival_tolerance = 1.0
