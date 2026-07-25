@@ -1,5 +1,6 @@
 mod ai;
 mod app;
+mod blocks;
 mod config;
 mod console;
 mod error;

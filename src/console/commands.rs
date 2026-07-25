@@ -1,6 +1,7 @@
 //! Parsing for local terminal input. Execution belongs to the application layer.
 
 use crate::{
+    blocks::block_query::normalize_block_id,
     error::AppError,
     movement::commands::{parse_coordinates, parse_follow_name},
 };
@@ -9,14 +10,33 @@ use crate::{
 pub enum ConsoleCommand {
     Help,
     Status,
-    Chat { message: String },
+    Chat {
+        message: String,
+    },
     Players,
     Inventory,
-    Entities { radius: Option<u32> },
-    Goto { x: i32, y: i32, z: i32 },
+    Entities {
+        radius: Option<u32>,
+    },
+    Goto {
+        x: i32,
+        y: i32,
+        z: i32,
+    },
     Stop,
-    Follow { player: String },
+    Follow {
+        player: String,
+    },
     Movement,
+    FindBlock {
+        block_id: String,
+        radius: Option<u32>,
+        limit: Option<usize>,
+    },
+    NearestBlock {
+        block_id: String,
+        radius: Option<u32>,
+    },
     Reconnect,
     Quit,
 }
@@ -87,6 +107,8 @@ pub fn parse_input(input: &str) -> Result<ConsoleInput, AppError> {
             player: parse_follow_name(arguments)?,
         },
         "movement" => no_arguments(command, arguments, ConsoleCommand::Movement)?,
+        "findblock" => parse_find_block(arguments)?,
+        "nearestblock" => parse_nearest_block(arguments)?,
         "reconnect" => no_arguments(command, arguments, ConsoleCommand::Reconnect)?,
         "quit" => no_arguments(command, arguments, ConsoleCommand::Quit)?,
         "chat" => {
@@ -103,6 +125,63 @@ pub fn parse_input(input: &str) -> Result<ConsoleInput, AppError> {
     };
 
     Ok(ConsoleInput::Command(parsed))
+}
+
+fn parse_find_block(arguments: &str) -> Result<ConsoleCommand, AppError> {
+    let mut parts = arguments.split_whitespace();
+    let block_id = parts.next().ok_or_else(|| {
+        AppError::MissingConsoleArgument("/findblock <block_id> [radius] [limit]".into())
+    })?;
+    let radius = parts
+        .next()
+        .map(|value| {
+            value.parse().map_err(|_| {
+                AppError::InvalidEntityQuery("radius must be a positive integer".into())
+            })
+        })
+        .transpose()?;
+    let limit = parts
+        .next()
+        .map(|value| {
+            value.parse().map_err(|_| {
+                AppError::InvalidEntityQuery("limit must be a positive integer".into())
+            })
+        })
+        .transpose()?;
+    if parts.next().is_some() {
+        return Err(AppError::InvalidConsoleSyntax(
+            "/findblock <block_id> [radius] [limit]".into(),
+        ));
+    }
+    Ok(ConsoleCommand::FindBlock {
+        block_id: normalize_block_id(block_id)?,
+        radius,
+        limit,
+    })
+}
+
+fn parse_nearest_block(arguments: &str) -> Result<ConsoleCommand, AppError> {
+    let mut parts = arguments.split_whitespace();
+    let block_id = parts.next().ok_or_else(|| {
+        AppError::MissingConsoleArgument("/nearestblock <block_id> [radius]".into())
+    })?;
+    let radius = parts
+        .next()
+        .map(|value| {
+            value.parse().map_err(|_| {
+                AppError::InvalidEntityQuery("radius must be a positive integer".into())
+            })
+        })
+        .transpose()?;
+    if parts.next().is_some() {
+        return Err(AppError::InvalidConsoleSyntax(
+            "/nearestblock <block_id> [radius]".into(),
+        ));
+    }
+    Ok(ConsoleCommand::NearestBlock {
+        block_id: normalize_block_id(block_id)?,
+        radius,
+    })
 }
 
 fn no_arguments(
@@ -143,6 +222,14 @@ mod tests {
             ConsoleInput::Command(ConsoleCommand::Help)
         );
         assert_eq!(
+            parse_input("/findblock stone 64 5").unwrap(),
+            ConsoleInput::Command(ConsoleCommand::FindBlock {
+                block_id: "minecraft:stone".into(),
+                radius: Some(64),
+                limit: Some(5),
+            })
+        );
+        assert_eq!(
             parse_input("/status").unwrap(),
             ConsoleInput::Command(ConsoleCommand::Status)
         );
@@ -176,6 +263,14 @@ mod tests {
             parse_input("/help now"),
             Err(AppError::InvalidConsoleSyntax(_))
         ));
+    }
+
+    #[test]
+    fn rejects_invalid_block_queries() {
+        assert!(parse_input("/findblock").is_err());
+        assert!(parse_input("/findblock minecraft:stone 0").is_ok());
+        assert!(parse_input("/findblock minecraft:stone abc").is_err());
+        assert!(parse_input("/nearestblock minecraft:stone 32 4").is_err());
     }
 
     #[test]

@@ -26,6 +26,8 @@ pub struct Config {
     pub world_state: WorldStateConfig,
     #[serde(default)]
     pub movement: MovementConfig,
+    #[serde(default)]
+    pub block_search: BlockSearchConfig,
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -93,6 +95,48 @@ pub struct MovementConfig {
     pub repath_interval_ms: u64,
     #[serde(default = "default_arrival_distance")]
     pub arrival_distance: f64,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+pub struct BlockSearchConfig {
+    #[serde(default = "default_block_search_radius")]
+    pub default_radius: u32,
+    #[serde(default = "default_block_search_maximum_radius")]
+    pub maximum_radius: u32,
+    #[serde(default = "default_block_search_result_limit")]
+    pub default_result_limit: usize,
+    #[serde(default = "default_block_search_maximum_result_limit")]
+    pub maximum_result_limit: usize,
+    #[serde(default = "default_block_search_vertical_range")]
+    pub default_vertical_range: u32,
+}
+
+fn default_block_search_radius() -> u32 {
+    32
+}
+fn default_block_search_maximum_radius() -> u32 {
+    128
+}
+fn default_block_search_result_limit() -> usize {
+    20
+}
+fn default_block_search_maximum_result_limit() -> usize {
+    256
+}
+fn default_block_search_vertical_range() -> u32 {
+    32
+}
+
+impl Default for BlockSearchConfig {
+    fn default() -> Self {
+        Self {
+            default_radius: default_block_search_radius(),
+            maximum_radius: default_block_search_maximum_radius(),
+            default_result_limit: default_block_search_result_limit(),
+            maximum_result_limit: default_block_search_maximum_result_limit(),
+            default_vertical_range: default_block_search_vertical_range(),
+        }
+    }
 }
 fn default_follow_distance() -> f64 {
     3.0
@@ -176,6 +220,31 @@ impl Config {
                 "arrival_distance must be greater than zero and at most 16".into(),
             ));
         }
+        if self.block_search.default_radius == 0
+            || self.block_search.maximum_radius == 0
+            || self.block_search.default_radius > self.block_search.maximum_radius
+            || self.block_search.maximum_radius > 256
+        {
+            return Err(AppError::InvalidBlockSearchConfiguration(
+                "radius must be positive, default_radius <= maximum_radius, and maximum_radius <= 256".into(),
+            ));
+        }
+        if self.block_search.default_result_limit == 0
+            || self.block_search.maximum_result_limit == 0
+            || self.block_search.default_result_limit > self.block_search.maximum_result_limit
+            || self.block_search.maximum_result_limit > 4096
+        {
+            return Err(AppError::InvalidBlockSearchConfiguration(
+                "result limits must be positive, default_result_limit <= maximum_result_limit, and maximum_result_limit <= 4096".into(),
+            ));
+        }
+        if self.block_search.default_vertical_range == 0
+            || self.block_search.default_vertical_range > 384
+        {
+            return Err(AppError::InvalidBlockSearchConfiguration(
+                "default_vertical_range must be between 1 and 384".into(),
+            ));
+        }
         Ok(())
     }
 }
@@ -231,6 +300,8 @@ mod tests {
 
         config.validate().expect("localhost should be valid");
         assert_eq!(config.minecraft.server, "localhost");
+        assert_eq!(config.block_search.default_radius, 32);
+        assert_eq!(config.block_search.default_result_limit, 20);
     }
 
     #[test]
@@ -284,6 +355,43 @@ mod tests {
         assert!(matches!(
             config.validate(),
             Err(AppError::InvalidMovementConfiguration(_))
+        ));
+    }
+
+    #[test]
+    fn rejects_invalid_block_search_configuration() {
+        let mut config: Config = toml::from_str(
+            r#"
+                [minecraft]
+                server = "localhost"
+                username = "MagicBot"
+                account_mode = "offline"
+                [reconnect]
+                enabled = false
+                delay_seconds = 1
+                maximum_attempts = 1
+                [logging]
+                level = "info"
+                [block_search]
+                default_radius = 129
+                maximum_radius = 128
+                default_result_limit = 20
+                maximum_result_limit = 256
+                default_vertical_range = 32
+            "#,
+        )
+        .unwrap();
+        assert!(matches!(
+            config.validate(),
+            Err(AppError::InvalidBlockSearchConfiguration(_))
+        ));
+        config.block_search.default_radius = 32;
+        config.block_search.maximum_radius = 128;
+        config.block_search.default_result_limit = 20;
+        config.block_search.maximum_result_limit = 4097;
+        assert!(matches!(
+            config.validate(),
+            Err(AppError::InvalidBlockSearchConfiguration(_))
         ));
     }
 }

@@ -27,3 +27,10 @@ stale_entity_seconds = 30
 follow_distance = 3.0
 repath_interval_ms = 500
 arrival_distance = 1.5
+
+[block_search]
+default_radius = 32
+maximum_radius = 128
+default_result_limit = 20
+maximum_result_limit = 256
+default_vertical_range = 32

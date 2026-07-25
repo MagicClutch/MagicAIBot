@@ -22,6 +22,32 @@ pub enum AppError {
     WorldStateUpdateFailure(String),
     #[error("invalid movement configuration: {0}")]
     InvalidMovementConfiguration(String),
+    #[error("invalid block-search configuration: {0}")]
+    InvalidBlockSearchConfiguration(String),
+    #[error("invalid block identifier: {0}")]
+    InvalidBlockIdentifier(String),
+    #[error("unknown block identifier: {0}")]
+    UnknownBlockIdentifier(String),
+    #[error("invalid block-search radius {radius}; maximum is {maximum}")]
+    InvalidBlockSearchRadius { radius: u32, maximum: u32 },
+    #[error("invalid block-search result limit {limit}; maximum is {maximum}")]
+    InvalidBlockSearchResultLimit { limit: usize, maximum: usize },
+    #[error("invalid block-search vertical range: {0}")]
+    InvalidBlockSearchVerticalRange(u32),
+    #[error("bot position is unavailable")]
+    BlockSearchPositionUnavailable,
+    #[error("bot dimension is unavailable")]
+    BlockSearchDimensionUnavailable,
+    #[error("no loaded chunks are available")]
+    NoLoadedChunks,
+    #[error("block search was cancelled")]
+    BlockSearchCancelled,
+    #[error("chunk became unavailable during block search")]
+    ChunkUnavailableDuringSearch,
+    #[error("block-state conversion failed: {0}")]
+    BlockStateConversionFailure(String),
+    #[error("block search is unavailable while disconnected")]
+    BlockSearchUnavailable,
     #[error("invalid coordinates: {0}")]
     InvalidCoordinates(String),
     #[error("unknown player: {0}")]

@@ -4,6 +4,11 @@ use std::{
 };
 
 use crate::{
+    blocks::{
+        BlockSearchService,
+        block_query::BlockSearchQuery,
+        block_search::{format_find_results, format_nearest_result},
+    },
     config::Config,
     console::{
         self,
@@ -23,6 +28,7 @@ pub struct App {
     shutdown: CancellationToken,
     minecraft: MinecraftClient,
     movement: MovementService,
+    block_search: BlockSearchService,
     started_at: Instant,
 }
 
@@ -43,6 +49,11 @@ impl App {
                 config.world_state.clone(),
             ),
             movement: MovementService::new(config.movement.clone()),
+            block_search: BlockSearchService::new(
+                config.block_search.maximum_radius,
+                config.block_search.maximum_result_limit,
+                config.block_search.default_vertical_range,
+            ),
             config,
             shutdown: CancellationToken::new(),
             started_at: Instant::now(),
@@ -148,6 +159,16 @@ impl App {
                     }
                 }
                 ConsoleCommand::Movement => self.print_movement().await,
+                ConsoleCommand::FindBlock {
+                    block_id,
+                    radius,
+                    limit,
+                } => {
+                    self.find_blocks(block_id, radius, limit).await;
+                }
+                ConsoleCommand::NearestBlock { block_id, radius } => {
+                    self.find_blocks(block_id, radius, Some(1)).await;
+                }
                 ConsoleCommand::Reconnect => match self.minecraft.reconnect().await {
                     Ok(()) => println!("Reconnect successful."),
                     Err(error) => println!("Reconnect failed: {error}"),
@@ -157,6 +178,32 @@ impl App {
             ConsoleInput::Empty => {}
         }
         Ok(false)
+    }
+
+    async fn find_blocks(&self, block_id: String, radius: Option<u32>, limit: Option<usize>) {
+        let radius = radius.unwrap_or(self.config.block_search.default_radius);
+        let limit = limit.unwrap_or(self.config.block_search.default_result_limit);
+        let query = BlockSearchQuery {
+            block_id,
+            radius,
+            maximum_results: limit,
+            vertical_range: self.config.block_search.default_vertical_range,
+        };
+        let nearest_only = limit == 1;
+        match self
+            .block_search
+            .search_nearby(&self.minecraft, query.clone())
+            .await
+        {
+            Ok(results) if nearest_only => {
+                println!(
+                    "{}",
+                    format_nearest_result(&query.block_id, radius, results.first())
+                );
+            }
+            Ok(results) => println!("{}", format_find_results(&query.block_id, radius, &results)),
+            Err(error) => logging::warning(format!("Block search failed: {error}")),
+        }
     }
 
     async fn print_status(&self) {
@@ -374,6 +421,8 @@ fn print_help() {
     println!("/players    Show known online players");
     println!("/inventory  Show inventory summary");
     println!("/entities [RADIUS]  Show nearby entities");
+    println!("/findblock ID [RADIUS] [LIMIT]  Find loaded blocks");
+    println!("/nearestblock ID [RADIUS]  Find nearest loaded block");
     println!("/goto X Y Z  Walk to coordinates");
     println!("/stop       Stop movement immediately");
     println!("/follow NAME Follow a player");

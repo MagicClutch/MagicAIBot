@@ -4,16 +4,20 @@
 //! our connection state and application errors.
 
 use std::{
+    cmp::Ordering,
     collections::HashSet,
     path::PathBuf,
     sync::Arc,
     time::{Duration, SystemTime},
 };
 
+use azalea::core::position::ChunkPos;
+use azalea::world::find_blocks::find_blocks_in_chunk;
 use azalea::{
     Client, Event,
     account::{Account, microsoft::MicrosoftAccountOpts},
     auto_reconnect::AutoReconnectDelay,
+    block::BlockStates,
     core::entity_id::MinecraftEntityId,
     entity::{
         Dead, EntityKindComponent, EntityUuid, LocalEntity, LookDirection, Physics, Position,
@@ -24,6 +28,7 @@ use azalea::{
         goals::{BlockPosGoal, RadiusGoal},
     },
     player::GameProfileComponent,
+    registry::builtin::BlockKind,
     world::WorldName,
 };
 use tokio::{
@@ -35,14 +40,18 @@ use tokio_util::sync::CancellationToken;
 use tracing::debug;
 
 use crate::{
+    blocks::{
+        block_query::{BlockSearchQuery, chunk_coordinate},
+        block_snapshot::LoadedBlockCandidate,
+    },
     config::{AccountMode, ConsoleConfig, MinecraftConfig, ReconnectConfig, WorldStateConfig},
     error::AppError,
     logging,
     minecraft::{
         events::handle_chat,
         world_state::{
-            InventorySlot, InventorySnapshot, MovementSnapshot, PlayerSnapshot, PositionSnapshot,
-            WorldConnectionState, WorldState, WorldStateSnapshot,
+            BlockPosition, InventorySlot, InventorySnapshot, MovementSnapshot, PlayerSnapshot,
+            PositionSnapshot, WorldConnectionState, WorldState, WorldStateSnapshot,
         },
     },
 };
@@ -93,6 +102,41 @@ pub struct NavigationStatus {
     pub calculating: bool,
     pub executing: bool,
     pub reached: bool,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct SearchCandidate {
+    position: BlockPosition,
+    distance_squared: f64,
+}
+
+impl PartialEq for SearchCandidate {
+    fn eq(&self, other: &Self) -> bool {
+        self.distance_squared == other.distance_squared && self.position == other.position
+    }
+}
+impl Eq for SearchCandidate {}
+impl PartialOrd for SearchCandidate {
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        Some(self.cmp(other))
+    }
+}
+impl Ord for SearchCandidate {
+    fn cmp(&self, other: &Self) -> Ordering {
+        self.distance_squared
+            .total_cmp(&other.distance_squared)
+            .then_with(|| {
+                (self.position.x, self.position.y, self.position.z).cmp(&(
+                    other.position.x,
+                    other.position.y,
+                    other.position.z,
+                ))
+            })
+    }
+}
+
+fn block_search_cancelled(state: ConnectionState) -> bool {
+    state != ConnectionState::Connected
 }
 
 struct SupervisorContext {
@@ -272,6 +316,140 @@ impl MinecraftClient {
     #[must_use]
     pub async fn world_state_snapshot(&self) -> WorldStateSnapshot {
         self.world_state.lock().await.snapshot()
+    }
+
+    pub(crate) async fn scan_loaded_blocks(
+        &self,
+        query: &BlockSearchQuery,
+    ) -> Result<Vec<LoadedBlockCandidate>, AppError> {
+        let world_snapshot = self.world_state_snapshot().await;
+        let center = world_snapshot
+            .bot
+            .position
+            .ok_or(AppError::BlockSearchPositionUnavailable)?;
+        let dimension = world_snapshot
+            .bot
+            .dimension
+            .clone()
+            .ok_or(AppError::BlockSearchDimensionUnavailable)?;
+        if self.connection_state() != ConnectionState::Connected || !world_snapshot.joined_world() {
+            return Err(AppError::BlockSearchUnavailable);
+        }
+
+        let block_kind = query
+            .block_id
+            .parse::<BlockKind>()
+            .map_err(|_| AppError::UnknownBlockIdentifier(query.block_id.clone()))?;
+        let block_states = BlockStates::from([block_kind]);
+        let client = self
+            .current_client
+            .lock()
+            .await
+            .clone()
+            .ok_or(AppError::BlockSearchUnavailable)?;
+        let world = client
+            .world()
+            .map_err(|error| AppError::WorldStateUpdateFailure(error.to_string()))?;
+
+        let radius = f64::from(query.radius);
+        let min_x = (center.x - radius).floor() as i32;
+        let max_x = (center.x + radius).floor() as i32;
+        let min_z = (center.z - radius).floor() as i32;
+        let max_z = (center.z + radius).floor() as i32;
+        let min_y = (center.y - f64::from(query.vertical_range)).floor() as i32;
+        let max_y = (center.y + f64::from(query.vertical_range)).floor() as i32;
+        let min_chunk = ChunkPos::new(chunk_coordinate(min_x), chunk_coordinate(min_z));
+        let max_chunk = ChunkPos::new(chunk_coordinate(max_x), chunk_coordinate(max_z));
+
+        let world_guard = world.read();
+        let world_min_y = world_guard.chunks.min_y();
+        let world_max_y = world_min_y + world_guard.chunks.height() as i32 - 1;
+        let min_y = min_y.max(world_min_y);
+        let max_y = max_y.min(world_max_y);
+        if min_y > max_y {
+            return Ok(Vec::new());
+        }
+
+        let mut nearest = std::collections::BinaryHeap::with_capacity(query.maximum_results);
+        let mut loaded_chunks = 0;
+        for chunk_x in min_chunk.x..=max_chunk.x {
+            for chunk_z in min_chunk.z..=max_chunk.z {
+                if block_search_cancelled(self.connection_state()) {
+                    return Err(AppError::BlockSearchCancelled);
+                }
+                let chunk_pos = ChunkPos::new(chunk_x, chunk_z);
+                let Some(chunk) = world_guard.chunks.get(&chunk_pos) else {
+                    continue;
+                };
+                loaded_chunks += 1;
+                let chunk_guard = chunk.read();
+                find_blocks_in_chunk(
+                    &block_states,
+                    chunk_pos,
+                    &chunk_guard,
+                    world_min_y,
+                    |position| {
+                        if position.x < min_x
+                            || position.x > max_x
+                            || position.y < min_y
+                            || position.y > max_y
+                            || position.z < min_z
+                            || position.z > max_z
+                        {
+                            return;
+                        }
+                        let dx = f64::from(position.x) + 0.5 - center.x;
+                        let dy = f64::from(position.y) + 0.5 - center.y;
+                        let dz = f64::from(position.z) + 0.5 - center.z;
+                        let distance_squared = dx * dx + dy * dy + dz * dz;
+                        if distance_squared > radius * radius {
+                            return;
+                        }
+                        let candidate = SearchCandidate {
+                            position: BlockPosition {
+                                x: position.x,
+                                y: position.y,
+                                z: position.z,
+                            },
+                            distance_squared,
+                        };
+                        if nearest.len() < query.maximum_results {
+                            nearest.push(candidate);
+                        } else if nearest.peek().is_some_and(|farthest| candidate < *farthest) {
+                            nearest.pop();
+                            nearest.push(candidate);
+                        }
+                    },
+                );
+            }
+        }
+
+        if loaded_chunks == 0 {
+            return Err(AppError::NoLoadedChunks);
+        }
+
+        let mut candidates: Vec<_> = nearest.into_vec();
+        candidates.sort_by(|left, right| {
+            left.distance_squared
+                .total_cmp(&right.distance_squared)
+                .then_with(|| {
+                    (left.position.x, left.position.y, left.position.z).cmp(&(
+                        right.position.x,
+                        right.position.y,
+                        right.position.z,
+                    ))
+                })
+        });
+        Ok(candidates
+            .into_iter()
+            .map(|candidate| LoadedBlockCandidate {
+                position: candidate.position,
+                block_id: query.block_id.clone(),
+                distance_squared: candidate.distance_squared,
+                dimension: Some(dimension.clone()),
+                chunk_loaded: true,
+            })
+            .collect())
     }
 
     pub async fn set_movement_snapshot(&self, movement: MovementSnapshot) {
@@ -925,4 +1103,10 @@ mod tests {
             })
             .await;
     }
+}
+#[test]
+fn block_search_cancels_when_connection_is_not_connected() {
+    assert!(block_search_cancelled(ConnectionState::Disconnected));
+    assert!(block_search_cancelled(ConnectionState::Reconnecting));
+    assert!(!block_search_cancelled(ConnectionState::Connected));
 }
