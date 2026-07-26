@@ -48,6 +48,27 @@ hello from plain console input
 /quit
 ```
 
+## Read-only crafting knowledge (Task 11)
+
+`/recipe <recipe-id>` inspects a recipe and `/craft-check <item> [count]
+[depth]` builds a deterministic plan against a cloned inventory snapshot. The
+service never clicks a menu, moves items, navigates, places a station, or changes
+inventory.
+
+The pinned Azalea revision targets Minecraft 26.2 / protocol 776. Azalea decodes
+recipe-book displays and item/tag holders, but its client packet plugin currently
+does not retain recipe-book packets, and the protocol's numeric display IDs are
+not resource-location recipe IDs. Therefore the service labels and caches a
+small, incomplete `fallback-1` diagnostic dataset for that exact version. The
+fallback contains only recipes needed to exercise the knowledge API; unsupported
+or absent recipes return structured failures rather than being guessed. A future
+server-recipe adapter takes precedence over and replaces this fallback.
+
+This read-only model and planner are ready to supply Task 12 inventory/crafting
+execution work. Crafting-table presence, synchronized recipe unlock state, the
+complete vanilla recipe corpus, special predicates, and non-crafting recipe
+types remain explicit integration work; no execution behavior is included here.
+
 ## Project structure
 
 ```text

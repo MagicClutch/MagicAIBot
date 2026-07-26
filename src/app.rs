@@ -14,6 +14,7 @@ use crate::{
         self,
         commands::{ConsoleCommand, ConsoleInput, plain_chat_message},
     },
+    crafting::RecipeBook,
     error::AppError,
     interaction::{InteractionController, interaction_controller::InteractionState},
     logging,
@@ -37,6 +38,7 @@ pub struct App {
     look: LookController,
     interaction: InteractionController,
     tasks: TaskService,
+    recipes: RecipeBook,
     session_ready: bool,
     started_at: Instant,
 }
@@ -90,6 +92,7 @@ impl App {
                 block_navigation,
             ),
             tasks: TaskService::default(),
+            recipes: RecipeBook::fallback().map_err(AppError::RecipeData)?,
             session_ready: false,
             config,
             shutdown: CancellationToken::new(),
@@ -202,6 +205,10 @@ impl App {
                 }
                 ConsoleCommand::Players => self.print_players().await,
                 ConsoleCommand::Inventory => self.print_inventory().await,
+                ConsoleCommand::Recipe { id } => self.print_recipe(&id),
+                ConsoleCommand::CraftCheck { item, count, depth } => {
+                    self.print_craft_check(&item, count, depth).await
+                }
                 ConsoleCommand::Entities { radius } => self.print_entities(radius).await,
                 ConsoleCommand::Goto { x, y, z } => {
                     self.interaction
@@ -873,6 +880,65 @@ impl App {
             println!("{id} x{count}");
         }
     }
+
+    fn print_recipe(&self, id: &str) {
+        match self.recipes.recipe(id) {
+            Ok(recipe) => {
+                println!(
+                    "Recipe {} -> {} x{}",
+                    recipe.id, recipe.output, recipe.output_count
+                );
+                println!(
+                    "layout={:?}; station={:?}; known={}; special={}",
+                    recipe.layout, recipe.station, recipe.known, recipe.special
+                );
+                let source = self.recipes.source();
+                println!(
+                    "source={} protocol={} revision={} complete={}",
+                    source.version, source.protocol, source.revision, source.complete
+                );
+            }
+            Err(failure) => println!("Recipe unavailable: {failure:?}"),
+        }
+    }
+
+    async fn print_craft_check(&self, item: &str, count: u32, depth: usize) {
+        let world = self.minecraft.world_state_snapshot().await;
+        if !world.inventory.available {
+            println!("Craft check unavailable: inventory snapshot is unavailable");
+            return;
+        }
+        // No crafting menu/station state is currently retained by the client
+        // boundary. Reporting it unavailable is safer than navigating to or
+        // claiming access to a table.
+        let plan = self
+            .recipes
+            .plan(item, count, &world.inventory, false, depth);
+        println!("Read-only craft plan for {item} x{count}:");
+        if let Ok(recipe) = self.recipes.preferred(item) {
+            let operations = count.div_ceil(recipe.output_count);
+            let direct = self
+                .recipes
+                .availability(recipe, &world.inventory, false, operations);
+            println!(
+                "  direct: max_operations={}; missing={:?}; station={:?}",
+                direct.maximum_crafts, direct.missing, direct.station_required
+            );
+        }
+        for step in &plan.steps {
+            println!(
+                "  {}: {} operation(s) -> {} x{}",
+                step.recipe_id, step.operations, step.output, step.produced
+            );
+        }
+        match plan.failure {
+            Some(failure) => println!("Unavailable: {failure:?}"),
+            None => println!(
+                "Available ({} step(s)); inventory was not modified.",
+                plan.steps.len()
+            ),
+        }
+    }
     async fn print_entities(&self, radius: Option<u32>) {
         let world = self.minecraft.world_state_snapshot().await;
         let radius = f64::from(radius.unwrap_or(64));
@@ -1002,6 +1068,8 @@ fn print_help() {
     println!("/chat TEXT  Send TEXT to Minecraft chat");
     println!("/players    Show known online players");
     println!("/inventory  Show inventory summary");
+    println!("/recipe ID  Show a versioned read-only recipe");
+    println!("/craft-check ITEM [COUNT] [DEPTH]  Plan with a virtual inventory");
     println!("/entities [RADIUS]  Show nearby entities");
     println!("/findblock ID [RADIUS] [LIMIT]  Find loaded blocks");
     println!("/nearestblock ID [RADIUS]  Find nearest loaded block");

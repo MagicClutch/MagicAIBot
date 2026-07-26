@@ -16,6 +16,8 @@ pub enum AppError {
     WorldStateUnavailable,
     #[error("inventory is unavailable")]
     InventoryUnavailable,
+    #[error("recipe data unavailable: {0}")]
+    RecipeData(String),
     #[error("invalid entity query: {0}")]
     InvalidEntityQuery(String),
     #[error("world-state update failed: {0}")]
