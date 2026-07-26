@@ -17,6 +17,7 @@ use crate::{
         placement_rules::{has_support, is_air, is_replaceable},
         progress::estimated_progress,
         reach::{distance_to_block_center, within_reach},
+        tool_selection::{ToolFallbackPolicy, ToolSelectionPolicy},
     },
     logging,
     look::{LookController, LookTarget, aim_point::LookPrecision},
@@ -26,6 +27,7 @@ use crate::{
     },
     movement::MovementService,
     navigation::{BlockNavigationService, navigation_state::BlockNavigationState},
+    tasks::{ActionFailure, Invalidation, OperationId},
 };
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -45,6 +47,7 @@ pub enum InteractionState {
 }
 #[derive(Clone, Debug, Default)]
 pub struct InteractionSnapshot {
+    pub operation_id: Option<OperationId>,
     pub state: InteractionState,
     pub target: Option<String>,
     pub progress_percent: Option<u8>,
@@ -52,6 +55,7 @@ pub struct InteractionSnapshot {
     pub started_at: Option<SystemTime>,
     pub retries: u32,
     pub failure_reason: Option<String>,
+    pub failure: Option<ActionFailure>,
 }
 #[derive(Clone, Debug)]
 enum Operation {
@@ -352,6 +356,7 @@ impl InteractionController {
             .map(|position| distance_to_block_center(position, block_position));
         let mut inner = self.inner.lock().await;
         inner.snapshot = InteractionSnapshot {
+            operation_id: Some(OperationId::new()),
             state: InteractionState::Preparing,
             target: Some(target),
             distance,
@@ -404,7 +409,8 @@ impl InteractionController {
         ) {
             logging::info("Interaction cancelled");
         }
-        inner.snapshot.state = InteractionState::Idle;
+        inner.snapshot.state = InteractionState::Cancelled;
+        inner.snapshot.failure = Some(ActionFailure::Cancelled);
         inner.operation = None;
         inner.dispatched = false;
         inner.retry_at = None;
@@ -709,12 +715,25 @@ impl InteractionController {
                 target, expected, ..
             } => {
                 if self.config.auto_tool_switch {
-                    match minecraft.select_best_tool_in_hotbar(expected).await {
-                        Ok(Some(tool)) => logging::info(format!("Selected {tool} for {expected}")),
-                        Ok(None) => debug!(
-                            block = expected,
-                            "no suitable hotbar tool; breaking with current item"
-                        ),
+                    let policy = ToolSelectionPolicy {
+                        minimum_remaining_durability: self.config.minimum_tool_durability,
+                        fallback: if self.config.allow_hand_fallback {
+                            ToolFallbackPolicy::AllowHand
+                        } else {
+                            ToolFallbackPolicy::RequireSuitableTool
+                        },
+                        held_material_equivalence: self.config.held_tool_equivalence,
+                    };
+                    match minecraft
+                        .select_tool_for_block(
+                            expected,
+                            &policy,
+                            &self.config.protected_tools,
+                            &self.config.reserved_tools,
+                        )
+                        .await
+                    {
+                        Ok(selection) => logging::info(selection.explanation),
                         Err(error) => return self.retry_or_fail(&error.to_string()).await,
                     }
                 }
@@ -802,6 +821,7 @@ impl InteractionController {
         if inner.snapshot.retries >= self.config.retry_limit {
             inner.snapshot.state = InteractionState::Failed;
             inner.snapshot.failure_reason = Some(reason.into());
+            inner.snapshot.failure = Some(classify_failure(reason));
             inner.operation = None;
             if !inner.failure_logged {
                 inner.failure_logged = true;
@@ -867,6 +887,7 @@ impl InteractionController {
         let mut inner = self.inner.lock().await;
         inner.snapshot.state = InteractionState::Failed;
         inner.snapshot.failure_reason = Some(reason.into());
+        inner.snapshot.failure = Some(classify_failure(reason));
         inner.operation = None;
         if !inner.failure_logged {
             inner.failure_logged = true;
@@ -1012,6 +1033,28 @@ pub fn held_item(inventory: &InventorySnapshot) -> Option<&str> {
 #[allow(dead_code)]
 pub fn find_placeable_block(inventory: &InventorySnapshot, item_id: &str) -> bool {
     inventory.has_item(item_id, 1)
+}
+
+fn classify_failure(reason: &str) -> ActionFailure {
+    let lower = reason.to_ascii_lowercase();
+    if lower.contains("timed out") || lower.contains("timeout") {
+        ActionFailure::Timeout
+    } else if lower.contains("chunk unloaded") || lower.contains("unavailable") {
+        ActionFailure::Invalidated(Invalidation::WorldUnavailable)
+    } else if lower.contains("target")
+        && (lower.contains("changed") || lower.contains("disappeared"))
+    {
+        ActionFailure::Invalidated(Invalidation::TargetChanged)
+    } else if lower.contains("no safe") || lower.contains("no path") || lower.contains("reachable")
+    {
+        ActionFailure::NoPath
+    } else if lower.contains("reach") || lower.contains("range") {
+        ActionFailure::OutOfRange
+    } else if lower.contains("missing") || lower.contains("inventory does not contain") {
+        ActionFailure::Invalidated(Invalidation::InventoryChanged)
+    } else {
+        ActionFailure::Internal(reason.into())
+    }
 }
 #[cfg(test)]
 mod tests {
