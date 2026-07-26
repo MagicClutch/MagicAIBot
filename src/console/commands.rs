@@ -88,6 +88,12 @@ pub enum ConsoleCommand {
     },
     StopInteraction,
     InteractionStatus,
+    Craft {
+        target: String,
+        count: u32,
+    },
+    CraftStatus,
+    CraftStop,
     TestOakLog,
     Reconnect,
     Quit,
@@ -219,6 +225,7 @@ pub fn parse_input(input: &str) -> Result<ConsoleInput, AppError> {
         "placeblock" => parse_placeblock(arguments)?,
         "stopinteraction" => no_arguments(command, arguments, ConsoleCommand::StopInteraction)?,
         "interactionstatus" => no_arguments(command, arguments, ConsoleCommand::InteractionStatus)?,
+        "craft" => parse_craft(arguments)?,
         "testoaklog" => no_arguments(command, arguments, ConsoleCommand::TestOakLog)?,
         "reconnect" => no_arguments(command, arguments, ConsoleCommand::Reconnect)?,
         "quit" => no_arguments(command, arguments, ConsoleCommand::Quit)?,
@@ -236,6 +243,53 @@ pub fn parse_input(input: &str) -> Result<ConsoleInput, AppError> {
     };
 
     Ok(ConsoleInput::Command(parsed))
+}
+
+fn normalize_item_id(value: &str) -> Result<String, AppError> {
+    let value = if value.contains(':') {
+        value.to_owned()
+    } else {
+        format!("minecraft:{value}")
+    };
+    let valid = value.split_once(':').is_some_and(|(namespace, path)| {
+        !namespace.is_empty()
+            && !path.is_empty()
+            && value.bytes().all(|b| {
+                b.is_ascii_lowercase()
+                    || b.is_ascii_digit()
+                    || matches!(b, b'_' | b'-' | b'.' | b'/' | b':')
+            })
+    });
+    if valid {
+        Ok(value)
+    } else {
+        Err(AppError::InvalidConsoleSyntax(
+            "invalid item identifier".into(),
+        ))
+    }
+}
+
+fn parse_craft(arguments: &str) -> Result<ConsoleCommand, AppError> {
+    let parts: Vec<_> = arguments.split_whitespace().collect();
+    match parts.as_slice() {
+        ["status"] => Ok(ConsoleCommand::CraftStatus),
+        ["stop"] => Ok(ConsoleCommand::CraftStop),
+        [target, count] => Ok(ConsoleCommand::Craft {
+            target: normalize_item_id(target)?,
+            count: count.parse().map_err(|_| {
+                AppError::InvalidConsoleSyntax("/craft <item> <positive-count>".into())
+            })?,
+        }),
+        _ => Err(AppError::InvalidConsoleSyntax(
+            "/craft <item> <count>, /craft status, or /craft stop".into(),
+        )),
+    }
+    .and_then(|command| match command {
+        ConsoleCommand::Craft { count: 0, .. } => Err(AppError::InvalidConsoleSyntax(
+            "craft count must be positive".into(),
+        )),
+        other => Ok(other),
+    })
 }
 
 fn parse_place(arguments: &str) -> Result<ConsoleCommand, AppError> {
@@ -441,6 +495,26 @@ mod tests {
                 message: "hello".to_owned()
             })
         );
+    }
+
+    #[test]
+    fn parses_crafting_debug_commands() {
+        assert_eq!(
+            parse_input("/craft stick 4").unwrap(),
+            ConsoleInput::Command(ConsoleCommand::Craft {
+                target: "minecraft:stick".into(),
+                count: 4
+            })
+        );
+        assert_eq!(
+            parse_input("/craft status").unwrap(),
+            ConsoleInput::Command(ConsoleCommand::CraftStatus)
+        );
+        assert_eq!(
+            parse_input("/craft stop").unwrap(),
+            ConsoleInput::Command(ConsoleCommand::CraftStop)
+        );
+        assert!(parse_input("/craft stick 0").is_err());
     }
 
     #[test]

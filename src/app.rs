@@ -14,6 +14,7 @@ use crate::{
         self,
         commands::{ConsoleCommand, ConsoleInput, plain_chat_message},
     },
+    crafting::CraftService,
     error::AppError,
     interaction::{InteractionController, interaction_controller::InteractionState},
     logging,
@@ -37,6 +38,7 @@ pub struct App {
     look: LookController,
     interaction: InteractionController,
     tasks: TaskService,
+    crafting: CraftService,
     session_ready: bool,
     started_at: Instant,
 }
@@ -90,6 +92,7 @@ impl App {
                 block_navigation,
             ),
             tasks: TaskService::default(),
+            crafting: CraftService::default(),
             session_ready: false,
             config,
             shutdown: CancellationToken::new(),
@@ -505,6 +508,28 @@ impl App {
                         .await
                 }
                 ConsoleCommand::InteractionStatus => self.print_interaction_status().await,
+                ConsoleCommand::Craft { target, count } => println!(
+                    "Craft request {target} x{count} rejected: this debug surface requires RecipeKnowledge to submit a resolved plan; it will not guess recipes or gather materials."
+                ),
+                ConsoleCommand::CraftStatus => {
+                    let status = self.crafting.status();
+                    println!(
+                        "Craft active: {}; recipe: {}; operations: {}; crafted: {}; last result: {:?}",
+                        status.active,
+                        status.recipe_id.as_deref().unwrap_or("none"),
+                        status.completed_operations,
+                        status.crafted,
+                        status.last_status
+                    );
+                }
+                ConsoleCommand::CraftStop => println!(
+                    "{}",
+                    if self.crafting.stop() {
+                        "Craft cancellation requested."
+                    } else {
+                        "No craft is active."
+                    }
+                ),
                 ConsoleCommand::TestOakLog => {
                     self.block_navigation
                         .cancel(&self.minecraft, &self.movement)
@@ -1031,6 +1056,8 @@ fn print_help() {
     println!("/placeblock ID [X Y Z]  Place through the reusable placement workflow");
     println!("/stopinteraction  Cancel block interaction");
     println!("/interactionstatus  Show interaction status");
+    println!("/craft ITEM COUNT  Submit a crafting debug request (requires a resolved plan)");
+    println!("/craft status | /craft stop  Inspect or cancel crafting");
     println!("/testoaklog  Break and restore the nearest oak log");
     println!("/reconnect  Reconnect to the configured server");
     println!("/quit       Shut down the application");
