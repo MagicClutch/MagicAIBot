@@ -21,7 +21,9 @@ use azalea::{
     core::entity_id::MinecraftEntityId,
     entity::{
         Dead, EntityKindComponent, EntityUuid, LocalEntity, LookDirection, Physics, Position,
-        dimensions::EntityDimensions, inventory::Inventory, metadata::Health,
+        dimensions::EntityDimensions,
+        inventory::Inventory,
+        metadata::{Health, ItemItem},
     },
     pathfinder::{
         PathfinderClientExt, PathfinderOpts,
@@ -501,6 +503,42 @@ impl MinecraftClient {
             result.insert(position, block_id);
         }
         Ok(result)
+    }
+
+    /// Reads the exact block kind and its generated property map while the
+    /// chunk read lock is held. A missing entry means the observation is not
+    /// reliable enough to act on.
+    pub(crate) async fn block_state_at(
+        &self,
+        position: BlockPosition,
+    ) -> Result<Option<(String, HashMap<String, String>)>, AppError> {
+        if self.connection_state() != ConnectionState::Connected {
+            return Err(AppError::BlockSearchCancelled);
+        }
+        let client = self
+            .current_client
+            .lock()
+            .await
+            .clone()
+            .ok_or(AppError::BlockSearchUnavailable)?;
+        let world = client
+            .world()
+            .map_err(|e| AppError::WorldStateUpdateFailure(e.to_string()))?;
+        let guard = world.read();
+        let Some(state) =
+            guard.get_block_state(azalea::BlockPos::new(position.x, position.y, position.z))
+        else {
+            return Ok(None);
+        };
+        let block = state.to_trait();
+        Ok(Some((
+            format!("minecraft:{}", block.id()),
+            block
+                .property_map()
+                .into_iter()
+                .map(|(k, v)| (k.to_owned(), v.to_owned()))
+                .collect(),
+        )))
     }
 
     pub(crate) async fn look_data(&self) -> Result<([f64; 3], f32, f32), AppError> {
@@ -1260,10 +1298,11 @@ async fn refresh_ecs_state(
         Option<&Dead>,
         Option<&Health>,
         Option<&WorldName>,
+        Option<&ItemItem>,
     )>();
     let mut updates = Vec::new();
     let mut existing_ids = HashSet::new();
-    for (entity, minecraft_id, uuid, kind, position, dead, health, _dimension) in
+    for (entity, minecraft_id, uuid, kind, position, dead, health, _dimension, item) in
         entities.iter(&ecs)
     {
         if Some(entity) == bot_entity {
@@ -1288,6 +1327,12 @@ async fn refresh_ecs_state(
             alive: Some(true),
             health: health.map(|health| health.0),
             custom_name: None,
+            item: item.and_then(|item| item.0.as_present()).map(|stack| {
+                crate::minecraft::world_state::DroppedItemSnapshot {
+                    item_id: stack.kind.to_string(),
+                    count: stack.count.max(0) as u32,
+                }
+            }),
             last_seen: SystemTime::now(),
         });
     }
