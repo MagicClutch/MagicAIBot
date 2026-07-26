@@ -170,7 +170,6 @@ impl App {
                     }
                     let explicit_look = self.look.snapshot().await.state == LookState::Looking;
                     self.movement.tick(&self.minecraft, explicit_look).await;
-                    self.block_navigation.tick(&self.minecraft, &self.movement).await;
                 },
                 _ = look_tick.tick() => {
                     let status = self.minecraft.navigation_status().await.ok();
@@ -179,6 +178,11 @@ impl App {
                     }
                 },
                 _ = interaction_tick.tick() => {
+                    // Block navigation owns interaction approach/repath state.
+                    // Tick it on the fast interaction cadence so an interaction
+                    // target does not wait for the slower movement repath timer
+                    // before the next path is selected.
+                    self.block_navigation.tick(&self.minecraft, &self.movement).await;
                     self.interaction.tick(&self.minecraft, &self.movement, &self.look).await;
                     self.container.tick(&self.minecraft, &self.movement, &self.block_navigation, &self.look).await;
                     self.food_collector.tick(&self.minecraft, &self.movement, &self.interaction, &self.look).await;
