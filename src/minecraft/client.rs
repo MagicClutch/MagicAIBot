@@ -642,6 +642,125 @@ impl MinecraftClient {
         }
     }
 
+    /// Explicitly interacts with a validated block instead of relying on the
+    /// currently ray-cast block. Azalea sends the normal use-on-block packet.
+    pub(crate) async fn interact_block(&self, position: BlockPosition) -> Result<(), AppError> {
+        let client = self
+            .current_client
+            .lock()
+            .await
+            .clone()
+            .ok_or(AppError::MovementUnavailable)?;
+        client.block_interact(azalea::BlockPos::new(position.x, position.y, position.z));
+        Ok(())
+    }
+
+    pub(crate) async fn any_container_open(&self) -> bool {
+        let Some(client) = self.current_client.lock().await.clone() else {
+            return false;
+        };
+        client
+            .component::<Inventory>()
+            .is_ok_and(|inventory| inventory.container_menu.is_some())
+    }
+
+    /// Maps Azalea's authoritative active menu into the application model.
+    pub(crate) async fn chest_menu_snapshot(
+        &self,
+    ) -> Result<Option<crate::container::model::MenuSnapshot>, AppError> {
+        use crate::container::model::{ContainerKind, MenuSnapshot, StackSnapshot};
+        use azalea::inventory::item::MaxStackSizeExt;
+        let client = self
+            .current_client
+            .lock()
+            .await
+            .clone()
+            .ok_or(AppError::InventoryUnavailable)?;
+        let inventory = client
+            .component::<Inventory>()
+            .map_err(|_| AppError::InventoryUnavailable)?;
+        let Some(menu) = inventory.container_menu.as_ref() else {
+            return Ok(None);
+        };
+        let kind = match menu {
+            azalea::inventory::Menu::Generic9x3 { .. } => ContainerKind::SingleChest,
+            azalea::inventory::Menu::Generic9x6 { .. } => ContainerKind::DoubleChest,
+            _ => return Ok(None),
+        };
+        let content_count = match kind {
+            ContainerKind::SingleChest => 27,
+            ContainerKind::DoubleChest => 54,
+        };
+        let map = |item: &azalea::inventory::ItemStack| {
+            item.as_present().map(|item| StackSnapshot {
+                item_id: item.kind.to_string(),
+                count: item.count.max(0) as u32,
+                max_count: item.kind.max_stack_size().max(1) as u32,
+            })
+        };
+        let slots = menu.slots();
+        Ok(Some(MenuSnapshot {
+            kind,
+            position: None,
+            window_id: inventory.id,
+            revision: inventory.state_id,
+            container_slots: slots[..content_count].iter().map(map).collect(),
+            player_slots: slots[content_count..].iter().map(map).collect(),
+        }))
+    }
+
+    pub(crate) async fn container_click(
+        &self,
+        window_id: i32,
+        click: crate::container::model::InventoryClick,
+    ) -> Result<(), AppError> {
+        use crate::container::model::ClickButton;
+        use azalea::inventory::operations::PickupClick;
+        let client = self
+            .current_client
+            .lock()
+            .await
+            .clone()
+            .ok_or(AppError::InventoryUnavailable)?;
+        let inventory = client
+            .component::<Inventory>()
+            .map_err(|_| AppError::InventoryUnavailable)?;
+        if inventory.id != window_id || inventory.container_menu.is_none() {
+            return Err(AppError::InventoryUnavailable);
+        }
+        let handle = client
+            .get_inventory()
+            .map_err(|_| AppError::InventoryUnavailable)?;
+        handle.click(match click.button {
+            ClickButton::Left => PickupClick::Left {
+                slot: Some(click.slot as u16),
+            },
+            ClickButton::Right => PickupClick::Right {
+                slot: Some(click.slot as u16),
+            },
+        });
+        Ok(())
+    }
+
+    pub(crate) async fn close_container(&self) -> Result<(), AppError> {
+        let client = self
+            .current_client
+            .lock()
+            .await
+            .clone()
+            .ok_or(AppError::InventoryUnavailable)?;
+        let inventory = client
+            .component::<Inventory>()
+            .map_err(|_| AppError::InventoryUnavailable)?;
+        if inventory.container_menu.is_some() {
+            client
+                .get_inventory()
+                .map_err(|_| AppError::InventoryUnavailable)?
+                .close();
+        }
+        Ok(())
+    }
+
     pub(crate) async fn use_item_at_look_target(&self) -> Result<(), AppError> {
         let client = self
             .current_client

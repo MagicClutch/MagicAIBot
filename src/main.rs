@@ -3,6 +3,7 @@ mod app;
 mod blocks;
 mod config;
 mod console;
+mod container;
 mod error;
 mod interaction;
 mod logging;
