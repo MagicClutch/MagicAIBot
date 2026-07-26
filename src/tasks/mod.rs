@@ -25,6 +25,7 @@ use crate::{
     error::AppError,
     interaction::InteractionController,
     look::{LookController, LookTarget},
+    logging,
     minecraft::{
         client::MinecraftClient,
         world_state::{BlockPosition, PositionSnapshot, TaskSnapshot},
@@ -355,6 +356,7 @@ impl TaskService {
     }
 
     pub fn cancel_task(&self, id: TaskId, reason: CancellationReason) -> bool {
+        logging::info(format!("Task {id} cancellation requested: {reason:?}"));
         let children = {
             let mut state = self.inner.state.lock().expect("task runtime lock poisoned");
             let Some(status) = state.active.get_mut(&id) else {
@@ -840,6 +842,7 @@ impl TaskService {
         let id = self
             .submit(TaskSubmission::command(name.clone(), name.clone()))
             .map_err(|e| AppError::TaskRuntime(e.message))?;
+        logging::info(format!("Task {id} created: {name}"));
         minecraft
             .set_current_task(TaskSnapshot {
                 name,
@@ -854,6 +857,10 @@ impl TaskService {
                     .map_err(|e| failure(TaskErrorCategory::Subsystem, e.to_string()))
             })
             .await;
+        logging::info(format!(
+            "Task {id} completed: {}",
+            if result.is_ok() { "success" } else { "failure" }
+        ));
         minecraft.clear_current_task().await;
         result.map_err(|e| AppError::TaskRuntime(e.message))
     }
