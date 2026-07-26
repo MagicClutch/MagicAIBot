@@ -351,6 +351,8 @@ fn parse_mine_ore(arguments: &str) -> Result<ConsoleCommand, AppError> {
         }
         _ => Err(AppError::InvalidConsoleSyntax("/mine-ore <ore|group> <count> [radius] | status | stop".into())),
     }
+}
+
 fn normalize_item_id(value: &str) -> Result<String, AppError> {
     if value.is_empty() || value.chars().any(char::is_whitespace) || value.matches(':').count() > 1
     {
