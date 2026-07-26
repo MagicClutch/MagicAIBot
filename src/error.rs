@@ -16,6 +16,8 @@ pub enum AppError {
     WorldStateUnavailable,
     #[error("inventory is unavailable")]
     InventoryUnavailable,
+    #[error("recipe data unavailable: {0}")]
+    RecipeData(String),
     #[error("inventory mutation is busy")]
     InventoryBusy,
     #[error("inventory mutation was rejected: {0}")]
