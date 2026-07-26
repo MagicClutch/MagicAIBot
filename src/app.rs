@@ -22,6 +22,7 @@ use crate::{
     error::AppError,
     food::{CollectFoodRequest, FoodCollector, FoodGoal},
     interaction::{InteractionController, interaction_controller::InteractionState},
+    inventory::{InventoryActionService, InventoryRequest},
     logging,
     look::{LookController, LookTarget, look_controller::LookState},
     minecraft::client::MinecraftClient,
@@ -45,6 +46,7 @@ pub struct App {
     block_navigation: BlockNavigationService,
     look: LookController,
     interaction: InteractionController,
+    inventory_actions: InventoryActionService,
     mining: MiningService,
     tasks: TaskService,
     collector: DropCollector,
@@ -109,6 +111,7 @@ impl App {
                 ),
                 block_navigation,
             ),
+            inventory_actions: InventoryActionService::default(),
             mining,
             tasks: TaskService::default(),
             collector: DropCollector::new(CollectorConfig::default()),
@@ -284,6 +287,30 @@ impl App {
                         }
                 ConsoleCommand::Players => self.print_players().await,
                 ConsoleCommand::Inventory => self.print_inventory().await,
+                ConsoleCommand::SelectHotbar { slot } => {
+                    let outcome = self
+                        .inventory_actions
+                        .execute(
+                            &self.minecraft,
+                            InventoryRequest::Select { hotbar: slot },
+                            &self.shutdown.child_token(),
+                        )
+                        .await;
+                    println!("Inventory action: {outcome:?}");
+                }
+                ConsoleCommand::EnsureHotbar { item_id, slot } => {
+                    let outcome = self
+                        .inventory_actions
+                        .execute(
+                            &self.minecraft,
+                            InventoryRequest::EnsureInHotbar {
+                                item_id,
+                                preferred: slot,
+                            },
+                            &self.shutdown.child_token(),
+                        )
+                        .await;
+                    println!("Inventory action: {outcome:?}");
                 ConsoleCommand::Smelt { target, count } => println!(
                     "Smelting request queued for {count} {target}; no live furnace container adapter is available in this build."
                 ),
@@ -1868,6 +1895,8 @@ fn print_help() {
     println!("/chat TEXT  Send TEXT to Minecraft chat");
     println!("/players    Show known online players");
     println!("/inventory  Show inventory summary");
+    println!("/select-hotbar SLOT  Confirm selection of hotbar slot 0-8");
+    println!("/ensure-hotbar ITEM [SLOT]  Confirm item placement and selection");
     println!("/smelt ID COUNT  Execute a standard-furnace recipe");
     println!("/smelt recipe ID COUNT  Execute a recipe by identifier");
     println!("/smelt status (or /smeltstatus)  Show furnace execution status");

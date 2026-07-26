@@ -2006,6 +2006,7 @@ name = "magic_ai_bot"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "async-trait",
  "azalea",
  "azalea-client",
  "azalea-inventory",
