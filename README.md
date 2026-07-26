@@ -85,5 +85,44 @@ This is intentionally a low-level chest adapter. It does not index or sort stora
 - Pathfinder results and server acceptance remain environment-dependent; loaded-world search does
   not explore or reveal unloaded blocks (no X-ray).
 
+## Project structure
+
+```text
+src/
+├── main.rs       # Tokio entry point
+├── app.rs        # Application composition and lifecycle
+├── config.rs     # TOML configuration and logging setup
+├── error.rs      # Unified application errors
+├── minecraft/    # Azalea connection and lifecycle integration
+├── console/      # Future operator commands
+├── movement/     # Future movement service
+├── skills/       # Future skill services
+├── tasks/        # Future task orchestration
+└── ai/           # Future AI decision-making
+```
+
+## Crafting execution status
+
+The crafting module accepts a resolved shaped or shapeless plan and executes a
+bounded, one-output-at-a-time transaction through a serialized menu driver. It
+selects the player 2x2 grid when possible and otherwise requests navigation to a
+known loaded crafting table. Every driver mutation must return a newer
+server-confirmed menu revision; output collection additionally requires the
+expected inventory-count delta. Failures attempt to return cursor/grid items and
+always report the remaining contents.
+
+`/craft <item> <count>`, `/craft status`, and `/craft stop` are debugging
+surfaces. Recipe lookup is intentionally not guessed by the command: until the
+read-only RecipeKnowledge task supplies a resolved plan and the runtime Azalea
+driver is wired, direct item requests are rejected. The executor never gathers
+or recursively crafts ingredients, creates or places a table, smelts, or chooses
+tools.
+
+Task 13 integration is **not ready for a live-server claim**: the transactional
+state machine and mocked player/table menus are ready, but this branch does not
+contain the prerequisite RecipeKnowledge/InventoryState services or a live
+Azalea menu-driver adapter. Those prerequisites should provide authoritative
+inventory revisions and own the Azalea click/navigation bridge before the next
+task consumes crafting execution.
 Out of scope: AI planning, persistence, autonomous survival/exploration/combat, advanced building,
 X-ray, reinforcement learning, and unrelated dependency upgrades.
