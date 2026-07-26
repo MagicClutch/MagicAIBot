@@ -375,27 +375,7 @@ fn parse_craft_check(arguments: &str) -> Result<ConsoleCommand, AppError> {
         item: normalize_item_id(parts[0])?,
         count,
         depth,
-    let value = if value.contains(':') {
-        value.to_owned()
-    } else {
-        format!("minecraft:{value}")
-    };
-    let valid = value.split_once(':').is_some_and(|(namespace, path)| {
-        !namespace.is_empty()
-            && !path.is_empty()
-            && value.bytes().all(|b| {
-                b.is_ascii_lowercase()
-                    || b.is_ascii_digit()
-                    || matches!(b, b'_' | b'-' | b'.' | b'/' | b':')
-            })
-    });
-    if valid {
-        Ok(value)
-    } else {
-        Err(AppError::InvalidConsoleSyntax(
-            "invalid item identifier".into(),
-        ))
-    }
+    })
 }
 
 fn parse_craft(arguments: &str) -> Result<ConsoleCommand, AppError> {
