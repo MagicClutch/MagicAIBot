@@ -7,6 +7,7 @@ use std::{
 
 use uuid::Uuid;
 
+use super::container::{ContainerObserver, ContainerSnapshot, MenuObservation};
 use crate::error::AppError;
 
 pub const DEFAULT_ENTITY_RADIUS: f64 = 64.0;
@@ -191,6 +192,7 @@ pub struct WorldStateSnapshot {
     pub connection: ConnectionSnapshot,
     pub bot: BotSnapshot,
     pub inventory: InventorySnapshot,
+    pub container: ContainerSnapshot,
     pub players: Vec<PlayerSnapshot>,
     pub entities: Vec<EntitySnapshot>,
     pub last_received_chat: Option<ChatRecord>,
@@ -205,6 +207,7 @@ impl Default for WorldStateSnapshot {
             connection: ConnectionSnapshot::default(),
             bot: BotSnapshot::default(),
             inventory: InventorySnapshot::default(),
+            container: ContainerSnapshot::default(),
             players: Vec::new(),
             entities: Vec::new(),
             last_received_chat: None,
@@ -231,6 +234,7 @@ pub struct WorldState {
     pub(crate) connection: ConnectionSnapshot,
     bot: BotSnapshot,
     inventory: InventorySnapshot,
+    container: ContainerObserver,
     players: HashMap<Uuid, PlayerSnapshot>,
     entities: HashMap<u32, EntitySnapshot>,
     last_received_chat: Option<ChatRecord>,
@@ -265,6 +269,7 @@ impl WorldState {
             connection: ConnectionSnapshot::default(),
             bot: BotSnapshot::default(),
             inventory: InventorySnapshot::default(),
+            container: ContainerObserver::default(),
             players: HashMap::new(),
             entities: HashMap::new(),
             last_received_chat: None,
@@ -295,6 +300,7 @@ impl WorldState {
         self.connection.joined_world = joined;
         if joined {
             self.connection.last_successful_join = Some(SystemTime::now());
+            self.container.begin_session(SystemTime::now());
         }
         self.touch();
     }
@@ -320,12 +326,20 @@ impl WorldState {
         self.inventory = inventory;
         self.touch();
     }
+    pub(crate) fn observe_container(&mut self, menu: Option<MenuObservation>, alive: bool) {
+        self.container.observe(menu, alive, SystemTime::now());
+        self.touch();
+    }
+    pub fn container_snapshot_for_generation(&self, generation: u64) -> ContainerSnapshot {
+        self.container.snapshot_for_generation(generation)
+    }
     pub fn clear_inventory(&mut self) {
         self.inventory = InventorySnapshot::default();
         self.touch();
     }
     /// Drop observations that belong to a disconnected Azalea session.
     pub fn clear_session_state(&mut self) {
+        self.container.disconnect(SystemTime::now());
         self.bot = BotSnapshot::default();
         self.players.clear();
         self.entities.clear();
@@ -491,6 +505,7 @@ impl WorldState {
             connection: self.connection.clone(),
             bot: self.bot.clone(),
             inventory: self.inventory.clone(),
+            container: self.container.snapshot(),
             players,
             entities,
             last_received_chat: self.last_received_chat.clone(),
