@@ -1,9 +1,13 @@
 mod ai;
 mod app;
 mod blocks;
+mod collection;
 mod config;
 mod console;
+mod crafting;
+mod container;
 mod error;
+mod food;
 mod interaction;
 mod logging;
 mod look;
@@ -13,6 +17,7 @@ mod navigation;
 mod processing;
 mod skills;
 mod tasks;
+mod tree_chopping;
 
 #[tokio::main(flavor = "current_thread")]
 async fn main() -> Result<(), error::AppError> {
