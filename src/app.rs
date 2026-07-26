@@ -505,6 +505,9 @@ impl App {
                         .await
                 }
                 ConsoleCommand::InteractionStatus => self.print_interaction_status().await,
+                ConsoleCommand::EnsureTool { block_id } => println!(
+                    "Ensure-tool request for {block_id}: orchestration is available; live recipe/crafting adapters are not configured."
+                ),
                 ConsoleCommand::TestOakLog => {
                     self.block_navigation
                         .cancel(&self.minecraft, &self.movement)
@@ -1031,6 +1034,7 @@ fn print_help() {
     println!("/placeblock ID [X Y Z]  Place through the reusable placement workflow");
     println!("/stopinteraction  Cancel block interaction");
     println!("/interactionstatus  Show interaction status");
+    println!("/ensure-tool ID  Debug an ensure-tool request (/craft-tool is an alias)");
     println!("/testoaklog  Break and restore the nearest oak log");
     println!("/reconnect  Reconnect to the configured server");
     println!("/quit       Shut down the application");
