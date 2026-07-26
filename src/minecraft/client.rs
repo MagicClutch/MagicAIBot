@@ -678,6 +678,51 @@ impl MinecraftClient {
         }
     }
 
+    /// Select the highest-scoring suitable tool in the hotbar. Equal scores
+    /// keep the current selection, then prefer the lowest hotbar slot.
+    pub(crate) async fn select_best_tool_in_hotbar(
+        &self,
+        block_id: &str,
+    ) -> Result<Option<String>, AppError> {
+        let client = self
+            .current_client
+            .lock()
+            .await
+            .clone()
+            .ok_or(AppError::InventoryUnavailable)?;
+        let menu = client.menu().map_err(|_| AppError::InventoryUnavailable)?;
+        let current = client
+            .component::<Inventory>()
+            .map_err(|_| AppError::InventoryUnavailable)?
+            .selected_hotbar_slot;
+        let slots = menu.slots();
+        let best = menu
+            .hotbar_slots_range()
+            .enumerate()
+            .filter_map(|(hotbar_slot, menu_slot)| {
+                let item = slots.get(menu_slot)?;
+                if item.is_empty() {
+                    return None;
+                }
+                let id = item.kind().to_string();
+                let score = crate::interaction::tool_selection::score(&id, block_id);
+                (score > 0).then_some((score, hotbar_slot as u8 == current, hotbar_slot as u8, id))
+            })
+            .max_by(|a, b| {
+                a.0.cmp(&b.0)
+                    .then(a.1.cmp(&b.1))
+                    .then_with(|| b.2.cmp(&a.2))
+            });
+        if let Some((_, _, slot, id)) = best {
+            if slot != current {
+                client.set_selected_hotbar_slot(slot);
+            }
+            Ok(Some(id))
+        } else {
+            Ok(None)
+        }
+    }
+
     pub async fn set_movement_snapshot(&self, movement: MovementSnapshot) {
         self.world_state.lock().await.set_movement(movement);
     }

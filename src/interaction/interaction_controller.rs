@@ -651,7 +651,21 @@ impl InteractionController {
             inner.snapshot.started_at = Some(SystemTime::now());
         }
         let result = match operation {
-            Operation::Break { target, .. } => minecraft.begin_breaking(*target).await,
+            Operation::Break {
+                target, expected, ..
+            } => {
+                if self.config.auto_tool_switch {
+                    match minecraft.select_best_tool_in_hotbar(expected).await {
+                        Ok(Some(tool)) => logging::info(format!("Selected {tool} for {expected}")),
+                        Ok(None) => debug!(
+                            block = expected,
+                            "no suitable hotbar tool; breaking with current item"
+                        ),
+                        Err(error) => return self.retry_or_fail(&error.to_string()).await,
+                    }
+                }
+                minecraft.begin_breaking(*target).await
+            }
             Operation::Place { item_id, .. } => {
                 match minecraft.select_item_in_hotbar(item_id).await {
                     Ok(true) => minecraft.use_item_at_look_target().await,
