@@ -21,7 +21,7 @@ use crate::{
     minecraft::client::MinecraftClient,
     movement::{MovementService, NavigationMode},
     navigation::{BlockNavigationService, navigation_state::BlockNavigationState},
-    tasks::TaskService,
+    tasks::{CancellationReason, GatherRequest, TaskId, TaskService},
 };
 use tokio::{sync::mpsc, task::JoinHandle};
 use tokio_util::sync::CancellationToken;
@@ -133,11 +133,15 @@ impl App {
                             self.block_navigation.cancel(&self.minecraft, &self.movement).await;
                             self.look.cancel().await;
                             let _ = self.movement.stop(&self.minecraft).await;
-                            self.tasks.cancel(&self.minecraft).await;
+                            self.tasks.disconnected();
+                            self.minecraft.clear_current_task().await;
                         }
                         continue;
                     }
                     self.session_ready = true;
+                    if self.minecraft.world_state_snapshot().await.bot.alive == Some(false) {
+                        self.tasks.player_died();
+                    }
                     let explicit_look = self.look.snapshot().await.state == LookState::Looking;
                     self.movement.tick(&self.minecraft, explicit_look).await;
                     self.block_navigation.tick(&self.minecraft, &self.movement).await;
@@ -163,6 +167,7 @@ impl App {
         };
 
         self.shutdown.cancel();
+        self.tasks.shutdown();
         self.block_navigation
             .cancel(&self.minecraft, &self.movement)
             .await;
@@ -277,6 +282,53 @@ impl App {
                     self.tasks.cancel(&self.minecraft).await;
                 }
                 ConsoleCommand::TaskStatus => self.print_task_status().await,
+                ConsoleCommand::TaskStatusById { id } => self.print_task_by_id(TaskId(id)),
+                ConsoleCommand::TaskCancel { id } => {
+                    if let Some(id) = id {
+                        println!(
+                            "Cancellation requested: {}",
+                            self.tasks.cancel_task(TaskId(id), CancellationReason::User)
+                        );
+                    } else {
+                        self.tasks.cancel_all(CancellationReason::User);
+                        println!("Cancellation requested for all active tasks.");
+                    }
+                }
+                ConsoleCommand::TaskRecent => self.print_recent_tasks(),
+                ConsoleCommand::Gather { target, quantity } => {
+                    let request = match target.as_str() {
+                        "logs" | "log" => GatherRequest::Logs { quantity },
+                        "stone" => GatherRequest::Stone { quantity },
+                        "ores" | "ore" => GatherRequest::VisibleOres { quantity },
+                        "food" => GatherRequest::Food { quantity },
+                        item => GatherRequest::Items(crate::tasks::CollectItemsRequest {
+                            item_ids: vec![if item.contains(':') {
+                                item.to_owned()
+                            } else {
+                                format!("minecraft:{item}")
+                            }],
+                            quantity,
+                            maximum_attempts: 32,
+                        }),
+                    };
+                    match self
+                        .tasks
+                        .gather_visible_blocks(
+                            &self.minecraft,
+                            &self.movement,
+                            &self.look,
+                            &self.interaction,
+                            request,
+                        )
+                        .await
+                    {
+                        Ok(result) => println!(
+                            "Gathered {}/{} in {} attempts.",
+                            result.collected, result.requested, result.attempts
+                        ),
+                        Err(error) => logging::warning(format!("Gather failed: {error}")),
+                    }
+                }
                 ConsoleCommand::Follow { player } => {
                     self.interaction
                         .cancel(&self.minecraft, &self.movement, &self.look)
@@ -983,11 +1035,72 @@ impl App {
         };
         println!("Movement: {movement_text}");
         println!("Look: {look_text}");
-        if let Some(name) = workflow.name {
-            println!("Workflow: {name} ({:?})", workflow.state);
-            if let Some(step) = workflow.current_step {
-                println!("Current task: {step}");
+        println!(
+            "Workflow: #{} {} ({:?})",
+            workflow.metadata.id, workflow.metadata.task_type, workflow.state
+        );
+        if !workflow.progress.phase.is_empty() {
+            println!(
+                "Progress: {} {}/{}",
+                workflow.progress.phase,
+                workflow.progress.completed_units,
+                workflow
+                    .progress
+                    .total_units
+                    .map_or_else(|| "?".into(), |n| n.to_string())
+            );
+        }
+        println!(
+            "Active tasks: {}; recent tasks: {}",
+            self.tasks.active().len(),
+            self.tasks.recent().len()
+        );
+    }
+
+    fn print_task_by_id(&self, id: TaskId) {
+        match self.tasks.query(id) {
+            Some(task) => {
+                println!("Task #{} {}: {:?}", id, task.metadata.task_type, task.state);
+                println!(
+                    "Source: {}; correlation: {}",
+                    task.metadata.source_command, task.metadata.correlation_id
+                );
+                println!(
+                    "Progress: {} {}/{}",
+                    task.progress.phase,
+                    task.progress.completed_units,
+                    task.progress
+                        .total_units
+                        .map_or_else(|| "?".into(), |n| n.to_string())
+                );
+                if let Some(failure) = task.failure {
+                    println!(
+                        "Failure: {:?}: {} (partial {})",
+                        failure.category, failure.message, failure.partial_completed
+                    );
+                }
             }
+            None => println!("Unknown task #{id}."),
+        }
+    }
+
+    fn print_recent_tasks(&self) {
+        let recent = self.tasks.recent();
+        if recent.is_empty() {
+            println!("No recently completed tasks.");
+            return;
+        }
+        for task in recent {
+            println!(
+                "#{} {} {:?} {}/{}",
+                task.metadata.id,
+                task.metadata.task_type,
+                task.state,
+                task.progress.completed_units,
+                task.progress
+                    .total_units
+                    .map_or_else(|| "?".into(), |n| n.to_string())
+            );
         }
     }
 }
@@ -1015,6 +1128,9 @@ fn print_help() {
     println!("/stop or /stopmovement  Stop movement only");
     println!("/stopall    Stop movement and looking");
     println!("/taskstatus Show movement and look tasks");
+    println!("/tasks      Show runtime summary");
+    println!("/task status ID | /task cancel ID|all | /task recent");
+    println!("/gather TARGET QUANTITY  Gather an item, logs, stone, visible ores, or food");
     println!("/follow NAME Follow a player");
     println!("/movement   Show movement status");
     println!("/look X Y Z  Look at a world position");

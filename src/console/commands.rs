@@ -32,6 +32,17 @@ pub enum ConsoleCommand {
     Stop,
     StopAll,
     TaskStatus,
+    TaskStatusById {
+        id: u64,
+    },
+    TaskCancel {
+        id: Option<u64>,
+    },
+    TaskRecent,
+    Gather {
+        target: String,
+        quantity: u32,
+    },
     Follow {
         player: String,
     },
@@ -166,6 +177,9 @@ pub fn parse_input(input: &str) -> Result<ConsoleInput, AppError> {
         "stop" | "stopmovement" => no_arguments(command, arguments, ConsoleCommand::Stop)?,
         "stopall" => no_arguments(command, arguments, ConsoleCommand::StopAll)?,
         "taskstatus" => no_arguments(command, arguments, ConsoleCommand::TaskStatus)?,
+        "task" => parse_task(arguments)?,
+        "tasks" => no_arguments(command, arguments, ConsoleCommand::TaskStatus)?,
+        "gather" => parse_gather(arguments)?,
         "follow" => ConsoleCommand::Follow {
             player: parse_follow_name(arguments)?,
         },
@@ -236,6 +250,49 @@ pub fn parse_input(input: &str) -> Result<ConsoleInput, AppError> {
     };
 
     Ok(ConsoleInput::Command(parsed))
+}
+
+fn parse_task(arguments: &str) -> Result<ConsoleCommand, AppError> {
+    let parts: Vec<_> = arguments.split_whitespace().collect();
+    match parts.as_slice() {
+        ["status", id] => Ok(ConsoleCommand::TaskStatusById {
+            id: id
+                .parse()
+                .map_err(|_| AppError::InvalidConsoleSyntax("/task status <id>".into()))?,
+        }),
+        ["cancel", "all"] => Ok(ConsoleCommand::TaskCancel { id: None }),
+        ["cancel", id] => Ok(ConsoleCommand::TaskCancel {
+            id: Some(
+                id.parse()
+                    .map_err(|_| AppError::InvalidConsoleSyntax("/task cancel <id|all>".into()))?,
+            ),
+        }),
+        ["recent"] | ["history"] => Ok(ConsoleCommand::TaskRecent),
+        _ => Err(AppError::InvalidConsoleSyntax(
+            "/task status <id> | /task cancel <id|all> | /task recent".into(),
+        )),
+    }
+}
+
+fn parse_gather(arguments: &str) -> Result<ConsoleCommand, AppError> {
+    let parts: Vec<_> = arguments.split_whitespace().collect();
+    let [target, quantity] = parts.as_slice() else {
+        return Err(AppError::InvalidConsoleSyntax(
+            "/gather <item|logs|stone|ores|food> <quantity>".into(),
+        ));
+    };
+    let quantity = quantity.parse().map_err(|_| {
+        AppError::InvalidConsoleSyntax("gather quantity must be a positive integer".into())
+    })?;
+    if quantity == 0 {
+        return Err(AppError::InvalidConsoleSyntax(
+            "gather quantity must be positive".into(),
+        ));
+    }
+    Ok(ConsoleCommand::Gather {
+        target: target.to_ascii_lowercase(),
+        quantity,
+    })
 }
 
 fn parse_place(arguments: &str) -> Result<ConsoleCommand, AppError> {
@@ -512,6 +569,30 @@ mod tests {
             parse_input("/cancelgotoblock").unwrap(),
             ConsoleInput::Command(ConsoleCommand::CancelGotoBlock)
         );
+    }
+
+    #[test]
+    fn parses_task_runtime_and_gather_commands() {
+        assert_eq!(
+            parse_input("/task status 42").unwrap(),
+            ConsoleInput::Command(ConsoleCommand::TaskStatusById { id: 42 })
+        );
+        assert_eq!(
+            parse_input("/task cancel all").unwrap(),
+            ConsoleInput::Command(ConsoleCommand::TaskCancel { id: None })
+        );
+        assert_eq!(
+            parse_input("/task recent").unwrap(),
+            ConsoleInput::Command(ConsoleCommand::TaskRecent)
+        );
+        assert_eq!(
+            parse_input("/gather logs 16").unwrap(),
+            ConsoleInput::Command(ConsoleCommand::Gather {
+                target: "logs".into(),
+                quantity: 16
+            })
+        );
+        assert!(parse_input("/gather stone 0").is_err());
     }
 
     #[test]
