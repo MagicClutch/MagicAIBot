@@ -28,9 +28,6 @@ pub enum ConsoleCommand {
     Entities {
         radius: Option<u32>,
     },
-    Drops {
-        radius: Option<u32>,
-    },
     Goto {
         x: i32,
         y: i32,
@@ -170,14 +167,6 @@ pub enum ConsoleInput {
     Empty,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum CleanupOperation {
-    DryRun,
-    Execute,
-    Status,
-    Stop,
-}
-
 #[must_use]
 pub fn plain_chat_message(input: &ConsoleInput, enabled: bool) -> Option<&str> {
     if enabled && let ConsoleInput::ChatMessage(message) = input {
@@ -230,10 +219,6 @@ pub fn parse_input(input: &str) -> Result<ConsoleInput, AppError> {
                 ));
             }
             ConsoleCommand::Entities { radius }
-        }
-        "drops" | "dropstatus" => {
-            let radius = optional_radius(arguments)?;
-            ConsoleCommand::Drops { radius }
         }
         "goto" => {
             let destination = parse_coordinates(arguments)?;
@@ -926,6 +911,30 @@ mod tests {
             parse_input("/cancelgotoblock").unwrap(),
             ConsoleInput::Command(ConsoleCommand::CancelGotoBlock)
         );
+    }
+
+    #[test]
+    fn parses_task_runtime_and_gather_commands() {
+        assert_eq!(
+            parse_input("/task status 42").unwrap(),
+            ConsoleInput::Command(ConsoleCommand::TaskStatusById { id: 42 })
+        );
+        assert_eq!(
+            parse_input("/task cancel all").unwrap(),
+            ConsoleInput::Command(ConsoleCommand::TaskCancel { id: None })
+        );
+        assert_eq!(
+            parse_input("/task recent").unwrap(),
+            ConsoleInput::Command(ConsoleCommand::TaskRecent)
+        );
+        assert_eq!(
+            parse_input("/gather logs 16").unwrap(),
+            ConsoleInput::Command(ConsoleCommand::Gather {
+                target: "logs".into(),
+                quantity: 16
+            })
+        );
+        assert!(parse_input("/gather stone 0").is_err());
     }
 
     #[test]
