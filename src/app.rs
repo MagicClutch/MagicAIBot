@@ -372,6 +372,7 @@ impl App {
                     self.print_craft_check(&item, count, depth).await
                 }
                 ConsoleCommand::Entities { radius } => self.print_entities(radius).await,
+                ConsoleCommand::Drops { radius } => self.print_drops(radius).await,
                 ConsoleCommand::Goto { x, y, z } => {
                     self.interaction
                         .cancel(&self.minecraft, &self.movement, &self.look)
@@ -1616,6 +1617,45 @@ impl App {
         }
     }
 
+    async fn print_drops(&self, radius: Option<u32>) {
+        use crate::minecraft::dropped_items::DroppedItemQuery;
+        use std::time::{Duration, SystemTime};
+
+        let world = self.minecraft.world_state_snapshot().await;
+        let radius = f64::from(radius.unwrap_or(64));
+        let query = DroppedItemQuery {
+            radius: Some(radius),
+            dimension: world.bot.dimension.clone(),
+            maximum_age: Some(Duration::from_secs(
+                self.config.world_state.stale_entity_seconds,
+            )),
+            limit: Some(64),
+            ..Default::default()
+        };
+        let drops = query.search(&world.dropped_items, world.session_id, SystemTime::now());
+        println!(
+            "Dropped items: {} (session {}, radius {:.0})",
+            drops.len(),
+            world.session_id,
+            radius
+        );
+        for drop in drops {
+            println!(
+                "#{} {} x{} | distance {:.1} | {:.2} {:.2} {:.2} | {} | uuid {}",
+                drop.entity_id,
+                drop.stack.item_id,
+                drop.stack.count,
+                drop.distance,
+                drop.position.x,
+                drop.position.y,
+                drop.position.z,
+                drop.dimension,
+                drop.uuid
+                    .map_or_else(|| "unavailable".into(), |uuid| uuid.to_string())
+            );
+        }
+    }
+
     async fn print_movement(&self) {
         let world = self.minecraft.world_state_snapshot().await;
         let movement = world.movement;
@@ -1912,6 +1952,7 @@ fn print_help() {
     println!("/collect-food-status  Show collector status");
     println!("/collect-food-stop  Cancel food collection");
     println!("/entities [RADIUS]  Show nearby entities");
+    println!("/drops [RADIUS]  Show fresh loaded dropped-item observations");
     println!("/findblock ID [RADIUS] [LIMIT]  Find loaded blocks");
     println!("/nearestblock ID [RADIUS]  Find nearest loaded block");
     println!("/gotoblock ID [RADIUS] [mine]  Navigate to a matching block");

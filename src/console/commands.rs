@@ -47,6 +47,9 @@ pub enum ConsoleCommand {
     Entities {
         radius: Option<u32>,
     },
+    Drops {
+        radius: Option<u32>,
+    },
     Goto {
         x: i32,
         y: i32,
@@ -317,6 +320,10 @@ pub fn parse_input(input: &str) -> Result<ConsoleInput, AppError> {
             }
             ConsoleCommand::Entities { radius }
         }
+        "drops" | "dropstatus" => {
+            let radius = optional_radius(arguments)?;
+            ConsoleCommand::Drops { radius }
+        }
         "goto" => {
             let destination = parse_coordinates(arguments)?;
             ConsoleCommand::Goto {
@@ -450,6 +457,19 @@ pub fn parse_input(input: &str) -> Result<ConsoleInput, AppError> {
     Ok(ConsoleInput::Command(parsed))
 }
 
+fn optional_radius(arguments: &str) -> Result<Option<u32>, AppError> {
+    if arguments.is_empty() {
+        return Ok(None);
+    }
+    let radius = arguments.parse().map_err(|_| {
+        AppError::InvalidEntityQuery("radius must be a positive integer no greater than 256".into())
+    })?;
+    if radius == 0 || radius > 256 {
+        return Err(AppError::InvalidEntityQuery(
+            "radius must be between 1 and 256".into(),
+        ));
+    }
+    Ok(Some(radius))
 fn parse_smelt(arguments: &str) -> Result<ConsoleCommand, AppError> {
     let parts: Vec<_> = arguments.split_whitespace().collect();
     let count = |value: &str| value.parse::<u32>().ok().filter(|v| *v > 0)
@@ -1000,6 +1020,8 @@ mod tests {
             ConsoleInput::Command(ConsoleCommand::Status)
         );
         assert_eq!(
+            parse_input("/drops 32").unwrap(),
+            ConsoleInput::Command(ConsoleCommand::Drops { radius: Some(32) })
             parse_input("/containerstatus").unwrap(),
             ConsoleInput::Command(ConsoleCommand::ContainerStatus)
         );
