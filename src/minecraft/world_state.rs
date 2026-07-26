@@ -88,6 +88,8 @@ pub struct InventorySlot {
 #[derive(Clone, Debug, Default)]
 pub struct InventorySnapshot {
     pub available: bool,
+    /// Monotonically increases only when slot contents change.
+    pub revision: u64,
     pub slots: Vec<InventorySlot>,
     pub selected_hotbar_slot: Option<u8>,
     pub total_counts: HashMap<String, u32>,
@@ -134,6 +136,10 @@ pub struct EntitySnapshot {
     pub entity_id: u32,
     pub uuid: Option<Uuid>,
     pub entity_type: String,
+    /// Present for Azalea's `minecraft:item` entities.
+    pub item_id: Option<String>,
+    pub item_count: u32,
+    pub dimension: Option<String>,
     pub position: PositionSnapshot,
     pub distance: f64,
     pub alive: Option<bool>,
@@ -317,6 +323,11 @@ impl WorldState {
     pub fn update_inventory(&mut self, mut inventory: InventorySnapshot) {
         inventory.slots.sort_by_key(|s| s.slot);
         inventory.rebuild_counts();
+        inventory.revision = if inventory.slots != self.inventory.slots {
+            self.inventory.revision.wrapping_add(1)
+        } else {
+            self.inventory.revision
+        };
         self.inventory = inventory;
         self.touch();
     }
@@ -551,6 +562,9 @@ mod tests {
             entity_id: id,
             uuid: Some(uuid(u128::from(id))),
             entity_type: "minecraft:pig".into(),
+            item_id: None,
+            item_count: 0,
+            dimension: Some("minecraft:overworld".into()),
             position: PositionSnapshot { x, y: 0., z: 0. },
             distance: 0.,
             alive: Some(true),
@@ -594,6 +608,7 @@ mod tests {
         let mut state = WorldState::default();
         state.update_inventory(InventorySnapshot {
             available: true,
+            revision: 0,
             selected_hotbar_slot: Some(1),
             slots: vec![
                 InventorySlot {

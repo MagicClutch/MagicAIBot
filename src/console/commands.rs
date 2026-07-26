@@ -2,11 +2,12 @@
 
 use crate::{
     blocks::block_query::normalize_block_id,
+    collection::{CollectRequest, ItemFilter, ItemGroup},
     error::AppError,
     movement::commands::{parse_coordinates, parse_follow_name},
 };
 
-#[derive(Debug, Eq, PartialEq)]
+#[derive(Debug, PartialEq)]
 pub enum ConsoleCommand {
     Help,
     Status,
@@ -88,12 +89,15 @@ pub enum ConsoleCommand {
     },
     StopInteraction,
     InteractionStatus,
+    CollectItem(CollectRequest),
+    CollectItemStatus,
+    CollectItemStop,
     TestOakLog,
     Reconnect,
     Quit,
 }
 
-#[derive(Debug, Eq, PartialEq)]
+#[derive(Debug, PartialEq)]
 pub enum ConsoleInput {
     Command(ConsoleCommand),
     ChatMessage(String),
@@ -219,6 +223,7 @@ pub fn parse_input(input: &str) -> Result<ConsoleInput, AppError> {
         "placeblock" => parse_placeblock(arguments)?,
         "stopinteraction" => no_arguments(command, arguments, ConsoleCommand::StopInteraction)?,
         "interactionstatus" => no_arguments(command, arguments, ConsoleCommand::InteractionStatus)?,
+        "collect-item" | "collectdrop" => parse_collect_item(arguments)?,
         "testoaklog" => no_arguments(command, arguments, ConsoleCommand::TestOakLog)?,
         "reconnect" => no_arguments(command, arguments, ConsoleCommand::Reconnect)?,
         "quit" => no_arguments(command, arguments, ConsoleCommand::Quit)?,
@@ -236,6 +241,41 @@ pub fn parse_input(input: &str) -> Result<ConsoleInput, AppError> {
     };
 
     Ok(ConsoleInput::Command(parsed))
+}
+
+fn parse_collect_item(arguments: &str) -> Result<ConsoleCommand, AppError> {
+    let parts: Vec<_> = arguments.split_whitespace().collect();
+    match parts.as_slice() {
+        ["status"] => Ok(ConsoleCommand::CollectItemStatus),
+        ["stop"] => Ok(ConsoleCommand::CollectItemStop),
+        ["nearest"] => { let mut r=CollectRequest::exact(String::new(),1); r.filter=ItemFilter::Nearest; Ok(ConsoleCommand::CollectItem(r)) },
+        ["group", group, quantity] => {
+            let group = match *group { "ores"=>ItemGroup::Ores,"logs"=>ItemGroup::Logs,"food"=>ItemGroup::Food,
+                _=>return Err(AppError::InvalidConsoleSyntax("groups: ores, logs, food".into())) };
+            let mut r=CollectRequest::exact(String::new(),parse_quantity(quantity)?); r.filter=ItemFilter::Group(group); Ok(ConsoleCommand::CollectItem(r))
+        }
+        [items, quantity] => { let ids=items.split(',').map(normalize_item_id).collect::<Vec<_>>();
+            let mut r=CollectRequest::exact(ids[0].clone(),parse_quantity(quantity)?); if ids.len()>1 {r.filter=ItemFilter::AnyOf(ids)}; Ok(ConsoleCommand::CollectItem(r)) }
+        _ => Err(AppError::InvalidConsoleSyntax("/collect-item <item[,item]> <count> | group <ores|logs|food> <count> | nearest | status | stop".into()))
+    }
+}
+fn parse_quantity(value: &str) -> Result<u32, AppError> {
+    let n = value.parse().map_err(|_| {
+        AppError::InvalidConsoleSyntax("collection count must be a positive integer".into())
+    })?;
+    if n == 0 {
+        return Err(AppError::InvalidConsoleSyntax(
+            "collection count must be positive".into(),
+        ));
+    }
+    Ok(n)
+}
+fn normalize_item_id(value: &str) -> String {
+    if value.contains(':') {
+        value.to_ascii_lowercase()
+    } else {
+        format!("minecraft:{}", value.to_ascii_lowercase())
+    }
 }
 
 fn parse_place(arguments: &str) -> Result<ConsoleCommand, AppError> {
