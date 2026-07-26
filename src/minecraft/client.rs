@@ -348,6 +348,10 @@ impl MinecraftClient {
         self.world_state.lock().await.snapshot()
     }
 
+    pub(crate) async fn block_id_at(&self, position: BlockPosition) -> Result<Option<String>, AppError> {
+        Ok(self.block_ids_at(&[position]).await?.remove(&position).flatten())
+    }
+
     pub(crate) async fn scan_loaded_blocks(
         &self,
         query: &BlockSearchQuery,

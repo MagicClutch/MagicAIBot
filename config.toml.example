@@ -119,6 +119,21 @@ face_inset = 0.001
 edge_margin = 0.12
 maximum_face_attempts = 6
 maximum_hit_points_per_face = 5
+
+# Conservative loaded-world tree recognition. It never crafts, builds, climbs, or replants.
+[tree_chopping]
+allowed_tree_types = ["oak", "birch", "spruce", "jungle", "acacia", "dark_oak", "mangrove", "cherry", "pale_oak"]
+require_nearby_leaves = true
+maximum_connected_logs = 192
+maximum_tree_height = 48
+maximum_branch_distance = 12
+maximum_horizontal_logs = 48
+break_leaves = false
+collect_saplings = true
+allow_hand_chopping = false
+search_radius = 32
+maximum_trees = 16
+total_timeout_seconds = 300
 [ensure_tool]
 # Highest preference first. Unsupported or insufficient tiers are skipped.
 material_tier_preference = ["iron", "stone", "wood"]

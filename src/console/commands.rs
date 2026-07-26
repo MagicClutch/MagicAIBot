@@ -138,6 +138,9 @@ pub enum ConsoleCommand {
         block_id: String,
     },
     TestOakLog,
+    ChopTree { request: crate::tree_chopping::ChopRequest },
+    ChopTreeStatus,
+    ChopTreeStop,
     OpenChest {
         x: i32,
         y: i32,
@@ -315,6 +318,7 @@ pub fn parse_input(input: &str) -> Result<ConsoleInput, AppError> {
             )?)?,
         },
         "testoaklog" => no_arguments(command, arguments, ConsoleCommand::TestOakLog)?,
+        "chop-tree" | "choptree" => parse_chop_tree(arguments)?,
         "open-chest" => {
             let p = parse_coordinates(arguments)?;
             ConsoleCommand::OpenChest {
@@ -345,6 +349,20 @@ pub fn parse_input(input: &str) -> Result<ConsoleInput, AppError> {
     Ok(ConsoleInput::Command(parsed))
 }
 
+fn parse_chop_tree(arguments: &str) -> Result<ConsoleCommand, AppError> {
+    use crate::tree_chopping::ChopRequest;
+    let parts: Vec<_> = arguments.split_whitespace().collect();
+    let request = match parts.as_slice() {
+        ["nearest"] => return Ok(ConsoleCommand::ChopTree { request: ChopRequest::Nearest }),
+        ["status"] => return Ok(ConsoleCommand::ChopTreeStatus),
+        ["stop"] => return Ok(ConsoleCommand::ChopTreeStop),
+        ["logs", amount] => ChopRequest::Logs(amount.parse().map_err(|_| AppError::InvalidConsoleSyntax("/chop-tree logs <positive count>".into()))?),
+        ["count", amount] => ChopRequest::Count(amount.parse().map_err(|_| AppError::InvalidConsoleSyntax("/chop-tree count <positive count>".into()))?),
+        [kind] => ChopRequest::TreeType(kind.to_ascii_lowercase()),
+        _ => return Err(AppError::InvalidConsoleSyntax("/chop-tree nearest|<type>|logs <n>|count <n>|status|stop".into())),
+    };
+    if matches!(request, ChopRequest::Logs(0) | ChopRequest::Count(0)) { return Err(AppError::InvalidConsoleSyntax("chop count must be positive".into())); }
+    Ok(ConsoleCommand::ChopTree { request })
 fn parse_mine_ore(arguments: &str) -> Result<ConsoleCommand, AppError> {
     let parts: Vec<_> = arguments.split_whitespace().collect();
     match parts.as_slice() {
@@ -1058,6 +1076,14 @@ mod tests {
             ConsoleInput::Command(ConsoleCommand::TestOakLog)
         );
     }
+
+    #[test]
+    fn parses_tree_chopping_commands_and_rejects_zero() {
+        use crate::tree_chopping::ChopRequest;
+        assert_eq!(parse_input("/chop-tree nearest").unwrap(), ConsoleInput::Command(ConsoleCommand::ChopTree { request: ChopRequest::Nearest }));
+        assert_eq!(parse_input("/choptree logs 12").unwrap(), ConsoleInput::Command(ConsoleCommand::ChopTree { request: ChopRequest::Logs(12) }));
+        assert_eq!(parse_input("/chop-tree status").unwrap(), ConsoleInput::Command(ConsoleCommand::ChopTreeStatus));
+        assert!(parse_input("/chop-tree count 0").is_err());
     #[test]
     fn parses_container_debug_commands() {
         assert_eq!(
