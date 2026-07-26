@@ -18,6 +18,15 @@ pub enum AppError {
     InventoryUnavailable,
     #[error("recipe data unavailable: {0}")]
     RecipeData(String),
+    #[error("inventory mutation is busy")]
+    InventoryBusy,
+    #[error("inventory mutation was rejected: {0}")]
+    InventoryMutationRejected(String),
+    #[error("no suitable tool for {block_id}: {explanation}")]
+    NoSuitableTool {
+        block_id: String,
+        explanation: String,
+    },
     #[error("invalid entity query: {0}")]
     InvalidEntityQuery(String),
     #[error("world-state update failed: {0}")]
@@ -128,6 +137,8 @@ pub enum AppError {
     InvalidConsoleSyntax(String),
     #[error("console input failed: {0}")]
     ConsoleInputFailure(String),
+    #[error("task runtime failure: {0}")]
+    TaskRuntime(String),
     #[error("reconnect is already in progress")]
     ReconnectAlreadyInProgress,
     #[error("failed to initialize logging: {0}")]
