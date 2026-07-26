@@ -1127,6 +1127,8 @@ fn fmt_opt<T: std::fmt::Display>(value: Option<T>) -> String {
 }
 
 fn print_help() {
+    println!("Local-console commands only. Success requires observed state confirmation.");
+    println!("Cancellation: /stopinteraction, /stop, or /stopall (in increasing scope).");
     println!("/help       Show available commands");
     println!("/status     Show connection and application status");
     println!("/chat TEXT  Send TEXT to Minecraft chat");
