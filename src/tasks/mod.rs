@@ -33,6 +33,7 @@ use crate::{
     navigation::BlockNavigationService,
 };
 
+pub mod gather;
 pub const DEFAULT_HISTORY_LIMIT: usize = 64;
 pub const DEFAULT_LEASE_TIMEOUT: Duration = Duration::from_secs(10);
 
