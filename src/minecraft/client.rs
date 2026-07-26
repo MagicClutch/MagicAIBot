@@ -33,6 +33,10 @@ use azalea::{
     registry::builtin::BlockKind,
     world::WorldName,
 };
+use azalea_inventory::{
+    ItemStack,
+    components::{CustomName, Damage, Enchantments, ItemName, MaxDamage, MaxStackSize},
+};
 use azalea_inventory::components::{Damage, Enchantments, MaxDamage, Tool};
 use tokio::{
     sync::{Mutex, watch},
@@ -55,8 +59,9 @@ use crate::{
         events::handle_chat,
         inventory_actions::InventoryActionService,
         world_state::{
-            BlockPosition, InventorySlot, InventorySnapshot, MovementSnapshot, PlayerSnapshot,
-            PositionSnapshot, TaskSnapshot, WorldConnectionState, WorldState, WorldStateSnapshot,
+            BlockPosition, InventorySlot, InventorySlotId, InventorySnapshot, InventorySyncState,
+            ItemMetadata, MovementSnapshot, PlayerSnapshot, PositionSnapshot, TaskSnapshot,
+            WorldConnectionState, WorldState, WorldStateSnapshot,
         },
     },
     movement::NavigationMode,
@@ -1526,32 +1531,100 @@ fn inventory_slot(slot: usize, item: &azalea::inventory::ItemStack) -> Inventory
 
 fn inventory_from_component(inventory: &Option<&Inventory>) -> Option<InventorySnapshot> {
     let inventory = (*inventory)?;
+    // Never use Inventory::menu(): that is the currently open container and its
+    // indexes are menu-specific. Task 3 observes only the canonical player menu.
     let slots = inventory
-        .menu()
+        .inventory_menu
         .slots()
         .iter()
         .enumerate()
-        .map(|(slot, item)| {
+        .filter_map(|(slot, item)| {
+            let id = InventorySlotId::new(slot)?;
             let (item_id, count) = if item.is_empty() {
                 (None, 0)
             } else {
                 (Some(item.kind().to_string()), item.count().max(0) as u32)
             };
-            InventorySlot {
-                slot,
+            let metadata = item_metadata(item);
+            let display_name = metadata
+                .custom_name
+                .clone()
+                .or_else(|| metadata.item_name.clone());
+            Some(InventorySlot {
+                id,
+                azalea_menu_slot: slot,
+                region: id.region(),
                 item_id,
-                display_name: None,
+                display_name,
                 count,
-            }
+                metadata,
+            })
         })
         .collect();
     Some(InventorySnapshot {
         available: true,
+        sync_state: InventorySyncState::Synchronized,
+        server_state_id: Some(inventory.state_id),
         revision: 0,
         slots,
         selected_hotbar_slot: Some(inventory.selected_hotbar_slot),
-        total_counts: Default::default(),
+        ..Default::default()
     })
+}
+
+fn item_metadata(item: &ItemStack) -> ItemMetadata {
+    let Some(data) = item.as_present() else {
+        return ItemMetadata::default();
+    };
+    let custom_name = item
+        .get_component::<CustomName>()
+        .map(|v| v.name.to_string());
+    let item_name = item.get_component::<ItemName>().map(|v| v.name.to_string());
+    let damage = item
+        .get_component::<Damage>()
+        .and_then(|v| u32::try_from(v.amount).ok());
+    let maximum_durability = item
+        .get_component::<MaxDamage>()
+        .and_then(|v| u32::try_from(v.amount).ok());
+    let remaining_durability =
+        maximum_durability.map(|maximum| maximum.saturating_sub(damage.unwrap_or(0)));
+    let mut enchantments = item
+        .get_component::<Enchantments>()
+        .map_or_else(Vec::new, |v| {
+            v.levels
+                .iter()
+                .filter_map(|(kind, level)| {
+                    u32::try_from(*level).ok().map(|level| {
+                        (
+                            serde_json::to_string(kind).unwrap_or_else(|_| format!("{kind:?}")),
+                            level,
+                        )
+                    })
+                })
+                .collect()
+        });
+    enchantments.sort();
+    let maximum_stack_size = item
+        .get_component::<MaxStackSize>()
+        .and_then(|v| u32::try_from(v.count).ok())
+        .unwrap_or(1);
+    let component_patch = serde_json::to_string(&data.component_patch).ok();
+    let stack_identity = Some(format!(
+        "{}|{}",
+        data.kind,
+        component_patch.as_deref().unwrap_or("<unavailable>")
+    ));
+    ItemMetadata {
+        custom_name,
+        item_name,
+        damage,
+        maximum_durability,
+        remaining_durability,
+        enchantments,
+        component_patch,
+        stack_identity,
+        maximum_stack_size,
+    }
 }
 
 async fn wait_for_spawn(
@@ -1618,6 +1691,8 @@ fn auth_cache_file() -> Result<PathBuf, AppError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use azalea::registry::builtin::ItemKind;
+    use azalea_inventory::{Menu, Player};
 
     fn client() -> MinecraftClient {
         MinecraftClient::new(
@@ -1669,6 +1744,28 @@ mod tests {
         assert_eq!(client.connection_state(), ConnectionState::Connecting);
         client.set_state(ConnectionState::Connected);
         assert_eq!(client.connection_state(), ConnectionState::Connected);
+    }
+
+    #[test]
+    fn canonical_player_menu_mapping_ignores_active_containers() {
+        let mut inventory = Inventory::default();
+        *inventory.inventory_menu.slot_mut(36).unwrap() = ItemStack::new(ItemKind::Stone, 3);
+        inventory.selected_hotbar_slot = 0;
+        inventory.container_menu = Some(Menu::Generic9x1 {
+            contents: Default::default(),
+            player: Default::default(),
+        });
+        let snapshot = inventory_from_component(&Some(&inventory)).unwrap();
+        assert_eq!(snapshot.slots.len(), InventorySlotId::SLOT_COUNT);
+        assert_eq!(*Player::HOTBAR_SLOTS.start(), 36);
+        assert_eq!(*Player::HOTBAR_SLOTS.end(), 44);
+        let held = snapshot
+            .slots
+            .iter()
+            .find(|slot| slot.id == InventorySlotId(36))
+            .unwrap();
+        assert_eq!(held.azalea_menu_slot, 36);
+        assert_eq!(held.item_id.as_deref(), Some("minecraft:stone"));
     }
 
     #[tokio::test(flavor = "current_thread")]
