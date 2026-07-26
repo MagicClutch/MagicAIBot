@@ -12,6 +12,7 @@ use crate::{
     config::InteractionConfig,
     error::AppError,
     interaction::{
+        block_breaking::{KeepCurrentTool, ToolSelector},
         faces::{BlockFace, BlockFacePurpose, best_face, face_hit_points},
         placement_rules::{has_support, is_air, is_replaceable},
         progress::estimated_progress,
@@ -84,6 +85,7 @@ pub struct InteractionController {
     search: BlockSearchService,
     navigation: BlockNavigationService,
     inner: Arc<Mutex<Inner>>,
+    tool_selector: Arc<dyn ToolSelector>,
 }
 
 impl InteractionController {
@@ -107,7 +109,15 @@ impl InteractionController {
                 hit_point_attempt: 0,
                 failed_hit_points: HashSet::new(),
             })),
+            tool_selector: Arc::new(KeepCurrentTool),
         }
+    }
+    /// Inject Task 3's eventual tool policy without coupling block-breaking
+    /// lifecycle code to inventory scoring.
+    #[allow(dead_code)] // exercised by the next inventory-policy integration task
+    pub fn with_tool_selector(mut self, selector: Arc<dyn ToolSelector>) -> Self {
+        self.tool_selector = selector;
+        self
     }
     pub async fn snapshot(&self) -> InteractionSnapshot {
         self.inner.lock().await.snapshot.clone()
@@ -402,12 +412,38 @@ impl InteractionController {
             Operation::Break { target, .. } | Operation::Place { target, .. } => *target,
         };
         let world = minecraft.world_state_snapshot().await;
+        if world.connection.state != crate::minecraft::world_state::WorldConnectionState::Connected
+        {
+            self.stop_and_fail(minecraft, movement, look, "disconnected during interaction")
+                .await;
+            return;
+        }
+        if world.bot.alive == Some(false) || world.bot.health.is_some_and(|health| health <= 0.0) {
+            self.stop_and_fail(minecraft, movement, look, "bot died during interaction")
+                .await;
+            return;
+        }
         let reach = if matches!(&operation, Operation::Break { .. }) {
             self.config.breaking_reach
         } else {
             self.config.placement_reach
         };
         let in_reach = within_reach(world.bot.position, target, reach);
+        if !in_reach
+            && matches!(
+                state,
+                InteractionState::Looking | InteractionState::Breaking
+            )
+        {
+            self.stop_and_fail(
+                minecraft,
+                movement,
+                look,
+                "target moved out of interaction range",
+            )
+            .await;
+            return;
+        }
         if !in_reach
             && matches!(
                 state,
@@ -596,8 +632,10 @@ impl InteractionController {
         ) && dispatched
         {
             match &operation {
-                Operation::Break { target, .. } => match block_id(minecraft, *target).await {
-                    Ok(Some(id)) if !is_air(Some(&id)) => {
+                Operation::Break {
+                    target, expected, ..
+                } => match block_id(minecraft, *target).await {
+                    Ok(Some(id)) if id == *expected => {
                         let mut inner = self.inner.lock().await;
                         if let Some(start) = inner.snapshot.started_at {
                             inner.snapshot.progress_percent = Some(estimated_progress(
@@ -610,8 +648,20 @@ impl InteractionController {
                             self.retry_or_fail("break verification timed out").await;
                         }
                     }
+                    Ok(Some(id)) if !is_air(Some(&id)) => {
+                        self.stop_and_fail(
+                            minecraft,
+                            movement,
+                            look,
+                            &format!("target changed from {expected} to {id}"),
+                        )
+                        .await
+                    }
                     Ok(_) => self.complete_break(minecraft, movement, look).await,
-                    Err(_) => self.retry_or_fail("chunk unloaded").await,
+                    Err(_) => {
+                        self.stop_and_fail(minecraft, movement, look, "chunk unloaded")
+                            .await
+                    }
                 },
                 Operation::Place {
                     target, item_id, ..
@@ -655,13 +705,14 @@ impl InteractionController {
                 target, expected, ..
             } => {
                 if self.config.auto_tool_switch {
-                    match minecraft.select_best_tool_in_hotbar(expected).await {
-                        Ok(Some(tool)) => logging::info(format!("Selected {tool} for {expected}")),
-                        Ok(None) => debug!(
-                            block = expected,
-                            "no suitable hotbar tool; breaking with current item"
-                        ),
-                        Err(error) => return self.retry_or_fail(&error.to_string()).await,
+                    let inventory = minecraft.world_state_snapshot().await.inventory;
+                    if let Some(slot) = self.tool_selector.select(&inventory, expected) {
+                        if let Err(error) = minecraft.select_hotbar_slot(slot).await {
+                            return self.retry_or_fail(&error.to_string()).await;
+                        }
+                        logging::info(format!("Selected hotbar slot {slot} for {expected}"));
+                    } else {
+                        debug!(block = expected, "tool policy kept the current item");
                     }
                 }
                 minecraft.begin_breaking(*target).await
@@ -813,6 +864,18 @@ impl InteractionController {
             inner.failure_logged = true;
             logging::warning(format!("Interaction failed: {reason}"));
         }
+    }
+    async fn stop_and_fail(
+        &self,
+        minecraft: &MinecraftClient,
+        movement: &MovementService,
+        look: &LookController,
+        reason: &str,
+    ) {
+        minecraft.stop_breaking().await;
+        self.navigation.cancel(minecraft, movement).await;
+        let _ = look.release_precise(minecraft).await;
+        self.fail(reason).await;
     }
     async fn complete(&self, message: &str) {
         let mut inner = self.inner.lock().await;
