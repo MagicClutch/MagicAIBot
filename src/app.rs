@@ -22,7 +22,7 @@ use crate::{
     minecraft::client::MinecraftClient,
     movement::{MovementService, NavigationMode},
     navigation::{BlockNavigationService, navigation_state::BlockNavigationState},
-    tasks::TaskService,
+    tasks::{CancellationReason, GatherRequest, TaskId, TaskService},
 };
 use tokio::{sync::mpsc, task::JoinHandle};
 use tokio_util::sync::CancellationToken;
@@ -136,11 +136,15 @@ impl App {
                             self.block_navigation.cancel(&self.minecraft, &self.movement).await;
                             self.look.cancel().await;
                             let _ = self.movement.stop(&self.minecraft).await;
-                            self.tasks.cancel(&self.minecraft).await;
+                            self.tasks.disconnected();
+                            self.minecraft.clear_current_task().await;
                         }
                         continue;
                     }
                     self.session_ready = true;
+                    if self.minecraft.world_state_snapshot().await.bot.alive == Some(false) {
+                        self.tasks.player_died();
+                    }
                     let explicit_look = self.look.snapshot().await.state == LookState::Looking;
                     self.movement.tick(&self.minecraft, explicit_look).await;
                     self.block_navigation.tick(&self.minecraft, &self.movement).await;
@@ -169,6 +173,7 @@ impl App {
         };
 
         self.shutdown.cancel();
+        self.tasks.shutdown();
         self.block_navigation
             .cancel(&self.minecraft, &self.movement)
             .await;
@@ -283,6 +288,79 @@ impl App {
                     self.tasks.cancel(&self.minecraft).await;
                 }
                 ConsoleCommand::TaskStatus => self.print_task_status().await,
+                ConsoleCommand::Gather {
+                    resource,
+                    quantity,
+                    deposit,
+                } => {
+                    println!(
+                        "Gather request: {resource} x{quantity}{}",
+                        if deposit { " (deposit enabled)" } else { "" }
+                    );
+                    println!(
+                        "Gather not started: this build has no live Phase 2/3 crafting, storage, pickup, or smelting adapters; no world action was attempted."
+                    );
+                }
+                ConsoleCommand::GatherStatus => self.print_task_status().await,
+                ConsoleCommand::GatherCancel => {
+                    self.interaction
+                        .cancel(&self.minecraft, &self.movement, &self.look)
+                        .await;
+                    self.block_navigation
+                        .cancel(&self.minecraft, &self.movement)
+                        .await;
+                    let _ = self.movement.stop(&self.minecraft).await;
+                    self.tasks.cancel(&self.minecraft).await;
+                    println!(
+                        "Gather cancellation requested; movement and interaction stopped; confirmed partial inventory remains unchanged."
+                    );
+                ConsoleCommand::TaskStatusById { id } => self.print_task_by_id(TaskId(id)),
+                ConsoleCommand::TaskCancel { id } => {
+                    if let Some(id) = id {
+                        println!(
+                            "Cancellation requested: {}",
+                            self.tasks.cancel_task(TaskId(id), CancellationReason::User)
+                        );
+                    } else {
+                        self.tasks.cancel_all(CancellationReason::User);
+                        println!("Cancellation requested for all active tasks.");
+                    }
+                }
+                ConsoleCommand::TaskRecent => self.print_recent_tasks(),
+                ConsoleCommand::Gather { target, quantity } => {
+                    let request = match target.as_str() {
+                        "logs" | "log" => GatherRequest::Logs { quantity },
+                        "stone" => GatherRequest::Stone { quantity },
+                        "ores" | "ore" => GatherRequest::VisibleOres { quantity },
+                        "food" => GatherRequest::Food { quantity },
+                        item => GatherRequest::Items(crate::tasks::CollectItemsRequest {
+                            item_ids: vec![if item.contains(':') {
+                                item.to_owned()
+                            } else {
+                                format!("minecraft:{item}")
+                            }],
+                            quantity,
+                            maximum_attempts: 32,
+                        }),
+                    };
+                    match self
+                        .tasks
+                        .gather_visible_blocks(
+                            &self.minecraft,
+                            &self.movement,
+                            &self.look,
+                            &self.interaction,
+                            request,
+                        )
+                        .await
+                    {
+                        Ok(result) => println!(
+                            "Gathered {}/{} in {} attempts.",
+                            result.collected, result.requested, result.attempts
+                        ),
+                        Err(error) => logging::warning(format!("Gather failed: {error}")),
+                    }
+                }
                 ConsoleCommand::Follow { player } => {
                     self.interaction
                         .cancel(&self.minecraft, &self.movement, &self.look)
@@ -1048,11 +1126,72 @@ impl App {
         };
         println!("Movement: {movement_text}");
         println!("Look: {look_text}");
-        if let Some(name) = workflow.name {
-            println!("Workflow: {name} ({:?})", workflow.state);
-            if let Some(step) = workflow.current_step {
-                println!("Current task: {step}");
+        println!(
+            "Workflow: #{} {} ({:?})",
+            workflow.metadata.id, workflow.metadata.task_type, workflow.state
+        );
+        if !workflow.progress.phase.is_empty() {
+            println!(
+                "Progress: {} {}/{}",
+                workflow.progress.phase,
+                workflow.progress.completed_units,
+                workflow
+                    .progress
+                    .total_units
+                    .map_or_else(|| "?".into(), |n| n.to_string())
+            );
+        }
+        println!(
+            "Active tasks: {}; recent tasks: {}",
+            self.tasks.active().len(),
+            self.tasks.recent().len()
+        );
+    }
+
+    fn print_task_by_id(&self, id: TaskId) {
+        match self.tasks.query(id) {
+            Some(task) => {
+                println!("Task #{} {}: {:?}", id, task.metadata.task_type, task.state);
+                println!(
+                    "Source: {}; correlation: {}",
+                    task.metadata.source_command, task.metadata.correlation_id
+                );
+                println!(
+                    "Progress: {} {}/{}",
+                    task.progress.phase,
+                    task.progress.completed_units,
+                    task.progress
+                        .total_units
+                        .map_or_else(|| "?".into(), |n| n.to_string())
+                );
+                if let Some(failure) = task.failure {
+                    println!(
+                        "Failure: {:?}: {} (partial {})",
+                        failure.category, failure.message, failure.partial_completed
+                    );
+                }
             }
+            None => println!("Unknown task #{id}."),
+        }
+    }
+
+    fn print_recent_tasks(&self) {
+        let recent = self.tasks.recent();
+        if recent.is_empty() {
+            println!("No recently completed tasks.");
+            return;
+        }
+        for task in recent {
+            println!(
+                "#{} {} {:?} {}/{}",
+                task.metadata.id,
+                task.metadata.task_type,
+                task.state,
+                task.progress.completed_units,
+                task.progress
+                    .total_units
+                    .map_or_else(|| "?".into(), |n| n.to_string())
+            );
         }
     }
 }
@@ -1062,6 +1201,8 @@ fn fmt_opt<T: std::fmt::Display>(value: Option<T>) -> String {
 }
 
 fn print_help() {
+    println!("Local-console commands only. Success requires observed state confirmation.");
+    println!("Cancellation: /stopinteraction, /stop, or /stopall (in increasing scope).");
     println!("/help       Show available commands");
     println!("/status     Show connection and application status");
     println!("/chat TEXT  Send TEXT to Minecraft chat");
@@ -1083,6 +1224,12 @@ fn print_help() {
     println!("/stop or /stopmovement  Stop movement only");
     println!("/stopall    Stop movement and looking");
     println!("/taskstatus Show movement and look tasks");
+    println!("/gather RESOURCE QUANTITY [deposit]  Gather a bounded supported resource quantity");
+    println!("/gatherstatus  Show gather/task progress and last failure");
+    println!("/gathercancel  Cancel gathering and preserve confirmed partial progress");
+    println!("/tasks      Show runtime summary");
+    println!("/task status ID | /task cancel ID|all | /task recent");
+    println!("/gather TARGET QUANTITY  Gather an item, logs, stone, visible ores, or food");
     println!("/follow NAME Follow a player");
     println!("/movement   Show movement status");
     println!("/look X Y Z  Look at a world position");
@@ -1099,6 +1246,7 @@ fn print_help() {
     println!("/placeblock ID [X Y Z]  Place through the reusable placement workflow");
     println!("/stopinteraction  Cancel block interaction");
     println!("/interactionstatus  Show interaction status");
+    println!("/ensure-tool ID  Debug an ensure-tool request (/craft-tool is an alias)");
     println!("/testoaklog  Break and restore the nearest oak log");
     println!("/reconnect  Reconnect to the configured server");
     println!("/quit       Shut down the application");
