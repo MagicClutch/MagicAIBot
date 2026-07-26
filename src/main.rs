@@ -10,6 +10,7 @@ mod look;
 pub mod minecraft;
 mod movement;
 mod navigation;
+mod smelting;
 mod skills;
 mod tasks;
 

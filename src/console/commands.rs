@@ -15,6 +15,10 @@ pub enum ConsoleCommand {
     },
     Players,
     Inventory,
+    Smelt { target: String, count: u32 },
+    SmeltRecipe { recipe_id: String, count: u32 },
+    SmeltStatus,
+    SmeltStop,
     Entities {
         radius: Option<u32>,
     },
@@ -129,6 +133,9 @@ pub fn parse_input(input: &str) -> Result<ConsoleInput, AppError> {
         "status" => no_arguments(command, arguments, ConsoleCommand::Status)?,
         "players" => no_arguments(command, arguments, ConsoleCommand::Players)?,
         "inventory" => no_arguments(command, arguments, ConsoleCommand::Inventory)?,
+        "smelt" => parse_smelt(arguments)?,
+        "smeltstatus" => no_arguments(command, arguments, ConsoleCommand::SmeltStatus)?,
+        "smeltstop" => no_arguments(command, arguments, ConsoleCommand::SmeltStop)?,
         "entities" => {
             let radius = if arguments.is_empty() {
                 None
@@ -236,6 +243,19 @@ pub fn parse_input(input: &str) -> Result<ConsoleInput, AppError> {
     };
 
     Ok(ConsoleInput::Command(parsed))
+}
+
+fn parse_smelt(arguments: &str) -> Result<ConsoleCommand, AppError> {
+    let parts: Vec<_> = arguments.split_whitespace().collect();
+    let count = |value: &str| value.parse::<u32>().ok().filter(|v| *v > 0)
+        .ok_or_else(|| AppError::InvalidConsoleSyntax("smelt count must be positive".into()));
+    match parts.as_slice() {
+        ["status"] => Ok(ConsoleCommand::SmeltStatus),
+        ["stop"] => Ok(ConsoleCommand::SmeltStop),
+        ["recipe", id, n] => Ok(ConsoleCommand::SmeltRecipe { recipe_id: normalize_block_id(id)?, count: count(n)? }),
+        [target, n] => Ok(ConsoleCommand::Smelt { target: normalize_block_id(target)?, count: count(n)? }),
+        _ => Err(AppError::InvalidConsoleSyntax("/smelt <output> <count> | recipe <id> <count> | status | stop".into())),
+    }
 }
 
 fn parse_place(arguments: &str) -> Result<ConsoleCommand, AppError> {

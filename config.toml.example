@@ -105,3 +105,10 @@ face_inset = 0.001
 edge_margin = 0.12
 maximum_face_attempts = 6
 maximum_hit_points_per_face = 5
+
+[smelting]
+station_search_radius = 32
+observation_interval_ms = 250
+confirmation_timeout_ms = 3000
+total_timeout_seconds = 300
+reopen_limit = 2
