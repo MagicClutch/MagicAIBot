@@ -3,6 +3,7 @@ mod app;
 mod blocks;
 mod config;
 mod console;
+mod crafting;
 mod container;
 mod error;
 mod food;
