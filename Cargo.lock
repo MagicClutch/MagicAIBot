@@ -2008,6 +2008,7 @@ dependencies = [
  "anyhow",
  "azalea",
  "azalea-client",
+ "azalea-inventory",
  "dotenvy",
  "serde",
  "serde_json",
