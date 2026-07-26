@@ -2,11 +2,12 @@
 
 use crate::{
     blocks::block_query::normalize_block_id,
+    collection::{CollectRequest, ItemFilter, ItemGroup},
     error::AppError,
     movement::commands::{parse_coordinates, parse_follow_name},
 };
 
-#[derive(Debug, Eq, PartialEq)]
+#[derive(Debug, PartialEq)]
 pub enum ConsoleCommand {
     Help,
     Status,
@@ -15,6 +16,26 @@ pub enum ConsoleCommand {
     },
     Players,
     Inventory,
+    SelectHotbar {
+        slot: u8,
+    },
+    EnsureHotbar {
+        item_id: String,
+        slot: Option<u8>,
+    Smelt { target: String, count: u32 },
+    SmeltRecipe { recipe_id: String, count: u32 },
+    SmeltStatus,
+    SmeltStop,
+    CleanupInventory {
+        operation: CleanupOperation,
+    FurnaceStatus,
+    SmeltCheck {
+        output: String,
+        count: u32,
+    },
+    FuelInfo {
+        item: String,
+    ContainerStatus,
     Recipe {
         id: String,
     },
@@ -121,6 +142,9 @@ pub enum ConsoleCommand {
     },
     StopInteraction,
     InteractionStatus,
+    CollectItem(CollectRequest),
+    CollectItemStatus,
+    CollectItemStop,
     MineOre { target: String, count: u32, radius: Option<u32> },
     MineOreStatus,
     MineOreStop,
@@ -163,11 +187,19 @@ pub enum ConsoleCommand {
     Quit,
 }
 
-#[derive(Debug, Eq, PartialEq)]
+#[derive(Debug, PartialEq)]
 pub enum ConsoleInput {
     Command(ConsoleCommand),
     ChatMessage(String),
     Empty,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum CleanupOperation {
+    DryRun,
+    Execute,
+    Status,
+    Stop,
 }
 
 #[must_use]
@@ -199,6 +231,74 @@ pub fn parse_input(input: &str) -> Result<ConsoleInput, AppError> {
         "status" => no_arguments(command, arguments, ConsoleCommand::Status)?,
         "players" => no_arguments(command, arguments, ConsoleCommand::Players)?,
         "inventory" => no_arguments(command, arguments, ConsoleCommand::Inventory)?,
+        "select-hotbar" => ConsoleCommand::SelectHotbar {
+            slot: arguments.parse().map_err(|_| {
+                AppError::InvalidConsoleSyntax("usage: /select-hotbar SLOT (0-8)".into())
+            })?,
+        },
+        "ensure-hotbar" => {
+            let mut parts = arguments.split_whitespace();
+            let item_id = parts
+                .next()
+                .ok_or_else(|| {
+                    AppError::InvalidConsoleSyntax("usage: /ensure-hotbar ITEM [SLOT]".into())
+                })?
+                .to_owned();
+            let slot =
+                parts.next().map(str::parse).transpose().map_err(|_| {
+                    AppError::InvalidConsoleSyntax("hotbar slot must be 0-8".into())
+                })?;
+            if parts.next().is_some() {
+                return Err(AppError::InvalidConsoleSyntax(
+                    "usage: /ensure-hotbar ITEM [SLOT]".into(),
+                ));
+            }
+            ConsoleCommand::EnsureHotbar { item_id, slot }
+        "smelt" => parse_smelt(arguments)?,
+        "smeltstatus" => no_arguments(command, arguments, ConsoleCommand::SmeltStatus)?,
+        "smeltstop" => no_arguments(command, arguments, ConsoleCommand::SmeltStop)?,
+        "cleanup-inventory" => {
+            let operation = match arguments {
+                "dry-run" => CleanupOperation::DryRun,
+                "execute" => CleanupOperation::Execute,
+                "status" => CleanupOperation::Status,
+                "stop" => CleanupOperation::Stop,
+                _ => {
+                    return Err(AppError::InvalidConsoleSyntax(
+                        "/cleanup-inventory dry-run|execute|status|stop".into(),
+                    ));
+                }
+            };
+            ConsoleCommand::CleanupInventory { operation }
+        }
+        "furnace-status" => no_arguments(command, arguments, ConsoleCommand::FurnaceStatus)?,
+        "smelt-check" => {
+            let mut parts = arguments.split_whitespace();
+            let output = minecraft_id(parts.next().ok_or_else(|| {
+                AppError::MissingConsoleArgument("/smelt-check <output> <count>".into())
+            })?);
+            let count = parts
+                .next()
+                .ok_or_else(|| {
+                    AppError::MissingConsoleArgument("/smelt-check <output> <count>".into())
+                })?
+                .parse()
+                .map_err(|_| {
+                    AppError::InvalidConsoleSyntax("count must be a positive integer".into())
+                })?;
+            if count == 0 || parts.next().is_some() {
+                return Err(AppError::InvalidConsoleSyntax(
+                    "/smelt-check <output> <count>".into(),
+                ));
+            }
+            ConsoleCommand::SmeltCheck { output, count }
+        }
+        "fuel-info" => ConsoleCommand::FuelInfo {
+            item: minecraft_id(single_argument(command, arguments, "/fuel-info <item>")?),
+        },
+        "containerstatus" | "container-status" => {
+            no_arguments(command, arguments, ConsoleCommand::ContainerStatus)?
+        }
         "recipe" => ConsoleCommand::Recipe {
             id: normalize_item_id(single_argument(command, arguments, "/recipe <recipe_id>")?)?,
         },
@@ -310,6 +410,7 @@ pub fn parse_input(input: &str) -> Result<ConsoleInput, AppError> {
         "placeblock" => parse_placeblock(arguments)?,
         "stopinteraction" => no_arguments(command, arguments, ConsoleCommand::StopInteraction)?,
         "interactionstatus" => no_arguments(command, arguments, ConsoleCommand::InteractionStatus)?,
+        "collect-item" | "collectdrop" => parse_collect_item(arguments)?,
         "mine-ore" | "mineore" => parse_mine_ore(arguments)?,
         "craft" => parse_craft(arguments)?,
         "collect-food" => parse_collect_food(arguments)?,
@@ -369,6 +470,57 @@ fn optional_radius(arguments: &str) -> Result<Option<u32>, AppError> {
         ));
     }
     Ok(Some(radius))
+fn parse_smelt(arguments: &str) -> Result<ConsoleCommand, AppError> {
+    let parts: Vec<_> = arguments.split_whitespace().collect();
+    let count = |value: &str| value.parse::<u32>().ok().filter(|v| *v > 0)
+        .ok_or_else(|| AppError::InvalidConsoleSyntax("smelt count must be positive".into()));
+    match parts.as_slice() {
+        ["status"] => Ok(ConsoleCommand::SmeltStatus),
+        ["stop"] => Ok(ConsoleCommand::SmeltStop),
+        ["recipe", id, n] => Ok(ConsoleCommand::SmeltRecipe { recipe_id: normalize_block_id(id)?, count: count(n)? }),
+        [target, n] => Ok(ConsoleCommand::Smelt { target: normalize_block_id(target)?, count: count(n)? }),
+        _ => Err(AppError::InvalidConsoleSyntax("/smelt <output> <count> | recipe <id> <count> | status | stop".into())),
+    }
+fn minecraft_id(value: &str) -> String {
+    let value = value.to_ascii_lowercase();
+    if value.contains(':') {
+        value
+    } else {
+        format!("minecraft:{value}")
+    }
+fn parse_collect_item(arguments: &str) -> Result<ConsoleCommand, AppError> {
+    let parts: Vec<_> = arguments.split_whitespace().collect();
+    match parts.as_slice() {
+        ["status"] => Ok(ConsoleCommand::CollectItemStatus),
+        ["stop"] => Ok(ConsoleCommand::CollectItemStop),
+        ["nearest"] => { let mut r=CollectRequest::exact(String::new(),1); r.filter=ItemFilter::Nearest; Ok(ConsoleCommand::CollectItem(r)) },
+        ["group", group, quantity] => {
+            let group = match *group { "ores"=>ItemGroup::Ores,"logs"=>ItemGroup::Logs,"food"=>ItemGroup::Food,
+                _=>return Err(AppError::InvalidConsoleSyntax("groups: ores, logs, food".into())) };
+            let mut r=CollectRequest::exact(String::new(),parse_quantity(quantity)?); r.filter=ItemFilter::Group(group); Ok(ConsoleCommand::CollectItem(r))
+        }
+        [items, quantity] => { let ids=items.split(',').map(normalize_item_id).collect::<Vec<_>>();
+            let mut r=CollectRequest::exact(ids[0].clone(),parse_quantity(quantity)?); if ids.len()>1 {r.filter=ItemFilter::AnyOf(ids)}; Ok(ConsoleCommand::CollectItem(r)) }
+        _ => Err(AppError::InvalidConsoleSyntax("/collect-item <item[,item]> <count> | group <ores|logs|food> <count> | nearest | status | stop".into()))
+    }
+}
+fn parse_quantity(value: &str) -> Result<u32, AppError> {
+    let n = value.parse().map_err(|_| {
+        AppError::InvalidConsoleSyntax("collection count must be a positive integer".into())
+    })?;
+    if n == 0 {
+        return Err(AppError::InvalidConsoleSyntax(
+            "collection count must be positive".into(),
+        ));
+    }
+    Ok(n)
+}
+fn normalize_item_id(value: &str) -> String {
+    if value.contains(':') {
+        value.to_ascii_lowercase()
+    } else {
+        format!("minecraft:{}", value.to_ascii_lowercase())
+    }
 fn parse_chop_tree(arguments: &str) -> Result<ConsoleCommand, AppError> {
     use crate::tree_chopping::ChopRequest;
     let parts: Vec<_> = arguments.split_whitespace().collect();
@@ -870,6 +1022,8 @@ mod tests {
         assert_eq!(
             parse_input("/drops 32").unwrap(),
             ConsoleInput::Command(ConsoleCommand::Drops { radius: Some(32) })
+            parse_input("/containerstatus").unwrap(),
+            ConsoleInput::Command(ConsoleCommand::ContainerStatus)
         );
         assert_eq!(
             parse_input("/chat hello").unwrap(),
@@ -880,6 +1034,39 @@ mod tests {
     }
 
     #[test]
+    fn parses_cleanup_inventory_commands_strictly() {
+        for (text, operation) in [
+            ("/cleanup-inventory dry-run", CleanupOperation::DryRun),
+            ("/cleanup-inventory execute", CleanupOperation::Execute),
+            ("/cleanup-inventory status", CleanupOperation::Status),
+            ("/cleanup-inventory stop", CleanupOperation::Stop),
+        ] {
+            assert_eq!(
+                parse_input(text).unwrap(),
+                ConsoleInput::Command(ConsoleCommand::CleanupInventory { operation })
+            );
+        }
+        assert!(parse_input("/cleanup-inventory").is_err());
+        assert!(parse_input("/cleanup-inventory run").is_err());
+    fn parses_processing_debug_commands() {
+        assert_eq!(
+            parse_input("/furnace-status").unwrap(),
+            ConsoleInput::Command(ConsoleCommand::FurnaceStatus)
+        );
+        assert_eq!(
+            parse_input("/smelt-check iron_ingot 3").unwrap(),
+            ConsoleInput::Command(ConsoleCommand::SmeltCheck {
+                output: "minecraft:iron_ingot".into(),
+                count: 3
+            })
+        );
+        assert_eq!(
+            parse_input("/fuel-info coal").unwrap(),
+            ConsoleInput::Command(ConsoleCommand::FuelInfo {
+                item: "minecraft:coal".into()
+            })
+        );
+        assert!(parse_input("/smelt-check iron_ingot 0").is_err());
     fn parses_crafting_debug_commands() {
         assert_eq!(
             parse_input("/craft stick 4").unwrap(),

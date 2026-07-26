@@ -1,5 +1,27 @@
 # Magic AI Bot
 
+## Dropped-item collection status
+
+Dropped-item collection is implemented for already loaded Azalea item entities. Use
+`/collect-item minecraft:diamond 10`, a comma-separated item set, `group
+ores|logs|food COUNT`, or `nearest`; `/collect-item status` and `/collect-item stop`
+provide bounded debug controls. The collector ranks safe/near/relevant candidates
+deterministically, checks inventory capacity, remembers failed entities, bounds
+moving-target replans, and confirms pickup using inventory revisions and matching
+count deltas alongside entity presence.
+
+The action only walks with the existing movement service. It does not explore,
+break blocks, open containers, or fight. Terrain hazards that Azalea does not expose
+in the current application snapshot remain `Unknown` (allowed by the current
+collector policy), stack capacity is conservatively modeled as 64, and a despawn
+cannot be distinguished from an entity merge unless a matching inventory delta is
+also observed. Task 9 integration is ready at the typed request/result boundary;
+shared survival preemption and richer terrain annotations remain follow-up inputs.
+
+Headless Minecraft AI bot foundation written in Rust, with Azalea planned as the
+Minecraft client framework. This stage provides configuration, logging, graceful
+shutdown, and module boundaries only; it does not connect to a server or perform
+gameplay actions.
 Headless Minecraft Java bot written in Rust on Azalea. The current branch implements connection,
 loaded-world snapshots, deterministic block search, movement/pathfinding, look control, and confirmed
 single-block break/place actions. It is **not** an autonomous resource-gathering bot.
@@ -122,6 +144,37 @@ src/
 └── ai/           # Future AI decision-making
 ```
 
+## Processing-station knowledge (Task 13 handoff)
+
+The processing module is observational and pure: it accepts immutable inventory,
+menu-slot, and menu-property snapshots and never opens, loads, waits on, collects
+from, places, or obtains a station. Its extensible station identity covers furnace,
+blast furnace, and smoker, while the bundled recipe catalog intentionally enables
+standard-furnace calculations first.
+
+**Pinned data/API decisions:** the lockfile pins Azalea commit
+`6249c295d353b9b3ef68f665b311cba39211fd19`. At that revision,
+`azalea-inventory::Menu` defines furnace, blast-furnace, and smoker as ingredient,
+fuel, and result slots; `ClientboundContainerSetData` exposes property id/value;
+the cooking-recipe display exposes ingredient, fuel, result, station, duration,
+and experience; and `ClientboundUpdateRecipes` does not expose the complete
+server cooking recipe set. Therefore third-party types remain at an adapter
+boundary, menu property values may be absent, and the versioned standard-furnace
+fallback catalog is deliberately small rather than pretending to be complete.
+Fuel burn values are explicit pinned vanilla fallback data, not inferred from item
+tags. Server/datapack recipe and fuel adapters can replace the catalog by revision.
+
+Debug commands are `/furnace-status`, `/smelt-check <output> <count>`, and
+`/fuel-info <item>`. The status command reports only an already-observed snapshot
+and deliberately performs no station discovery or interaction.
+
+**Limitations and Task 14 readiness:** live container identity/revision/property
+capture is not yet wired because the pinned Azalea client leaves container-set-data
+handling as a TODO. Blast-furnace and smoker types are modeled but their catalogs
+are deferred. Task 14 may consume `ProcessingStationSnapshot`, `CookingRecipe`,
+`Fuel`, and `ProcessingRequirements`; execution must separately add authoritative
+snapshot capture and serialized inventory ownership, without adding side effects to
+this knowledge module.
 ## Tree chopping (Task 32)
 
 `/chop-tree nearest`, `/chop-tree <tree_type>`, `/chop-tree logs <n>`, and

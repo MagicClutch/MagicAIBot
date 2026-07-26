@@ -120,6 +120,19 @@ edge_margin = 0.12
 maximum_face_attempts = 6
 maximum_hit_points_per_face = 5
 
+[smelting]
+station_search_radius = 32
+observation_interval_ms = 250
+confirmation_timeout_ms = 3000
+total_timeout_seconds = 300
+reopen_limit = 2
+# Inventory cleanup is deny-by-default: with no rules every item is kept.
+# Rules are evaluated deterministically; exact item rules beat tag rules and
+# the first rule wins ties. `discard` is the only authorization to drop.
+[inventory_cleanup]
+protect_rare_items = true
+protect_tools = true
+rules = []
 # Conservative loaded-world tree recognition. It never crafts, builds, climbs, or replants.
 [tree_chopping]
 allowed_tree_types = ["oak", "birch", "spruce", "jungle", "acacia", "dark_oak", "mangrove", "cherry", "pale_oak"]

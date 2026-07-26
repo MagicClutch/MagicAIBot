@@ -10,10 +10,11 @@ use crate::{
         block_query::BlockSearchQuery,
         block_search::{format_find_results, format_nearest_result},
     },
+    collection::{CollectDirective, CollectorConfig, DropCollector},
     config::Config,
     console::{
         self,
-        commands::{ConsoleCommand, ConsoleInput, plain_chat_message},
+        commands::{CleanupOperation, ConsoleCommand, ConsoleInput, plain_chat_message},
     },
     crafting::RecipeBook,
     crafting::CraftService,
@@ -21,11 +22,13 @@ use crate::{
     error::AppError,
     food::{CollectFoodRequest, FoodCollector, FoodGoal},
     interaction::{InteractionController, interaction_controller::InteractionState},
+    inventory::{InventoryActionService, InventoryRequest},
     logging,
     look::{LookController, LookTarget, look_controller::LookState},
     minecraft::client::MinecraftClient,
     movement::{MovementService, NavigationMode},
     navigation::{BlockNavigationService, navigation_state::BlockNavigationState},
+    processing::{ProcessingKnowledge, StationKind},
     tasks::TaskService,
     tree_chopping::TreeChopService,
     tasks::{CancellationReason, GatherRequest, TaskId, TaskService},
@@ -43,8 +46,10 @@ pub struct App {
     block_navigation: BlockNavigationService,
     look: LookController,
     interaction: InteractionController,
+    inventory_actions: InventoryActionService,
     mining: MiningService,
     tasks: TaskService,
+    collector: DropCollector,
     tree_chopping: TreeChopService,
     recipes: RecipeBook,
     crafting: CraftService,
@@ -106,8 +111,10 @@ impl App {
                 ),
                 block_navigation,
             ),
+            inventory_actions: InventoryActionService::default(),
             mining,
             tasks: TaskService::default(),
+            collector: DropCollector::new(CollectorConfig::default()),
             tree_chopping,
             recipes: RecipeBook::fallback().map_err(AppError::RecipeData)?,
             crafting: CraftService::default(),
@@ -139,6 +146,7 @@ impl App {
             1000 / u64::from(self.config.look.update_rate),
         ));
         let mut interaction_tick = tokio::time::interval(Duration::from_millis(50));
+        let mut collection_tick = tokio::time::interval(Duration::from_millis(100));
         let console_task = self.config.console.enabled.then(|| {
             tokio::task::spawn_local(console::read_input(input_tx, self.shutdown.child_token()))
         });
@@ -204,6 +212,8 @@ impl App {
                     self.interaction.tick(&self.minecraft, &self.movement, &self.look).await;
                     self.tree_chopping.tick(&self.minecraft, &self.movement, &self.look, &self.interaction).await;
                 },
+                _ = interaction_tick.tick() => self.interaction.tick(&self.minecraft, &self.movement, &self.look).await,
+                _ = collection_tick.tick(), if self.collector.running() => self.tick_collector().await,
                 input = input_rx.recv() => match input {
                     Some(Ok(ConsoleInput::Empty)) => {}
                     Some(Ok(input)) => {
@@ -256,16 +266,107 @@ impl App {
                     println!("Plain console input forwarding is disabled.");
                 }
             }
-            ConsoleInput::Command(command) => match command {
-                ConsoleCommand::Help => print_help(),
-                ConsoleCommand::Status => self.print_status().await,
-                ConsoleCommand::Chat { message } => {
-                    if let Err(error) = self.minecraft.send_chat(&message).await {
-                        println!("Chat error: {error}");
-                    }
+            ConsoleInput::Command(command) => {
+                // A newly issued non-collection command preempts collection;
+                // this prevents its tick from reclaiming movement afterward.
+                if self.collector.running()
+                    && !matches!(
+                        &command,
+                        ConsoleCommand::CollectItemStatus | ConsoleCommand::CollectItemStop
+                    )
+                {
+                    self.collector.cancel();
+                    self.tick_collector().await;
                 }
+                match command {
+                    ConsoleCommand::Help => print_help(),
+                    ConsoleCommand::Status => self.print_status().await,
+                    ConsoleCommand::Chat { message } => {
+                        if let Err(error) = self.minecraft.send_chat(&message).await {
+                            println!("Chat error: {error}");
+                        }
                 ConsoleCommand::Players => self.print_players().await,
                 ConsoleCommand::Inventory => self.print_inventory().await,
+                ConsoleCommand::SelectHotbar { slot } => {
+                    let outcome = self
+                        .inventory_actions
+                        .execute(
+                            &self.minecraft,
+                            InventoryRequest::Select { hotbar: slot },
+                            &self.shutdown.child_token(),
+                        )
+                        .await;
+                    println!("Inventory action: {outcome:?}");
+                }
+                ConsoleCommand::EnsureHotbar { item_id, slot } => {
+                    let outcome = self
+                        .inventory_actions
+                        .execute(
+                            &self.minecraft,
+                            InventoryRequest::EnsureInHotbar {
+                                item_id,
+                                preferred: slot,
+                            },
+                            &self.shutdown.child_token(),
+                        )
+                        .await;
+                    println!("Inventory action: {outcome:?}");
+                ConsoleCommand::Smelt { target, count } => println!(
+                    "Smelting request queued for {count} {target}; no live furnace container adapter is available in this build."
+                ),
+                ConsoleCommand::SmeltRecipe { recipe_id, count } => println!(
+                    "Smelting recipe request queued for {count} operations of {recipe_id}; no live furnace container adapter is available in this build."
+                ),
+                ConsoleCommand::SmeltStatus => println!("Smelting: idle"),
+                ConsoleCommand::SmeltStop => println!("Smelting: no active execution"),
+                ConsoleCommand::CleanupInventory { operation } => match operation {
+                    CleanupOperation::DryRun => {
+                        let world = self.minecraft.world_state_snapshot().await;
+                        let snapshot = crate::inventory_cleanup::CleanupSnapshot {
+                            revision: 0,
+                            items: world
+                                .inventory
+                                .slots
+                                .iter()
+                                .filter_map(|slot| {
+                                    Some(crate::inventory_cleanup::CleanupItem {
+                                        slot: slot.slot,
+                                        item_id: slot.item_id.clone()?,
+                                        count: slot.count,
+                                        tags: Default::default(),
+                                        rare: false,
+                                        tool: false,
+                                    })
+                                })
+                                .collect(),
+                        };
+                        let plan = crate::inventory_cleanup::plan_cleanup(
+                            &self.config.inventory_cleanup,
+                            &snapshot,
+                            &Default::default(),
+                        );
+                        println!("Cleanup dry-run (revision {}):", plan.revision);
+                        for step in plan.steps {
+                            println!(
+                                "slot {} {} x{}: {:?} ({})",
+                                step.slot, step.item_id, step.amount, step.action, step.reason
+                            );
+                        }
+                    }
+                    CleanupOperation::Execute => println!(
+                        "Cleanup result: Rejected (no chest/inventory mutation adapter is registered)"
+                    ),
+                    CleanupOperation::Status => println!("Cleanup status: idle"),
+                    CleanupOperation::Stop => println!("Cleanup result: Cancelled"),
+                },
+                ConsoleCommand::FurnaceStatus => println!(
+                    "No processing-station snapshot is currently observed. Open/load/acquire operations are intentionally not performed."
+                ),
+                ConsoleCommand::SmeltCheck { output, count } => {
+                    self.print_smelt_check(&output, count).await
+                }
+                ConsoleCommand::FuelInfo { item } => print_fuel_info(&item),
+                ConsoleCommand::ContainerStatus => self.print_container_status().await,
                 ConsoleCommand::Recipe { id } => self.print_recipe(&id),
                 ConsoleCommand::CraftCheck { item, count, depth } => {
                     self.print_craft_check(&item, count, depth).await
@@ -295,53 +396,81 @@ impl App {
                     {
                         println!("Movement error: {error}");
                     }
-                }
-                ConsoleCommand::GotoMine { x, y, z } => {
-                    self.interaction
-                        .cancel(&self.minecraft, &self.movement, &self.look)
-                        .await;
-                    self.block_navigation
-                        .cancel(&self.minecraft, &self.movement)
-                        .await;
-                    if let Err(error) = self
-                        .tasks
-                        .goto_position(
-                            &self.minecraft,
-                            &self.movement,
-                            crate::minecraft::world_state::PositionSnapshot {
-                                x: f64::from(x),
-                                y: f64::from(y),
-                                z: f64::from(z),
-                            },
-                            NavigationMode::AllowMining,
-                        )
-                        .await
-                    {
-                        println!("Movement error: {error}");
+                    ConsoleCommand::Players => self.print_players().await,
+                    ConsoleCommand::Inventory => self.print_inventory().await,
+                    ConsoleCommand::Entities { radius } => self.print_entities(radius).await,
+                    ConsoleCommand::Goto { x, y, z } => {
+                        self.interaction
+                            .cancel(&self.minecraft, &self.movement, &self.look)
+                            .await;
+                        self.block_navigation
+                            .cancel(&self.minecraft, &self.movement)
+                            .await;
+                        if let Err(error) = self
+                            .tasks
+                            .goto_position(
+                                &self.minecraft,
+                                &self.movement,
+                                crate::minecraft::world_state::PositionSnapshot {
+                                    x: f64::from(x),
+                                    y: f64::from(y),
+                                    z: f64::from(z),
+                                },
+                                NavigationMode::MovementOnly,
+                            )
+                            .await
+                        {
+                            println!("Movement error: {error}");
+                        }
                     }
-                }
-                ConsoleCommand::PathStatus => self.print_path_status().await,
-                ConsoleCommand::Stop => {
-                    // `/stop` is the movement channel's stop command. A
-                    // separate look task remains active, even when it is
-                    // tracking a target while the bot walks.
-                    self.block_navigation
-                        .cancel(&self.minecraft, &self.movement)
-                        .await;
-                    if let Err(error) = self.movement.stop(&self.minecraft).await {
-                        println!("Movement error: {error}");
+                    ConsoleCommand::GotoMine { x, y, z } => {
+                        self.interaction
+                            .cancel(&self.minecraft, &self.movement, &self.look)
+                            .await;
+                        self.block_navigation
+                            .cancel(&self.minecraft, &self.movement)
+                            .await;
+                        if let Err(error) = self
+                            .tasks
+                            .goto_position(
+                                &self.minecraft,
+                                &self.movement,
+                                crate::minecraft::world_state::PositionSnapshot {
+                                    x: f64::from(x),
+                                    y: f64::from(y),
+                                    z: f64::from(z),
+                                },
+                                NavigationMode::AllowMining,
+                            )
+                            .await
+                        {
+                            println!("Movement error: {error}");
+                        }
                     }
-                }
-                ConsoleCommand::StopAll => {
-                    self.interaction
-                        .cancel(&self.minecraft, &self.movement, &self.look)
-                        .await;
-                    self.block_navigation
-                        .cancel(&self.minecraft, &self.movement)
-                        .await;
-                    if let Err(error) = self.movement.stop(&self.minecraft).await {
-                        println!("Movement error: {error}");
+                    ConsoleCommand::PathStatus => self.print_path_status().await,
+                    ConsoleCommand::Stop => {
+                        // `/stop` is the movement channel's stop command. A
+                        // separate look task remains active, even when it is
+                        // tracking a target while the bot walks.
+                        self.block_navigation
+                            .cancel(&self.minecraft, &self.movement)
+                            .await;
+                        if let Err(error) = self.movement.stop(&self.minecraft).await {
+                            println!("Movement error: {error}");
+                        }
                     }
+                    ConsoleCommand::StopAll => {
+                        self.interaction
+                            .cancel(&self.minecraft, &self.movement, &self.look)
+                            .await;
+                        self.block_navigation
+                            .cancel(&self.minecraft, &self.movement)
+                            .await;
+                        if let Err(error) = self.movement.stop(&self.minecraft).await {
+                            println!("Movement error: {error}");
+                        }
+                        self.look.cancel().await;
+                        self.tasks.cancel(&self.minecraft).await;
                     self.look.cancel().await;
                     self.tasks.cancel(&self.minecraft).await;
                 }
@@ -429,144 +558,175 @@ impl App {
                     if let Err(error) = self.movement.follow(&self.minecraft, &player).await {
                         println!("Movement error: {error}");
                     }
-                }
-                ConsoleCommand::Movement => self.print_movement().await,
-                ConsoleCommand::FindBlock {
-                    block_id,
-                    radius,
-                    limit,
-                } => {
-                    self.find_blocks(block_id, radius, limit).await;
-                }
-                ConsoleCommand::NearestBlock { block_id, radius } => {
-                    self.find_blocks(block_id, radius, Some(1)).await;
-                }
-                ConsoleCommand::GotoBlock {
-                    block_id,
-                    search_radius,
-                    allow_mining,
-                } => {
-                    self.interaction
-                        .cancel(&self.minecraft, &self.movement, &self.look)
-                        .await;
-                    let radius =
-                        search_radius.unwrap_or(self.config.block_navigation.default_search_radius);
-                    if let Err(error) = self
-                        .tasks
-                        .goto_block(
-                            &self.minecraft,
-                            &self.movement,
-                            &self.block_navigation,
-                            block_id,
-                            radius,
-                            if allow_mining {
-                                NavigationMode::AllowMining
-                            } else {
-                                NavigationMode::MovementOnly
-                            },
-                        )
-                        .await
-                    {
-                        logging::warning(format!("Block navigation failed: {error}"));
-                    }
-                }
-                ConsoleCommand::GotoBlockStatus => self.print_block_navigation_status().await,
-                ConsoleCommand::CancelGotoBlock => {
-                    self.block_navigation
-                        .cancel(&self.minecraft, &self.movement)
-                        .await;
-                }
-                ConsoleCommand::Look { x, y, z } => {
-                    self.interaction
-                        .cancel(&self.minecraft, &self.movement, &self.look)
-                        .await;
-                    if let Err(error) = self
-                        .tasks
-                        .look_at(
-                            &self.minecraft,
-                            &self.look,
-                            LookTarget::World(crate::minecraft::world_state::PositionSnapshot {
-                                x: f64::from(x),
-                                y: f64::from(y),
-                                z: f64::from(z),
-                            }),
-                        )
-                        .await
-                    {
-                        logging::warning(format!("Look failed: {error}"));
-                    }
-                }
-                ConsoleCommand::LookBlock { block_id } => {
-                    self.interaction
-                        .cancel(&self.minecraft, &self.movement, &self.look)
-                        .await;
-                    if let Err(error) = self
-                        .tasks
-                        .look_at_block(&self.minecraft, &self.look, block_id)
-                        .await
-                    {
-                        logging::warning(format!("Look failed: {error}"));
-                    }
-                }
-                ConsoleCommand::LookPlayer { player } => {
-                    self.interaction
-                        .cancel(&self.minecraft, &self.movement, &self.look)
-                        .await;
-                    if let Err(error) = self
-                        .tasks
-                        .look_at(&self.minecraft, &self.look, LookTarget::Player(player))
-                        .await
-                    {
-                        logging::warning(format!("Look failed: {error}"));
-                    }
-                }
-                ConsoleCommand::LookEntity { entity_type } => {
-                    self.interaction
-                        .cancel(&self.minecraft, &self.movement, &self.look)
-                        .await;
-                    let world = self.minecraft.world_state_snapshot().await;
-                    let entity = world.entities.iter().find(|entity| {
-                        entity
-                            .entity_type
-                            .rsplit(':')
-                            .next()
-                            .is_some_and(|kind| kind.eq_ignore_ascii_case(&entity_type))
-                    });
-                    match entity {
-                        Some(entity) => {
-                            if let Err(error) = self
-                                .tasks
-                                .look_at(
-                                    &self.minecraft,
-                                    &self.look,
-                                    LookTarget::Entity(entity.entity_id),
-                                )
-                                .await
-                            {
-                                logging::warning(format!("Look failed: {error}"));
-                            }
+                    ConsoleCommand::TaskStatus => self.print_task_status().await,
+                    ConsoleCommand::Follow { player } => {
+                        self.interaction
+                            .cancel(&self.minecraft, &self.movement, &self.look)
+                            .await;
+                        self.block_navigation
+                            .cancel(&self.minecraft, &self.movement)
+                            .await;
+                        if let Err(error) = self.movement.follow(&self.minecraft, &player).await {
+                            println!("Movement error: {error}");
                         }
-                        None => logging::warning(format!("Unknown entity: {entity_type}")),
                     }
-                }
-                ConsoleCommand::LookStop => self.look.cancel().await,
-                ConsoleCommand::LookStatus => self.print_look_status().await,
-                ConsoleCommand::BreakBlock => {
-                    self.block_navigation
-                        .cancel(&self.minecraft, &self.movement)
-                        .await;
-                    if let Err(error) = self
-                        .tasks
-                        .break_looked_block(
-                            &self.minecraft,
-                            &self.movement,
-                            &self.look,
-                            &self.interaction,
-                        )
-                        .await
-                    {
-                        logging::warning(format!("Cannot break block: {error}"));
+                    ConsoleCommand::Movement => self.print_movement().await,
+                    ConsoleCommand::FindBlock {
+                        block_id,
+                        radius,
+                        limit,
+                    } => {
+                        self.find_blocks(block_id, radius, limit).await;
                     }
+                    ConsoleCommand::NearestBlock { block_id, radius } => {
+                        self.find_blocks(block_id, radius, Some(1)).await;
+                    }
+                    ConsoleCommand::GotoBlock {
+                        block_id,
+                        search_radius,
+                        allow_mining,
+                    } => {
+                        self.interaction
+                            .cancel(&self.minecraft, &self.movement, &self.look)
+                            .await;
+                        let radius = search_radius
+                            .unwrap_or(self.config.block_navigation.default_search_radius);
+                        if let Err(error) = self
+                            .tasks
+                            .goto_block(
+                                &self.minecraft,
+                                &self.movement,
+                                &self.block_navigation,
+                                block_id,
+                                radius,
+                                if allow_mining {
+                                    NavigationMode::AllowMining
+                                } else {
+                                    NavigationMode::MovementOnly
+                                },
+                            )
+                            .await
+                        {
+                            logging::warning(format!("Block navigation failed: {error}"));
+                        }
+                    }
+                    ConsoleCommand::GotoBlockStatus => self.print_block_navigation_status().await,
+                    ConsoleCommand::CancelGotoBlock => {
+                        self.block_navigation
+                            .cancel(&self.minecraft, &self.movement)
+                            .await;
+                    }
+                    ConsoleCommand::Look { x, y, z } => {
+                        self.interaction
+                            .cancel(&self.minecraft, &self.movement, &self.look)
+                            .await;
+                        if let Err(error) = self
+                            .tasks
+                            .look_at(
+                                &self.minecraft,
+                                &self.look,
+                                LookTarget::World(
+                                    crate::minecraft::world_state::PositionSnapshot {
+                                        x: f64::from(x),
+                                        y: f64::from(y),
+                                        z: f64::from(z),
+                                    },
+                                ),
+                            )
+                            .await
+                        {
+                            logging::warning(format!("Look failed: {error}"));
+                        }
+                    }
+                    ConsoleCommand::LookBlock { block_id } => {
+                        self.interaction
+                            .cancel(&self.minecraft, &self.movement, &self.look)
+                            .await;
+                        if let Err(error) = self
+                            .tasks
+                            .look_at_block(&self.minecraft, &self.look, block_id)
+                            .await
+                        {
+                            logging::warning(format!("Look failed: {error}"));
+                        }
+                    }
+                    ConsoleCommand::LookPlayer { player } => {
+                        self.interaction
+                            .cancel(&self.minecraft, &self.movement, &self.look)
+                            .await;
+                        if let Err(error) = self
+                            .tasks
+                            .look_at(&self.minecraft, &self.look, LookTarget::Player(player))
+                            .await
+                        {
+                            logging::warning(format!("Look failed: {error}"));
+                        }
+                    }
+                    ConsoleCommand::LookEntity { entity_type } => {
+                        self.interaction
+                            .cancel(&self.minecraft, &self.movement, &self.look)
+                            .await;
+                        let world = self.minecraft.world_state_snapshot().await;
+                        let entity = world.entities.iter().find(|entity| {
+                            entity
+                                .entity_type
+                                .rsplit(':')
+                                .next()
+                                .is_some_and(|kind| kind.eq_ignore_ascii_case(&entity_type))
+                        });
+                        match entity {
+                            Some(entity) => {
+                                if let Err(error) = self
+                                    .tasks
+                                    .look_at(
+                                        &self.minecraft,
+                                        &self.look,
+                                        LookTarget::Entity(entity.entity_id),
+                                    )
+                                    .await
+                                {
+                                    logging::warning(format!("Look failed: {error}"));
+                                }
+                            }
+                            None => logging::warning(format!("Unknown entity: {entity_type}")),
+                        }
+                    }
+                    ConsoleCommand::LookStop => self.look.cancel().await,
+                    ConsoleCommand::LookStatus => self.print_look_status().await,
+                    ConsoleCommand::BreakBlock => {
+                        self.block_navigation
+                            .cancel(&self.minecraft, &self.movement)
+                            .await;
+                        if let Err(error) = self
+                            .tasks
+                            .break_looked_block(
+                                &self.minecraft,
+                                &self.movement,
+                                &self.look,
+                                &self.interaction,
+                            )
+                            .await
+                        {
+                            logging::warning(format!("Cannot break block: {error}"));
+                        }
+                    }
+                    ConsoleCommand::Break { x, y, z } => {
+                        self.block_navigation
+                            .cancel(&self.minecraft, &self.movement)
+                            .await;
+                        if let Err(error) = self
+                            .tasks
+                            .break_block(
+                                &self.minecraft,
+                                &self.movement,
+                                &self.look,
+                                &self.interaction,
+                                crate::minecraft::world_state::BlockPosition { x, y, z },
+                            )
+                            .await
+                        {
+                            logging::warning(format!("Cannot break block: {error}"));
+                        }
                 }
                 ConsoleCommand::MineOre { target, count, radius } => {
                     self.mining.cancel(&self.minecraft,&self.movement,&self.look,&self.interaction).await;
@@ -595,24 +755,41 @@ impl App {
                     {
                         logging::warning(format!("Cannot break block: {error}"));
                     }
-                }
-                ConsoleCommand::BreakNearest { block_id } => {
-                    self.block_navigation
-                        .cancel(&self.minecraft, &self.movement)
-                        .await;
-                    if let Err(error) = self
-                        .tasks
-                        .break_nearest_block(
-                            &self.minecraft,
-                            &self.movement,
-                            &self.look,
-                            &self.interaction,
-                            block_id,
-                        )
-                        .await
-                    {
-                        logging::warning(format!("Cannot break block: {error}"));
+                    ConsoleCommand::BreakNearest { block_id } => {
+                        self.block_navigation
+                            .cancel(&self.minecraft, &self.movement)
+                            .await;
+                        if let Err(error) = self
+                            .tasks
+                            .break_nearest_block(
+                                &self.minecraft,
+                                &self.movement,
+                                &self.look,
+                                &self.interaction,
+                                block_id,
+                            )
+                            .await
+                        {
+                            logging::warning(format!("Cannot break block: {error}"));
+                        }
                     }
+                    ConsoleCommand::PlaceLooked { block_id } => {
+                        self.block_navigation
+                            .cancel(&self.minecraft, &self.movement)
+                            .await;
+                        if let Err(error) = self
+                            .tasks
+                            .place_looked_block(
+                                &self.minecraft,
+                                &self.movement,
+                                &self.look,
+                                &self.interaction,
+                                block_id,
+                            )
+                            .await
+                        {
+                            logging::warning(format!("Cannot place block: {error}"));
+                        }
                 }
                 ConsoleCommand::SelectTool { block_id } => {
                     let policy = crate::interaction::tool_selection::ToolSelectionPolicy {
@@ -658,25 +835,58 @@ impl App {
                     {
                         logging::warning(format!("Cannot place block: {error}"));
                     }
-                }
-                ConsoleCommand::PlaceAt { x, y, z, block_id } => {
-                    self.block_navigation
-                        .cancel(&self.minecraft, &self.movement)
-                        .await;
-                    if let Err(error) = self
-                        .tasks
-                        .place_block(
-                            &self.minecraft,
-                            &self.movement,
-                            &self.look,
-                            &self.interaction,
-                            crate::minecraft::world_state::BlockPosition { x, y, z },
-                            block_id,
-                        )
-                        .await
-                    {
-                        logging::warning(format!("Cannot place block: {error}"));
+                    ConsoleCommand::PlaceAt { x, y, z, block_id } => {
+                        self.block_navigation
+                            .cancel(&self.minecraft, &self.movement)
+                            .await;
+                        if let Err(error) = self
+                            .tasks
+                            .place_block(
+                                &self.minecraft,
+                                &self.movement,
+                                &self.look,
+                                &self.interaction,
+                                crate::minecraft::world_state::BlockPosition { x, y, z },
+                                block_id,
+                            )
+                            .await
+                        {
+                            logging::warning(format!("Cannot place block: {error}"));
+                        }
                     }
+                    ConsoleCommand::StopInteraction => {
+                        self.interaction
+                            .cancel(&self.minecraft, &self.movement, &self.look)
+                            .await
+                    }
+                    ConsoleCommand::InteractionStatus => self.print_interaction_status().await,
+                    ConsoleCommand::CollectItem(request) => {
+                        self.interaction
+                            .cancel(&self.minecraft, &self.movement, &self.look)
+                            .await;
+                        self.block_navigation
+                            .cancel(&self.minecraft, &self.movement)
+                            .await;
+                        let _ = self.movement.stop(&self.minecraft).await;
+                        self.collector.start(request, Instant::now());
+                        logging::info("Dropped-item collection requested");
+                    }
+                    ConsoleCommand::CollectItemStatus => self.print_collection_status(),
+                    ConsoleCommand::CollectItemStop => {
+                        self.collector.cancel();
+                        self.tick_collector().await;
+                    }
+                    ConsoleCommand::TestOakLog => {
+                        self.block_navigation
+                            .cancel(&self.minecraft, &self.movement)
+                            .await;
+                        if let Err(error) = self
+                            .interaction
+                            .test_oak_log(&self.minecraft, &self.movement, &self.look)
+                            .await
+                        {
+                            logging::warning(format!("Oak-log test failed: {error}"));
+                        }
                 }
                 ConsoleCommand::StopInteraction => {
                     self.interaction
@@ -851,12 +1061,74 @@ impl App {
                         Ok(()) => println!("Reconnect successful."),
                         Err(error) => println!("Reconnect failed: {error}"),
                     }
+                    ConsoleCommand::Reconnect => {
+                        let _ = self.movement.stop(&self.minecraft).await;
+                        self.block_navigation
+                            .cancel(&self.minecraft, &self.movement)
+                            .await;
+                        self.look.cancel().await;
+                        self.interaction
+                            .cancel(&self.minecraft, &self.movement, &self.look)
+                            .await;
+                        match self.minecraft.reconnect().await {
+                            Ok(()) => println!("Reconnect successful."),
+                            Err(error) => println!("Reconnect failed: {error}"),
+                        }
+                    }
+                    ConsoleCommand::Quit => return Ok(true),
                 }
-                ConsoleCommand::Quit => return Ok(true),
-            },
+            }
             ConsoleInput::Empty => {}
         }
         Ok(false)
+    }
+
+    async fn print_container_status(&self) {
+        let snapshot = self.minecraft.world_state_snapshot().await.container;
+        println!("Container observer (read-only):");
+        println!("  session generation: {}", snapshot.session_generation);
+        println!(
+            "  open: {}  synced: {}  state: {:?}",
+            snapshot.is_open, snapshot.is_synced, snapshot.sync_state
+        );
+        if let Some(identity) = snapshot.identity {
+            println!(
+                "  window: {}  type: {}  title: {}",
+                identity.window_id,
+                identity.menu_type,
+                identity.title.as_deref().unwrap_or("unknown")
+            );
+            println!(
+                "  position: {}",
+                identity
+                    .world_position
+                    .map_or_else(|| "unknown".into(), |p| format!("{} {} {}", p.x, p.y, p.z))
+            );
+        }
+        println!(
+            "  revision: {}  container slots: {}  player slots: {}",
+            snapshot
+                .revision
+                .map_or_else(|| "unknown".into(), |revision| revision.to_string()),
+            snapshot.container_slots.len(),
+            snapshot.player_slots.len()
+        );
+        println!(
+            "  cursor: {}",
+            snapshot
+                .cursor
+                .as_ref()
+                .and_then(|slot| slot.item_id.as_deref())
+                .map_or("empty".into(), |id| format!(
+                    "{} x{}",
+                    id,
+                    snapshot.cursor.as_ref().map_or(0, |slot| slot.count)
+                ))
+        );
+        println!(
+            "  opened: {:?}  observed: {:?}  closed: {:?}",
+            snapshot.opened_at, snapshot.observed_at, snapshot.closed_at
+        );
     }
 
     async fn find_blocks(&self, block_id: String, radius: Option<u32>, limit: Option<usize>) {
@@ -1165,11 +1437,24 @@ impl App {
     async fn print_inventory(&self) {
         let world = self.minecraft.world_state_snapshot().await;
         println!(
-            "Selected slot: {}",
+            "Inventory sync: {:?} | revision {} | server state {}",
+            world.inventory.sync_state,
+            world.inventory.revision,
+            world
+                .inventory
+                .server_state_id
+                .map_or_else(|| "unknown".into(), |v| v.to_string())
+        );
+        println!(
+            "Selected hotbar slot: {} | application slot: {}",
             world
                 .inventory
                 .selected_hotbar_slot
-                .map_or_else(|| "unknown".into(), |v| v.to_string())
+                .map_or_else(|| "unknown".into(), |v| v.to_string()),
+            world
+                .inventory
+                .selected_slot
+                .map_or_else(|| "unknown".into(), |v| v.0.to_string())
         );
         println!(
             "Selected item: {}",
@@ -1179,22 +1464,76 @@ impl App {
             )
         );
         println!(
-            "Used slots: {}",
-            world
-                .inventory
-                .slots
-                .iter()
-                .filter(|s| s.item_id.is_some())
-                .count()
+            "Storage slots: {}/{} used ({} empty)",
+            world.inventory.used_storage_slots,
+            world.inventory.storage_capacity,
+            world.inventory.empty_storage_slots
         );
-        println!("Total item stacks: {}", world.inventory.total_counts.len());
+        println!(
+            "Distinct item kinds: {}",
+            world.inventory.total_counts.len()
+        );
         let mut items: Vec<_> = world.inventory.total_counts.iter().collect();
         items.sort_by_key(|(id, _)| *id);
         for (id, count) in items {
             println!("{id} x{count}");
         }
+        for slot in world
+            .inventory
+            .slots
+            .iter()
+            .filter(|slot| slot.item_id.is_some())
+        {
+            let durability = slot
+                .metadata
+                .remaining_durability
+                .zip(slot.metadata.maximum_durability)
+                .map_or_else(String::new, |(left, max)| {
+                    format!(" durability={left}/{max}")
+                });
+            let name = slot
+                .display_name
+                .as_deref()
+                .map_or_else(String::new, |name| format!(" name={name:?}"));
+            println!(
+                "slot {} [{:?}] {} x{}{}{}",
+                slot.id.0,
+                slot.region,
+                slot.item_id.as_deref().unwrap_or("unknown"),
+                slot.count,
+                name,
+                durability
+            );
+        }
     }
 
+    async fn print_smelt_check(&self, output: &str, count: u32) {
+        let knowledge = ProcessingKnowledge::vanilla_furnace();
+        let world = self.minecraft.world_state_snapshot().await;
+        let Some(recipe) = knowledge.recipes_for_output(output).into_iter().next() else {
+            println!(
+                "No standard-furnace recipe data for {output} (catalog revision {}).",
+                knowledge.revision
+            );
+            return;
+        };
+        match knowledge.requirements(recipe, StationKind::Furnace, count, &world.inventory) {
+            Ok(r) => println!(
+                "Recipe: {} | operations: {} | output: {} | input available/missing: {}/{} | burn required/missing: {}/{} ticks | fuel: {} | time: {} ticks",
+                recipe.id,
+                r.operations,
+                r.expected_output,
+                r.available_input,
+                r.missing_input,
+                r.required_burn_ticks,
+                r.missing_burn_ticks,
+                r.fuel.map_or_else(
+                    || "none sufficient".into(),
+                    |f| format!("{} x{} ({} waste ticks)", f.item_id, f.items, f.waste_ticks)
+                ),
+                r.cooking_ticks
+            ),
+            Err(error) => println!("Smelt check unavailable: {error}"),
     fn print_recipe(&self, id: &str) {
         match self.recipes.recipe(id) {
             Ok(recipe) => {
@@ -1366,6 +1705,62 @@ impl App {
         }
     }
 
+    async fn tick_collector(&mut self) {
+        use crate::minecraft::world_state::MovementStatus;
+        use std::collections::{HashMap, HashSet};
+        let world = self.minecraft.world_state_snapshot().await;
+        let path_failed = self.movement.snapshot().await.status == MovementStatus::Failed;
+        // Safety is conservative: absent terrain annotations are Unknown and
+        // governed by CollectorConfig. Pathfinder failures populate the
+        // collector's per-run unreachable memory.
+        match self.collector.tick(
+            &world,
+            &HashMap::new(),
+            &HashSet::new(),
+            path_failed,
+            Instant::now(),
+        ) {
+            CollectDirective::Navigate(position) => {
+                if let Err(error) = self
+                    .movement
+                    .goto(&self.minecraft, position, NavigationMode::MovementOnly)
+                    .await
+                {
+                    logging::warning(format!("Collection path failed: {error}"));
+                }
+            }
+            CollectDirective::Stop => {
+                let _ = self.movement.stop(&self.minecraft).await;
+            }
+            CollectDirective::Finished(result) => {
+                let _ = self.movement.stop(&self.minecraft).await;
+                logging::info(format!(
+                    "Collection {:?}: {}/{} items, {} target(s), {} lost",
+                    result.outcome,
+                    result.collected,
+                    result.requested,
+                    result.entities_targeted,
+                    result.entities_lost
+                ));
+            }
+            CollectDirective::None => {}
+        }
+    }
+
+    fn print_collection_status(&self) {
+        let (result, target) = self.collector.status();
+        println!(
+            "Collection: {} | collected {}/{} | target {} | lost {}",
+            if self.collector.running() {
+                "running"
+            } else {
+                "idle"
+            },
+            result.collected,
+            result.requested,
+            target.map_or_else(|| "none".into(), |id| id.to_string()),
+            result.entities_lost
+        );
     async fn reconcile_task_terminal(&self) {
         use crate::tasks::{ActionResource, ActionState};
 
@@ -1540,6 +1935,17 @@ fn print_help() {
     println!("/chat TEXT  Send TEXT to Minecraft chat");
     println!("/players    Show known online players");
     println!("/inventory  Show inventory summary");
+    println!("/select-hotbar SLOT  Confirm selection of hotbar slot 0-8");
+    println!("/ensure-hotbar ITEM [SLOT]  Confirm item placement and selection");
+    println!("/smelt ID COUNT  Execute a standard-furnace recipe");
+    println!("/smelt recipe ID COUNT  Execute a recipe by identifier");
+    println!("/smelt status (or /smeltstatus)  Show furnace execution status");
+    println!("/smelt stop (or /smeltstop)  Cancel furnace execution");
+    println!("/cleanup-inventory dry-run|execute|status|stop  Safely plan or control cleanup");
+    println!("/furnace-status  Show the currently observed station snapshot only");
+    println!("/smelt-check OUTPUT COUNT  Calculate read-only furnace requirements");
+    println!("/fuel-info ITEM  Show pinned standard-furnace fuel data");
+    println!("/containerstatus  Show read-only active-container debug state");
     println!("/recipe ID  Show a versioned read-only recipe");
     println!("/craft-check ITEM [COUNT] [DEPTH]  Plan with a virtual inventory");
     println!("/collect-food [ITEM COUNT|value POINTS]  Collect safe observable food");
@@ -1582,6 +1988,9 @@ fn print_help() {
     println!("/placeblock ID [X Y Z]  Place through the reusable placement workflow");
     println!("/stopinteraction  Cancel block interaction");
     println!("/interactionstatus  Show interaction status");
+    println!("/collect-item ITEM[,ITEM] COUNT  Collect matching loaded drops");
+    println!("/collect-item group ores|logs|food COUNT  Collect a loaded item group");
+    println!("/collect-item nearest|status|stop  Collection debug controls");
     println!("/mine-ore ORE COUNT [RADIUS]  Mine safe loaded ore only");
     println!("/mine-ore status|stop  Inspect or cancel ore mining");
     println!("/craft ITEM COUNT  Submit a crafting debug request (requires a resolved plan)");
@@ -1590,6 +1999,23 @@ fn print_help() {
     println!("/testoaklog  Break and restore the nearest oak log");
     println!("/reconnect  Reconnect to the configured server");
     println!("/quit       Shut down the application");
+}
+
+fn print_fuel_info(item: &str) {
+    let knowledge = ProcessingKnowledge::vanilla_furnace();
+    match knowledge.fuel(item) {
+        Some(fuel) => println!(
+            "Fuel: {} | burn: {} ticks | standard operations: {:.2} | preference: {} | protected: {} | emergency-only: {} | remainder: {}",
+            fuel.item_id,
+            fuel.burn_ticks,
+            fuel.standard_operations(),
+            fuel.preference,
+            fuel.protected,
+            fuel.emergency_only,
+            fuel.remainder.as_deref().unwrap_or("none")
+        ),
+        None => println!("No pinned fuel data for {item}."),
+    }
 }
 
 async fn await_console_task(task: JoinHandle<()>) {
