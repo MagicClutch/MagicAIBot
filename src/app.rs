@@ -6,6 +6,7 @@ use std::{
 use crate::{
     blocks::{
         BlockSearchService,
+        mining::{MiningService, OreSelector},
         block_query::BlockSearchQuery,
         block_search::{format_find_results, format_nearest_result},
     },
@@ -36,6 +37,7 @@ pub struct App {
     block_navigation: BlockNavigationService,
     look: LookController,
     interaction: InteractionController,
+    mining: MiningService,
     tasks: TaskService,
     session_ready: bool,
     started_at: Instant,
@@ -58,6 +60,9 @@ impl App {
             ),
         );
 
+        let mining = MiningService::new(BlockSearchService::new(
+            config.block_search.maximum_radius, config.block_search.maximum_result_limit,
+            config.block_search.default_vertical_range));
         Ok(Self {
             minecraft: MinecraftClient::new(
                 config.minecraft.clone(),
@@ -89,6 +94,7 @@ impl App {
                 ),
                 block_navigation,
             ),
+            mining,
             tasks: TaskService::default(),
             session_ready: false,
             config,
@@ -148,7 +154,10 @@ impl App {
                         self.look.tick(&self.minecraft).await;
                     }
                 },
-                _ = interaction_tick.tick() => self.interaction.tick(&self.minecraft, &self.movement, &self.look).await,
+                _ = interaction_tick.tick() => {
+                    self.interaction.tick(&self.minecraft, &self.movement, &self.look).await;
+                    self.mining.tick(&self.minecraft, &self.movement, &self.look, &self.interaction).await;
+                },
                 input = input_rx.recv() => match input {
                     Some(Ok(ConsoleInput::Empty)) => {}
                     Some(Ok(input)) => {
@@ -426,6 +435,16 @@ impl App {
                         logging::warning(format!("Cannot break block: {error}"));
                     }
                 }
+                ConsoleCommand::MineOre { target, count, radius } => {
+                    self.mining.cancel(&self.minecraft,&self.movement,&self.look,&self.interaction).await;
+                    let selector=if target.starts_with("minecraft:") || target.ends_with("_ore") {OreSelector::Id(target)} else {OreSelector::Group(target)};
+                    if let Err(error)=self.mining.start(&self.minecraft,selector,count,radius.unwrap_or(32)).await { logging::warning(format!("Cannot mine ore: {error}")); }
+                }
+                ConsoleCommand::MineOreStatus => {
+                    let s=self.mining.snapshot().await;
+                    println!("Ore mining: {:?}; collected {}/{}; broken {}; skipped {}; failures {}{}",s.state,s.collected,s.requested,s.blocks_broken,s.skipped,s.failures,s.reason.map(|r|format!("; {r}")).unwrap_or_default());
+                }
+                ConsoleCommand::MineOreStop => self.mining.cancel(&self.minecraft,&self.movement,&self.look,&self.interaction).await,
                 ConsoleCommand::Break { x, y, z } => {
                     self.block_navigation
                         .cancel(&self.minecraft, &self.movement)
@@ -1031,6 +1050,8 @@ fn print_help() {
     println!("/placeblock ID [X Y Z]  Place through the reusable placement workflow");
     println!("/stopinteraction  Cancel block interaction");
     println!("/interactionstatus  Show interaction status");
+    println!("/mine-ore ORE COUNT [RADIUS]  Mine safe loaded ore only");
+    println!("/mine-ore status|stop  Inspect or cancel ore mining");
     println!("/testoaklog  Break and restore the nearest oak log");
     println!("/reconnect  Reconnect to the configured server");
     println!("/quit       Shut down the application");

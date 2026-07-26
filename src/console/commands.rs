@@ -88,6 +88,9 @@ pub enum ConsoleCommand {
     },
     StopInteraction,
     InteractionStatus,
+    MineOre { target: String, count: u32, radius: Option<u32> },
+    MineOreStatus,
+    MineOreStop,
     TestOakLog,
     Reconnect,
     Quit,
@@ -219,6 +222,7 @@ pub fn parse_input(input: &str) -> Result<ConsoleInput, AppError> {
         "placeblock" => parse_placeblock(arguments)?,
         "stopinteraction" => no_arguments(command, arguments, ConsoleCommand::StopInteraction)?,
         "interactionstatus" => no_arguments(command, arguments, ConsoleCommand::InteractionStatus)?,
+        "mine-ore" | "mineore" => parse_mine_ore(arguments)?,
         "testoaklog" => no_arguments(command, arguments, ConsoleCommand::TestOakLog)?,
         "reconnect" => no_arguments(command, arguments, ConsoleCommand::Reconnect)?,
         "quit" => no_arguments(command, arguments, ConsoleCommand::Quit)?,
@@ -236,6 +240,20 @@ pub fn parse_input(input: &str) -> Result<ConsoleInput, AppError> {
     };
 
     Ok(ConsoleInput::Command(parsed))
+}
+
+fn parse_mine_ore(arguments: &str) -> Result<ConsoleCommand, AppError> {
+    let parts: Vec<_> = arguments.split_whitespace().collect();
+    match parts.as_slice() {
+        ["status"] => Ok(ConsoleCommand::MineOreStatus),
+        ["stop"] => Ok(ConsoleCommand::MineOreStop),
+        [target, count] | [target, count, _] => {
+            let count=count.parse().map_err(|_|AppError::InvalidConsoleSyntax("/mine-ore <ore|group> <count> [radius]".into()))?;
+            let radius=parts.get(2).map(|v|v.parse().map_err(|_|AppError::InvalidConsoleSyntax("radius must be a positive integer".into()))).transpose()?;
+            Ok(ConsoleCommand::MineOre{target:target.to_ascii_lowercase(),count,radius})
+        }
+        _ => Err(AppError::InvalidConsoleSyntax("/mine-ore <ore|group> <count> [radius] | status | stop".into())),
+    }
 }
 
 fn parse_place(arguments: &str) -> Result<ConsoleCommand, AppError> {
@@ -566,6 +584,8 @@ mod tests {
             parse_input("/breakblock").unwrap(),
             ConsoleInput::Command(ConsoleCommand::BreakBlock)
         );
+        assert_eq!(parse_input("/mine-ore diamond 3 24").unwrap(), ConsoleInput::Command(ConsoleCommand::MineOre{target:"diamond".into(),count:3,radius:Some(24)}));
+        assert_eq!(parse_input("/mine-ore status").unwrap(), ConsoleInput::Command(ConsoleCommand::MineOreStatus));
         assert_eq!(
             parse_input("/break 1 64 -2").unwrap(),
             ConsoleInput::Command(ConsoleCommand::Break { x: 1, y: 64, z: -2 })

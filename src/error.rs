@@ -44,6 +44,8 @@ pub enum AppError {
     InteractionOutOfReach,
     #[error("cannot break air")]
     CannotBreakAir,
+    #[error("no suitable harvest tool is available")]
+    NoSuitableHarvestTool,
     #[error("inventory does not contain {0}")]
     InteractionItemMissing(String),
     #[error("cannot place block: {0}")]
