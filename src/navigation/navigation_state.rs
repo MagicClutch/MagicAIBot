@@ -1,6 +1,9 @@
 use std::time::{Duration, SystemTime};
 
-use crate::minecraft::world_state::{BlockPosition, PositionSnapshot};
+use crate::{
+    minecraft::world_state::{BlockPosition, PositionSnapshot},
+    movement::NavigationMode,
+};
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub enum BlockNavigationState {
@@ -9,6 +12,7 @@ pub enum BlockNavigationState {
     Searching,
     SelectingTarget,
     Moving,
+    #[allow(dead_code)] // retained for status compatibility; Azalea now owns replanning.
     Repathing,
     Reached,
     Cancelled,
@@ -30,6 +34,7 @@ pub struct BlockNavigationSnapshot {
     pub current_attempt: usize,
     pub maximum_attempts: usize,
     pub generation: u64,
+    pub mode: NavigationMode,
 }
 
 pub fn arrival_valid(
@@ -47,12 +52,6 @@ pub fn arrival_valid(
 pub fn timed_out(start: Option<SystemTime>, maximum_seconds: u64) -> bool {
     start.is_some_and(|start| {
         start.elapsed().unwrap_or_default() >= Duration::from_secs(maximum_seconds)
-    })
-}
-
-pub fn is_stuck(last_progress: Option<SystemTime>, timeout_seconds: u64) -> bool {
-    last_progress.is_some_and(|last| {
-        last.elapsed().unwrap_or_default() >= Duration::from_secs(timeout_seconds)
     })
 }
 
@@ -101,9 +100,8 @@ mod tests {
     }
 
     #[test]
-    fn detects_stuck_and_timeout() {
+    fn detects_timeout() {
         let old = Some(SystemTime::now() - Duration::from_secs(20));
-        assert!(is_stuck(old, 12));
         assert!(timed_out(old, 12));
     }
 }

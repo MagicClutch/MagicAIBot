@@ -1,4 +1,5 @@
 use std::{
+    collections::HashSet,
     sync::Arc,
     time::{Duration, SystemTime},
 };
@@ -72,6 +73,10 @@ struct Inner {
     dispatched: bool,
     retry_at: Option<SystemTime>,
     restore_after_break: Option<(BlockPosition, String)>,
+    failure_logged: bool,
+    face_attempt: usize,
+    hit_point_attempt: usize,
+    failed_hit_points: HashSet<(BlockPosition, BlockFace, usize)>,
 }
 #[derive(Clone)]
 pub struct InteractionController {
@@ -97,6 +102,10 @@ impl InteractionController {
                 dispatched: false,
                 retry_at: None,
                 restore_after_break: None,
+                failure_logged: false,
+                face_attempt: 0,
+                hit_point_attempt: 0,
+                failed_hit_points: HashSet::new(),
             })),
         }
     }
@@ -311,6 +320,10 @@ impl InteractionController {
         inner.operation = Some(operation);
         inner.dispatched = false;
         inner.retry_at = None;
+        inner.failure_logged = false;
+        inner.face_attempt = 0;
+        inner.hit_point_attempt = 0;
+        inner.failed_hit_points.clear();
         Ok(())
     }
     pub async fn cancel(
@@ -355,6 +368,10 @@ impl InteractionController {
         inner.dispatched = false;
         inner.retry_at = None;
         inner.restore_after_break = None;
+        inner.failure_logged = false;
+        inner.face_attempt = 0;
+        inner.hit_point_attempt = 0;
+        inner.failed_hit_points.clear();
     }
     pub async fn tick(
         &self,
@@ -416,7 +433,7 @@ impl InteractionController {
                     self.fail("navigation support disappeared").await;
                     return;
                 };
-                if self
+                if let Err(error) = self
                     .navigation
                     .start_exact(
                         minecraft,
@@ -425,9 +442,8 @@ impl InteractionController {
                         navigation_block_id,
                     )
                     .await
-                    .is_err()
                 {
-                    self.fail("navigation failed").await;
+                    self.fail(&navigation_failure_reason(&error)).await;
                     return;
                 }
                 self.set_state(InteractionState::Moving).await;
@@ -436,17 +452,28 @@ impl InteractionController {
             return;
         }
         if state == InteractionState::Moving {
-            let navigation_state = self.navigation.snapshot().await.state;
+            let navigation = self.navigation.snapshot().await;
+            let navigation_state = navigation.state;
             if navigation_state == BlockNavigationState::Failed {
-                self.fail("navigation failed").await;
+                self.fail(
+                    navigation
+                        .failure_reason
+                        .as_deref()
+                        .unwrap_or("no safe reachable interaction position"),
+                )
+                .await;
             } else if navigation_state == BlockNavigationState::Reached && in_reach {
-                self.prepare().await;
+                if self.operation_still_valid(minecraft, &operation).await {
+                    self.prepare().await;
+                } else {
+                    self.fail("target changed while navigating").await;
+                }
             }
             return;
         }
         if state == InteractionState::Preparing {
             if self.config.auto_precise_look {
-                let (look_position, expected_id, face) = match &operation {
+                let (look_position, expected_id, base_face) = match &operation {
                     Operation::Break {
                         target,
                         expected,
@@ -459,7 +486,14 @@ impl InteractionController {
                         ..
                     } => (*support, Some(support_id.clone()), *face),
                 };
-                let attempt = self.inner.lock().await.snapshot.retries as usize;
+                let (face_attempt, hit_point_attempt) = {
+                    let inner = self.inner.lock().await;
+                    (inner.face_attempt, inner.hit_point_attempt)
+                };
+                let face = match &operation {
+                    Operation::Break { .. } => break_face_order(base_face)[face_attempt % 6],
+                    Operation::Place { .. } => base_face,
+                };
                 let points = face_hit_points(
                     look_position,
                     face,
@@ -472,7 +506,10 @@ impl InteractionController {
                     self.config.face_targeting.edge_margin,
                     self.config.face_targeting.maximum_hit_points_per_face,
                 );
-                let point = points.get(attempt % points.len()).copied().ok_or(());
+                let point = points
+                    .get(hit_point_attempt % points.len())
+                    .copied()
+                    .ok_or(());
                 let Ok(point) = point else {
                     self.fail("no valid face hit point").await;
                     return;
@@ -482,14 +519,15 @@ impl InteractionController {
                     block_id: expected_id,
                     point,
                 };
+                // Claim the phase before awaiting the look controller. This
+                // prevents a later tick from starting the same child task.
+                self.set_state(InteractionState::Looking).await;
                 if look
                     .look_at_with_precision(minecraft, target_for_look, LookPrecision::Precise)
                     .await
                     .is_err()
                 {
                     self.fail("precise look failed").await;
-                } else {
-                    self.set_state(InteractionState::Looking).await;
                 }
             } else {
                 self.dispatch(minecraft, &operation).await;
@@ -504,6 +542,19 @@ impl InteractionController {
                     Operation::Place { support, face, .. } => (*support, *face),
                 };
                 match minecraft.looked_block().await {
+                    // Breaking needs the target block. Unlike placement, the
+                    // exact face is advisory and can legitimately vary after
+                    // interpolation or a collision-shape raycast.
+                    Ok(hit)
+                        if matches!(&operation, Operation::Break { .. })
+                            && hit.position == expected_hit =>
+                    {
+                        if self.operation_still_valid(minecraft, &operation).await {
+                            self.dispatch(minecraft, &operation).await
+                        } else {
+                            self.retry_or_fail("target or support changed").await;
+                        }
+                    }
                     Ok(hit)
                         if hit.position == expected_hit
                             && hit.face == to_raycast_face(expected_face) =>
@@ -517,9 +568,20 @@ impl InteractionController {
                     Ok(hit) if hit.position == expected_hit => {
                         self.retry_or_fail("raycast hit wrong face").await
                     }
-                    Ok(_) => {
-                        self.retry_or_fail("wrong support block is being looked at")
-                            .await
+                    Ok(hit) => {
+                        if matches!(&operation, Operation::Break { .. }) {
+                            let actual_id = block_id(minecraft, hit.position)
+                                .await
+                                .ok()
+                                .flatten()
+                                .unwrap_or_else(|| "unloaded".into());
+                            debug!(expected = ?expected_hit, actual = ?hit.position, actual_id, "target face is obstructed; trying another acquisition candidate");
+                            self.recover_break_raycast(minecraft, movement, &operation)
+                                .await;
+                        } else {
+                            self.retry_or_fail("wrong support block is being looked at")
+                                .await;
+                        }
                     }
                     Err(_) => self.retry_or_fail("raycast target unavailable").await,
                 }
@@ -568,6 +630,26 @@ impl InteractionController {
         }
     }
     async fn dispatch(&self, minecraft: &MinecraftClient, operation: &Operation) {
+        // Mark dispatch before touching Azalea so break/place cannot be
+        // started twice if another completion signal arrives meanwhile.
+        {
+            let mut inner = self.inner.lock().await;
+            if inner.dispatched
+                || !matches!(
+                    inner.snapshot.state,
+                    InteractionState::Looking | InteractionState::Preparing
+                )
+            {
+                return;
+            }
+            inner.dispatched = true;
+            inner.snapshot.state = if matches!(operation, Operation::Break { .. }) {
+                InteractionState::Breaking
+            } else {
+                InteractionState::Placing
+            };
+            inner.snapshot.started_at = Some(SystemTime::now());
+        }
         let result = match operation {
             Operation::Break { target, .. } => minecraft.begin_breaking(*target).await,
             Operation::Place { item_id, .. } => {
@@ -580,22 +662,15 @@ impl InteractionController {
         };
         match result {
             Ok(()) => {
-                self.set_state(if matches!(operation, Operation::Break { .. }) {
-                    InteractionState::Breaking
-                } else {
-                    InteractionState::Placing
-                })
-                .await;
-                let mut inner = self.inner.lock().await;
-                inner.dispatched = true;
-                inner.snapshot.started_at = Some(SystemTime::now());
                 if matches!(operation, Operation::Break { .. }) {
                     logging::info("Beginning block break");
                 } else {
                     logging::info("Placing block");
                 }
             }
-            Err(error) => self.retry_or_fail(&error.to_string()).await,
+            Err(error) => {
+                self.retry_or_fail(&error.to_string()).await;
+            }
         }
     }
     async fn operation_still_valid(
@@ -654,7 +729,11 @@ impl InteractionController {
         if inner.snapshot.retries >= self.config.retry_limit {
             inner.snapshot.state = InteractionState::Failed;
             inner.snapshot.failure_reason = Some(reason.into());
-            logging::warning(format!("Interaction failed: {reason}"));
+            inner.operation = None;
+            if !inner.failure_logged {
+                inner.failure_logged = true;
+                logging::warning(format!("Interaction failed: {reason}"));
+            }
         } else {
             inner.snapshot.retries += 1;
             inner.snapshot.state = InteractionState::Retrying;
@@ -662,16 +741,70 @@ impl InteractionController {
                 Some(SystemTime::now() + Duration::from_millis(self.config.retry_delay_ms));
         }
     }
+    /// Exhaust safe points on a face, then the remaining faces, before asking
+    /// the existing block navigation service for another approach position.
+    async fn recover_break_raycast(
+        &self,
+        minecraft: &MinecraftClient,
+        movement: &MovementService,
+        operation: &Operation,
+    ) {
+        let Operation::Break { target, face, .. } = operation else {
+            return;
+        };
+        let reposition = {
+            let mut inner = self.inner.lock().await;
+            let hit_point_attempt = inner.hit_point_attempt;
+            inner
+                .failed_hit_points
+                .insert((*target, *face, hit_point_attempt));
+            inner.hit_point_attempt += 1;
+            if inner.hit_point_attempt >= self.config.face_targeting.maximum_hit_points_per_face {
+                inner.hit_point_attempt = 0;
+                inner.face_attempt += 1;
+            }
+            if inner.face_attempt < 6 {
+                inner.snapshot.state = InteractionState::Preparing;
+                return;
+            }
+            inner.face_attempt = 0;
+            inner.hit_point_attempt = 0;
+            true
+        };
+        if reposition {
+            logging::info("Repositioning for a clear view");
+            match self
+                .navigation
+                .try_another_approach(minecraft, movement)
+                .await
+            {
+                Ok(true) => self.set_state(InteractionState::Moving).await,
+                Ok(false) => {
+                    self.retry_or_fail("no clear reachable view from any safe interaction position")
+                        .await
+                }
+                Err(error) => {
+                    self.retry_or_fail(&format!("no clear reachable view: {error}"))
+                        .await
+                }
+            }
+        }
+    }
     async fn fail(&self, reason: &str) {
         let mut inner = self.inner.lock().await;
         inner.snapshot.state = InteractionState::Failed;
         inner.snapshot.failure_reason = Some(reason.into());
-        logging::warning(format!("Interaction failed: {reason}"));
+        inner.operation = None;
+        if !inner.failure_logged {
+            inner.failure_logged = true;
+            logging::warning(format!("Interaction failed: {reason}"));
+        }
     }
     async fn complete(&self, message: &str) {
         let mut inner = self.inner.lock().await;
         inner.snapshot.state = InteractionState::Completed;
         inner.snapshot.progress_percent = Some(100);
+        inner.operation = None;
         logging::success(message);
     }
     async fn complete_break(
@@ -684,6 +817,7 @@ impl InteractionController {
             let mut inner = self.inner.lock().await;
             inner.snapshot.state = InteractionState::Completed;
             inner.snapshot.progress_percent = Some(100);
+            inner.operation = None;
             inner.restore_after_break.take()
         };
         logging::success("Block broken");
@@ -756,6 +890,39 @@ fn to_raycast_face(face: BlockFace) -> RaycastFace {
         BlockFace::East => RaycastFace::East,
     }
 }
+fn break_face_order(preferred: BlockFace) -> [BlockFace; 6] {
+    let all = [
+        BlockFace::Up,
+        BlockFace::Down,
+        BlockFace::North,
+        BlockFace::South,
+        BlockFace::West,
+        BlockFace::East,
+    ];
+    let mut ordered = [preferred; 6];
+    let mut index = 1;
+    for face in all {
+        if face != preferred {
+            ordered[index] = face;
+            index += 1;
+        }
+    }
+    ordered
+}
+fn navigation_failure_reason(error: &AppError) -> String {
+    match error {
+        AppError::NoValidApproachPosition => "no safe reachable interaction position".into(),
+        AppError::TargetBlockDisappeared => "target changed before navigation".into(),
+        AppError::TargetChunkUnloaded | AppError::ChunkUnavailableDuringSearch => {
+            "target chunk is not loaded".into()
+        }
+        AppError::MovementUnavailable => "bot is not ready for navigation".into(),
+        AppError::MovementCancelled => "navigation was cancelled".into(),
+        AppError::BlockNavigationTimeout => "navigation timed out".into(),
+        AppError::MovementStalled => "movement stalled".into(),
+        other => format!("navigation could not start: {other}"),
+    }
+}
 async fn world_position(minecraft: &MinecraftClient) -> Result<[f64; 3], AppError> {
     let position = minecraft
         .world_state_snapshot()
@@ -781,5 +948,23 @@ mod tests {
         let i = InventorySnapshot::default();
         assert!(!find_placeable_block(&i, "minecraft:stone"));
         assert_eq!(held_item(&i), None);
+    }
+    #[test]
+    fn break_recovery_exhausts_each_face_before_repositioning() {
+        let faces = break_face_order(BlockFace::North);
+        assert_eq!(faces[0], BlockFace::North);
+        let unique: HashSet<_> = faces.into_iter().collect();
+        assert_eq!(unique.len(), 6);
+    }
+    #[test]
+    fn navigation_start_errors_keep_the_useful_reason() {
+        assert_eq!(
+            navigation_failure_reason(&AppError::NoValidApproachPosition),
+            "no safe reachable interaction position"
+        );
+        assert_eq!(
+            navigation_failure_reason(&AppError::TargetBlockDisappeared),
+            "target changed before navigation"
+        );
     }
 }

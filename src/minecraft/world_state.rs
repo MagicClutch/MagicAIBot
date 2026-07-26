@@ -324,6 +324,16 @@ impl WorldState {
         self.inventory = InventorySnapshot::default();
         self.touch();
     }
+    /// Drop observations that belong to a disconnected Azalea session.
+    pub fn clear_session_state(&mut self) {
+        self.bot = BotSnapshot::default();
+        self.players.clear();
+        self.entities.clear();
+        self.inventory = InventorySnapshot::default();
+        self.movement = MovementSnapshot::default();
+        self.current_task = None;
+        self.touch();
+    }
     pub fn upsert_player(&mut self, mut player: PlayerSnapshot) {
         player.distance = player
             .position
@@ -725,6 +735,31 @@ mod tests {
         assert_eq!(state.snapshot().current_task.unwrap().name, "test");
         state.clear_current_task();
         assert!(state.snapshot().current_task.is_none());
+    }
+
+    #[test]
+    fn session_reset_drops_stale_bot_and_task_state() {
+        let mut state = WorldState::default();
+        state.update_bot(BotSnapshot {
+            position: Some(PositionSnapshot {
+                x: 1.0,
+                y: 64.0,
+                z: 1.0,
+            }),
+            dimension: Some("minecraft:overworld".into()),
+            ..BotSnapshot::default()
+        });
+        state.set_current_task(TaskSnapshot {
+            name: "old".into(),
+            id: "1".into(),
+            status: "running".into(),
+            started_at: SystemTime::now(),
+        });
+        state.clear_session_state();
+        let snapshot = state.snapshot();
+        assert!(snapshot.bot.position.is_none());
+        assert!(snapshot.bot.dimension.is_none());
+        assert!(snapshot.current_task.is_none());
     }
     #[test]
     fn snapshots_clone_without_internal_aliases() {

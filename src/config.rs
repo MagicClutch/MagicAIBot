@@ -71,7 +71,7 @@ impl Default for ConsoleConfig {
     fn default() -> Self {
         Self {
             enabled: true,
-            send_plain_input_to_chat: true,
+            send_plain_input_to_chat: false,
             show_system_messages: true,
             show_action_bar_messages: false,
         }
@@ -212,7 +212,7 @@ fn default_interaction_distance() -> f64 {
     4.5
 }
 fn default_maximum_target_attempts() -> usize {
-    8
+    10
 }
 fn default_stuck_timeout_seconds() -> u64 {
     12
@@ -232,7 +232,7 @@ impl Default for BlockNavigationConfig {
             candidate_limit: 20,
             interaction_distance: 4.5,
             arrival_distance: 1.5,
-            maximum_target_attempts: 8,
+            maximum_target_attempts: 10,
             stuck_timeout_seconds: 12,
             maximum_navigation_seconds: 120,
             repath_interval_ms: 1000,
@@ -788,7 +788,7 @@ mod tests {
         assert_eq!(config.minecraft.server, "localhost");
         assert_eq!(config.block_search.default_radius, 32);
         assert_eq!(config.block_search.default_result_limit, 20);
-        assert_eq!(config.block_navigation.maximum_target_attempts, 8);
+        assert_eq!(config.block_navigation.maximum_target_attempts, 10);
         assert_eq!(config.look.motion.maximum_yaw_speed, 220.0);
         assert_eq!(config.look.update_rate, 20);
         assert!(config.look.randomization.enabled);

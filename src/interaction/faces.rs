@@ -12,7 +12,7 @@ pub enum BlockFacePurpose {
     Interact,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Hash)]
 pub enum BlockFace {
     Up,
     Down,

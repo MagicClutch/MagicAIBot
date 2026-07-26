@@ -19,7 +19,7 @@ use crate::{
     logging,
     look::{LookController, LookTarget, look_controller::LookState},
     minecraft::client::MinecraftClient,
-    movement::MovementService,
+    movement::{MovementService, NavigationMode},
     navigation::{BlockNavigationService, navigation_state::BlockNavigationState},
     tasks::TaskService,
 };
@@ -37,6 +37,7 @@ pub struct App {
     look: LookController,
     interaction: InteractionController,
     tasks: TaskService,
+    session_ready: bool,
     started_at: Instant,
 }
 
@@ -89,6 +90,7 @@ impl App {
                 block_navigation,
             ),
             tasks: TaskService::default(),
+            session_ready: false,
             config,
             shutdown: CancellationToken::new(),
             started_at: Instant::now(),
@@ -124,11 +126,28 @@ impl App {
                     break Ok(());
                 }
                 _ = movement_tick.tick() => {
+                    if self.minecraft.connection_state() != crate::minecraft::client::ConnectionState::Connected {
+                        if self.session_ready {
+                            self.session_ready = false;
+                            self.interaction.cancel(&self.minecraft, &self.movement, &self.look).await;
+                            self.block_navigation.cancel(&self.minecraft, &self.movement).await;
+                            self.look.cancel().await;
+                            let _ = self.movement.stop(&self.minecraft).await;
+                            self.tasks.cancel(&self.minecraft).await;
+                        }
+                        continue;
+                    }
+                    self.session_ready = true;
                     let explicit_look = self.look.snapshot().await.state == LookState::Looking;
                     self.movement.tick(&self.minecraft, explicit_look).await;
                     self.block_navigation.tick(&self.minecraft, &self.movement).await;
                 },
-                _ = look_tick.tick() => self.look.tick(&self.minecraft).await,
+                _ = look_tick.tick() => {
+                    let status = self.minecraft.navigation_status().await.ok();
+                    if !status.is_some_and(|status| status.calculating || status.executing) {
+                        self.look.tick(&self.minecraft).await;
+                    }
+                },
                 _ = interaction_tick.tick() => self.interaction.tick(&self.minecraft, &self.movement, &self.look).await,
                 input = input_rx.recv() => match input {
                     Some(Ok(ConsoleInput::Empty)) => {}
@@ -201,12 +220,38 @@ impl App {
                                 y: f64::from(y),
                                 z: f64::from(z),
                             },
+                            NavigationMode::MovementOnly,
                         )
                         .await
                     {
                         println!("Movement error: {error}");
                     }
                 }
+                ConsoleCommand::GotoMine { x, y, z } => {
+                    self.interaction
+                        .cancel(&self.minecraft, &self.movement, &self.look)
+                        .await;
+                    self.block_navigation
+                        .cancel(&self.minecraft, &self.movement)
+                        .await;
+                    if let Err(error) = self
+                        .tasks
+                        .goto_position(
+                            &self.minecraft,
+                            &self.movement,
+                            crate::minecraft::world_state::PositionSnapshot {
+                                x: f64::from(x),
+                                y: f64::from(y),
+                                z: f64::from(z),
+                            },
+                            NavigationMode::AllowMining,
+                        )
+                        .await
+                    {
+                        println!("Movement error: {error}");
+                    }
+                }
+                ConsoleCommand::PathStatus => self.print_path_status().await,
                 ConsoleCommand::Stop => {
                     // `/stop` is the movement channel's stop command. A
                     // separate look task remains active, even when it is
@@ -257,6 +302,7 @@ impl App {
                 ConsoleCommand::GotoBlock {
                     block_id,
                     search_radius,
+                    allow_mining,
                 } => {
                     self.interaction
                         .cancel(&self.minecraft, &self.movement, &self.look)
@@ -271,6 +317,11 @@ impl App {
                             &self.block_navigation,
                             block_id,
                             radius,
+                            if allow_mining {
+                                NavigationMode::AllowMining
+                            } else {
+                                NavigationMode::MovementOnly
+                            },
                         )
                         .await
                     {
@@ -585,6 +636,16 @@ impl App {
         );
         if let Some(reason) = snapshot.failure_reason {
             println!("Failure reason: {reason}");
+        }
+    }
+
+    async fn print_path_status(&self) {
+        match self.minecraft.navigation_status().await {
+            Ok(status) if status.calculating => println!("Pathfinder: calculating"),
+            Ok(status) if status.executing => println!("Pathfinder: following path"),
+            Ok(status) if status.reached => println!("Pathfinder: completed"),
+            Ok(_) => println!("Pathfinder: idle or no path"),
+            Err(error) => println!("Pathfinder unavailable: {error}"),
         }
     }
 
@@ -944,10 +1005,13 @@ fn print_help() {
     println!("/entities [RADIUS]  Show nearby entities");
     println!("/findblock ID [RADIUS] [LIMIT]  Find loaded blocks");
     println!("/nearestblock ID [RADIUS]  Find nearest loaded block");
-    println!("/gotoblock ID [RADIUS]  Navigate to a matching block");
+    println!("/gotoblock ID [RADIUS] [mine]  Navigate to a matching block");
+    println!("/navigate-to-block ID [RADIUS] [mine]  Alias for /gotoblock");
     println!("/gotoblockstatus  Show block-navigation status");
     println!("/cancelgotoblock  Cancel block navigation");
-    println!("/goto X Y Z  Walk to coordinates");
+    println!("/goto X Y Z  Walk to coordinates without mining");
+    println!("/goto-mine X Y Z  Navigate with Azalea mining-aware routing");
+    println!("/path-status  Show Azalea pathfinder status");
     println!("/stop or /stopmovement  Stop movement only");
     println!("/stopall    Stop movement and looking");
     println!("/taskstatus Show movement and look tasks");
@@ -964,6 +1028,7 @@ fn print_help() {
     println!("/breaknearest ID  Find, navigate to, and break a block");
     println!("/place ID  Place the held block beside the crosshair target");
     println!("/place X Y Z ID  Place a block at coordinates");
+    println!("/placeblock ID [X Y Z]  Place through the reusable placement workflow");
     println!("/stopinteraction  Cancel block interaction");
     println!("/interactionstatus  Show interaction status");
     println!("/testoaklog  Break and restore the nearest oak log");

@@ -54,6 +54,7 @@ use crate::{
             PositionSnapshot, TaskSnapshot, WorldConnectionState, WorldState, WorldStateSnapshot,
         },
     },
+    movement::NavigationMode,
 };
 
 #[derive(Clone, Copy, Debug)]
@@ -279,7 +280,7 @@ impl MinecraftClient {
         let mut world = self.world_state.lock().await;
         world.set_joined_world(false);
         world.set_connection(WorldConnectionState::Disconnected);
-        world.clear_inventory();
+        world.clear_session_state();
         self.set_state(ConnectionState::Disconnected);
         logging::info("Disconnected");
         Ok(())
@@ -693,6 +694,7 @@ impl MinecraftClient {
         &self,
         destination: PositionSnapshot,
         follow_distance: Option<f64>,
+        mode: NavigationMode,
     ) -> Result<(), AppError> {
         if self.connection_state() != ConnectionState::Connected {
             return Err(AppError::MovementUnavailable);
@@ -710,16 +712,16 @@ impl MinecraftClient {
                     distance as f32,
                 ),
                 PathfinderOpts::new()
-                    .allow_mining(false)
-                    .retry_on_no_path(false),
+                    .allow_mining(mode.allows_mining())
+                    .retry_on_no_path(true),
             );
         } else {
             let block = destination.block();
             client.start_goto_with_opts(
                 BlockPosGoal(azalea::BlockPos::new(block.x, block.y, block.z)),
                 PathfinderOpts::new()
-                    .allow_mining(false)
-                    .retry_on_no_path(false),
+                    .allow_mining(mode.allows_mining())
+                    .retry_on_no_path(true),
             );
         }
         Ok(())
@@ -863,6 +865,7 @@ async fn supervise(
             let mut world = world_state.lock().await;
             world.set_connection(WorldConnectionState::Disconnected);
             world.set_joined_world(false);
+            world.clear_session_state();
             match &reason {
                 DisconnectReason::Kicked(message) => world.set_disconnect_reason(message.clone()),
                 DisconnectReason::ConnectionFailure(message) => {

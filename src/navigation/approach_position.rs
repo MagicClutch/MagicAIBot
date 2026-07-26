@@ -3,7 +3,7 @@ use std::collections::HashMap;
 use crate::minecraft::world_state::BlockPosition;
 
 pub fn approach_positions(target: BlockPosition) -> Vec<BlockPosition> {
-    let mut positions = Vec::with_capacity(8);
+    let mut positions = Vec::with_capacity(10);
     for (x, z) in [
         (target.x - 1, target.z),
         (target.x + 1, target.z),
@@ -16,6 +16,19 @@ pub fn approach_positions(target: BlockPosition) -> Vec<BlockPosition> {
     ] {
         positions.push(BlockPosition { x, y: target.y, z });
     }
+    // Standing on top can be the only valid interaction position for a
+    // partially enclosed block. Below is included only when the normal floor,
+    // foot and head validation accepts it.
+    positions.push(BlockPosition {
+        x: target.x,
+        y: target.y + 1,
+        z: target.z,
+    });
+    positions.push(BlockPosition {
+        x: target.x,
+        y: target.y - 1,
+        z: target.z,
+    });
     positions
 }
 
@@ -115,7 +128,7 @@ mod tests {
     fn generates_cardinal_and_diagonal_approaches() {
         assert_eq!(
             approach_positions(BlockPosition { x: 0, y: 64, z: 0 }).len(),
-            8
+            10
         );
     }
 

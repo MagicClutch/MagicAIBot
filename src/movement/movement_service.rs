@@ -12,9 +12,9 @@ use crate::{
         client::MinecraftClient,
         world_state::{MovementSnapshot, MovementStatus, PositionSnapshot},
     },
-    movement::logger,
     movement::multitasking::{LocalMovementInput, local_input_for_direction},
     movement::navigator::{arrived, distance, following_snapshot, moving_snapshot},
+    movement::{NavigationMode, logger},
 };
 
 #[derive(Clone)]
@@ -23,6 +23,7 @@ pub struct MovementService {
     multitasking: MultitaskingConfig,
     state: Arc<Mutex<MovementSnapshot>>,
     local_input: Arc<Mutex<LocalMovementInput>>,
+    suppress_terminal_log: Arc<Mutex<bool>>,
 }
 
 impl MovementService {
@@ -32,6 +33,7 @@ impl MovementService {
             multitasking,
             state: Arc::new(Mutex::new(MovementSnapshot::default())),
             local_input: Arc::new(Mutex::new(LocalMovementInput::default())),
+            suppress_terminal_log: Arc::new(Mutex::new(false)),
         }
     }
     pub async fn snapshot(&self) -> MovementSnapshot {
@@ -50,22 +52,26 @@ impl MovementService {
         &self,
         minecraft: &MinecraftClient,
         destination: PositionSnapshot,
+        mode: NavigationMode,
     ) -> Result<(), AppError> {
-        self.goto_internal(minecraft, destination, true).await
+        self.goto_internal(minecraft, destination, mode, true).await
     }
 
     pub(crate) async fn goto_for_block_navigation(
         &self,
         minecraft: &MinecraftClient,
         destination: PositionSnapshot,
+        mode: NavigationMode,
     ) -> Result<(), AppError> {
-        self.goto_internal(minecraft, destination, false).await
+        self.goto_internal(minecraft, destination, mode, false)
+            .await
     }
 
     async fn goto_internal(
         &self,
         minecraft: &MinecraftClient,
         destination: PositionSnapshot,
+        mode: NavigationMode,
         log_start: bool,
     ) -> Result<(), AppError> {
         if !destination.x.is_finite() || !destination.y.is_finite() || !destination.z.is_finite() {
@@ -74,7 +80,10 @@ impl MovementService {
             ));
         }
         let world = minecraft.world_state_snapshot().await;
-        minecraft.start_navigation_to(destination, None).await?;
+        *self.suppress_terminal_log.lock().await = !log_start;
+        minecraft
+            .start_navigation_to(destination, None, mode)
+            .await?;
         if log_start {
             logger::going_to(destination);
         }
@@ -107,6 +116,7 @@ impl MovementService {
 
     pub async fn follow(&self, minecraft: &MinecraftClient, name: &str) -> Result<(), AppError> {
         let world = minecraft.world_state_snapshot().await;
+        *self.suppress_terminal_log.lock().await = false;
         let player = world
             .find_player_by_name(name)
             .ok_or_else(|| AppError::UnknownPlayer(name.to_owned()))?;
@@ -114,7 +124,11 @@ impl MovementService {
             .position
             .ok_or_else(|| AppError::UnknownPlayer(format!("{name} has no known position")))?;
         minecraft
-            .start_navigation_to(destination, Some(self.config.follow_distance))
+            .start_navigation_to(
+                destination,
+                Some(self.config.follow_distance),
+                NavigationMode::MovementOnly,
+            )
             .await?;
         logger::following(&player.username);
         self.replace_and_publish(
@@ -257,7 +271,11 @@ impl MovementService {
                 .is_none_or(|d| d > self.config.follow_distance)
         {
             if let Err(error) = minecraft
-                .start_navigation_to(destination, Some(self.config.follow_distance))
+                .start_navigation_to(
+                    destination,
+                    Some(self.config.follow_distance),
+                    NavigationMode::MovementOnly,
+                )
                 .await
             {
                 self.fail(minecraft, snapshot, error.to_string()).await;
@@ -286,7 +304,8 @@ impl MovementService {
             *state = snapshot.clone();
             previous
         };
-        if previous != snapshot.status {
+        let suppress_terminal_log = *self.suppress_terminal_log.lock().await;
+        if previous != snapshot.status && !suppress_terminal_log {
             match snapshot.status {
                 MovementStatus::Completed => logger::reached(),
                 MovementStatus::Failed => logger::cannot_reach(
@@ -304,6 +323,15 @@ impl MovementService {
                 }
                 _ => {}
             }
+        }
+        if matches!(
+            snapshot.status,
+            MovementStatus::Completed
+                | MovementStatus::Failed
+                | MovementStatus::Cancelled
+                | MovementStatus::Idle
+        ) {
+            *self.suppress_terminal_log.lock().await = false;
         }
         minecraft.set_movement_snapshot(snapshot).await;
     }

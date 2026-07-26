@@ -23,6 +23,12 @@ pub enum ConsoleCommand {
         y: i32,
         z: i32,
     },
+    GotoMine {
+        x: i32,
+        y: i32,
+        z: i32,
+    },
+    PathStatus,
     Stop,
     StopAll,
     TaskStatus,
@@ -42,6 +48,7 @@ pub enum ConsoleCommand {
     GotoBlock {
         block_id: String,
         search_radius: Option<u32>,
+        allow_mining: bool,
     },
     GotoBlockStatus,
     CancelGotoBlock,
@@ -147,6 +154,15 @@ pub fn parse_input(input: &str) -> Result<ConsoleInput, AppError> {
                 z: destination.z as i32,
             }
         }
+        "goto-mine" => {
+            let destination = parse_coordinates(arguments)?;
+            ConsoleCommand::GotoMine {
+                x: destination.x as i32,
+                y: destination.y as i32,
+                z: destination.z as i32,
+            }
+        }
+        "path-status" => no_arguments(command, arguments, ConsoleCommand::PathStatus)?,
         "stop" | "stopmovement" => no_arguments(command, arguments, ConsoleCommand::Stop)?,
         "stopall" => no_arguments(command, arguments, ConsoleCommand::StopAll)?,
         "taskstatus" => no_arguments(command, arguments, ConsoleCommand::TaskStatus)?,
@@ -156,7 +172,7 @@ pub fn parse_input(input: &str) -> Result<ConsoleInput, AppError> {
         "movement" => no_arguments(command, arguments, ConsoleCommand::Movement)?,
         "findblock" => parse_find_block(arguments)?,
         "nearestblock" => parse_nearest_block(arguments)?,
-        "gotoblock" => parse_goto_block(arguments)?,
+        "gotoblock" | "navigate-to-block" => parse_goto_block(arguments)?,
         "gotoblockstatus" => no_arguments(command, arguments, ConsoleCommand::GotoBlockStatus)?,
         "cancelgotoblock" => no_arguments(command, arguments, ConsoleCommand::CancelGotoBlock)?,
         "look" | "lookat" => {
@@ -200,6 +216,7 @@ pub fn parse_input(input: &str) -> Result<ConsoleInput, AppError> {
             )?)?,
         },
         "place" => parse_place(arguments)?,
+        "placeblock" => parse_placeblock(arguments)?,
         "stopinteraction" => no_arguments(command, arguments, ConsoleCommand::StopInteraction)?,
         "interactionstatus" => no_arguments(command, arguments, ConsoleCommand::InteractionStatus)?,
         "testoaklog" => no_arguments(command, arguments, ConsoleCommand::TestOakLog)?,
@@ -238,6 +255,29 @@ fn parse_place(arguments: &str) -> Result<ConsoleCommand, AppError> {
         }),
         _ => Err(AppError::InvalidConsoleSyntax(
             "/place <block_id> or /place <x> <y> <z> <block_id>".into(),
+        )),
+    }
+}
+
+/// `/placeblock` keeps the task-oriented block-first syntax while mapping to
+/// the same placement command variants and workflow as `/place`.
+fn parse_placeblock(arguments: &str) -> Result<ConsoleCommand, AppError> {
+    let parts: Vec<_> = arguments.split_whitespace().collect();
+    match parts.as_slice() {
+        [block_id] => Ok(ConsoleCommand::PlaceLooked {
+            block_id: normalize_block_id(block_id)?,
+        }),
+        [block_id, x, y, z] => Ok(ConsoleCommand::PlaceAt {
+            x: x.parse()
+                .map_err(|_| AppError::InvalidCoordinates("x must be an integer".into()))?,
+            y: y.parse()
+                .map_err(|_| AppError::InvalidCoordinates("y must be an integer".into()))?,
+            z: z.parse()
+                .map_err(|_| AppError::InvalidCoordinates("z must be an integer".into()))?,
+            block_id: normalize_block_id(block_id)?,
+        }),
+        _ => Err(AppError::InvalidConsoleSyntax(
+            "/placeblock <block> or /placeblock <block> <x> <y> <z>".into(),
         )),
     }
 }
@@ -304,22 +344,28 @@ fn parse_goto_block(arguments: &str) -> Result<ConsoleCommand, AppError> {
     let block_id = parts.next().ok_or_else(|| {
         AppError::MissingConsoleArgument("/gotoblock <block_id> [search_radius]".into())
     })?;
-    let search_radius = parts
-        .next()
-        .map(|value| {
-            value.parse().map_err(|_| {
-                AppError::InvalidEntityQuery("search_radius must be a positive integer".into())
-            })
-        })
-        .transpose()?;
-    if parts.next().is_some() {
+    let mut allow_mining = false;
+    let search_radius = match parts.next() {
+        Some("mine") => {
+            allow_mining = true;
+            None
+        }
+        Some(value) => Some(value.parse().map_err(|_| {
+            AppError::InvalidEntityQuery("search_radius must be a positive integer".into())
+        })?),
+        None => None,
+    };
+    if matches!(parts.next(), Some("mine")) {
+        allow_mining = true;
+    } else if parts.next().is_some() {
         return Err(AppError::InvalidConsoleSyntax(
-            "/gotoblock <block_id> [search_radius]".into(),
+            "/gotoblock <block_id> [search_radius] [mine]".into(),
         ));
     }
     Ok(ConsoleCommand::GotoBlock {
         block_id: normalize_block_id(block_id)?,
         search_radius,
+        allow_mining,
     })
 }
 
@@ -443,7 +489,20 @@ mod tests {
             ConsoleInput::Command(ConsoleCommand::GotoBlock {
                 block_id: "minecraft:stone".into(),
                 search_radius: Some(64),
+                allow_mining: false,
             })
+        );
+        assert_eq!(
+            parse_input("/navigate-to-block stone mine").unwrap(),
+            ConsoleInput::Command(ConsoleCommand::GotoBlock {
+                block_id: "minecraft:stone".into(),
+                search_radius: None,
+                allow_mining: true,
+            })
+        );
+        assert_eq!(
+            parse_input("/goto-mine 1 64 -2").unwrap(),
+            ConsoleInput::Command(ConsoleCommand::GotoMine { x: 1, y: 64, z: -2 })
         );
         assert_eq!(
             parse_input("/gotoblockstatus").unwrap(),
@@ -530,6 +589,21 @@ mod tests {
                 y: 64,
                 z: -2,
                 block_id: "minecraft:cobblestone".into()
+            })
+        );
+        assert_eq!(
+            parse_input("/placeblock oak_log 901 91 984").unwrap(),
+            ConsoleInput::Command(ConsoleCommand::PlaceAt {
+                x: 901,
+                y: 91,
+                z: 984,
+                block_id: "minecraft:oak_log".into()
+            })
+        );
+        assert_eq!(
+            parse_input("/placeblock minecraft:oak_log").unwrap(),
+            ConsoleInput::Command(ConsoleCommand::PlaceLooked {
+                block_id: "minecraft:oak_log".into()
             })
         );
         assert!(parse_input("/place 1 2").is_err());

@@ -14,11 +14,11 @@ use crate::{
         client::MinecraftClient,
         world_state::{BlockPosition, PositionSnapshot},
     },
-    movement::MovementService,
+    movement::{MovementService, NavigationMode},
     navigation::{
         approach_position::{approach_positions, is_valid_approach, required_cells},
         navigation_state::{
-            BlockNavigationSnapshot, BlockNavigationState, arrival_valid, is_stuck, timed_out,
+            BlockNavigationSnapshot, BlockNavigationState, arrival_valid, timed_out,
         },
         target_selector::next_candidate,
     },
@@ -62,6 +62,7 @@ impl BlockNavigationService {
         movement: &MovementService,
         block_id: String,
         radius: u32,
+        mode: NavigationMode,
     ) -> Result<(), AppError> {
         if radius == 0 || radius > self.config.maximum_search_radius {
             return Err(AppError::InvalidBlockSearchRadius {
@@ -80,6 +81,7 @@ impl BlockNavigationService {
                 last_progress_time: Some(SystemTime::now()),
                 maximum_attempts: self.config.maximum_target_attempts,
                 generation,
+                mode,
                 ..BlockNavigationSnapshot::default()
             };
             inner.candidates.clear();
@@ -164,6 +166,7 @@ impl BlockNavigationService {
                 last_progress_time: Some(SystemTime::now()),
                 maximum_attempts: self.config.maximum_target_attempts,
                 generation,
+                mode: NavigationMode::MovementOnly,
                 ..BlockNavigationSnapshot::default()
             };
             inner.candidates = vec![BlockSnapshot {
@@ -209,6 +212,26 @@ impl BlockNavigationService {
         inner.candidates.clear();
         inner.failed_blocks.clear();
         inner.failed_approaches.clear();
+    }
+
+    /// Reuse the existing bounded approach selection after a caller discovers
+    /// that the current standing position has no clear interaction ray.
+    pub async fn try_another_approach(
+        &self,
+        minecraft: &MinecraftClient,
+        movement: &MovementService,
+    ) -> Result<bool, AppError> {
+        let snapshot = self.snapshot().await;
+        let (Some(target), Some(approach)) = (
+            snapshot.selected_block_position,
+            snapshot.selected_approach_position,
+        ) else {
+            return Ok(false);
+        };
+        self.mark_approach_failed(snapshot.generation, target, approach)
+            .await;
+        self.try_next_target(minecraft, movement, snapshot.generation)
+            .await
     }
 
     pub async fn tick(&self, minecraft: &MinecraftClient, movement: &MovementService) {
@@ -315,21 +338,6 @@ impl BlockNavigationService {
                 let mut inner = self.inner.lock().await;
                 inner.snapshot.last_position = Some(position);
                 inner.snapshot.last_progress_time = Some(SystemTime::now());
-            } else if is_stuck(
-                snapshot.last_progress_time,
-                self.config.stuck_timeout_seconds,
-            ) {
-                self.mark_approach_failed(snapshot.generation, target, approach)
-                    .await;
-                self.retry_or_fail(
-                    minecraft,
-                    movement,
-                    snapshot.generation,
-                    &block_id,
-                    "movement stalled",
-                )
-                .await;
-                return;
             }
         }
 
@@ -351,21 +359,9 @@ impl BlockNavigationService {
             .await;
             return;
         }
-        if snapshot.last_progress_time.is_some_and(|last| {
-            last.elapsed().unwrap_or_default().as_millis()
-                >= u128::from(self.config.repath_interval_ms)
-        }) {
-            {
-                let mut inner = self.inner.lock().await;
-                inner.snapshot.state = BlockNavigationState::Repathing;
-            }
-            let _ = movement
-                .goto_for_block_navigation(minecraft, center(approach))
-                .await;
-            let mut inner = self.inner.lock().await;
-            inner.snapshot.state = BlockNavigationState::Moving;
-            inner.snapshot.last_progress_time = Some(SystemTime::now());
-        }
+        // Do not restart Azalea on an application timer. Its executor owns
+        // mining, waits for block updates, stuck recovery and replanning; a
+        // second start_goto here used to cancel those in-flight actions.
     }
 
     async fn try_next_target(
@@ -420,8 +416,9 @@ impl BlockNavigationService {
                     inner.snapshot.current_attempt += 1;
                     inner.snapshot.current_attempt
                 };
+                let mode = self.inner.lock().await.snapshot.mode;
                 if movement
-                    .goto_for_block_navigation(minecraft, center(approach))
+                    .goto_for_block_navigation(minecraft, center(approach), mode)
                     .await
                     .is_err()
                 {

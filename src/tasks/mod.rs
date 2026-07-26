@@ -18,7 +18,7 @@ use crate::{
         client::MinecraftClient,
         world_state::{BlockPosition, PositionSnapshot, TaskSnapshot},
     },
-    movement::MovementService,
+    movement::{MovementService, NavigationMode},
     navigation::BlockNavigationService,
 };
 
@@ -118,9 +118,10 @@ impl TaskService {
         minecraft: &MinecraftClient,
         movement: &MovementService,
         position: PositionSnapshot,
+        mode: NavigationMode,
     ) -> Result<(), AppError> {
         self.begin(minecraft, "Go to position", "Navigating").await;
-        let result = movement.goto(minecraft, position).await;
+        let result = movement.goto(minecraft, position, mode).await;
         if let Err(error) = &result {
             self.fail(minecraft, error).await;
         }
@@ -134,6 +135,7 @@ impl TaskService {
         navigation: &BlockNavigationService,
         block_id: String,
         radius: u32,
+        mode: NavigationMode,
     ) -> Result<(), AppError> {
         self.begin(
             minecraft,
@@ -142,7 +144,7 @@ impl TaskService {
         )
         .await;
         let result = navigation
-            .start(minecraft, movement, block_id, radius)
+            .start(minecraft, movement, block_id, radius, mode)
             .await;
         if let Err(error) = &result {
             self.fail(minecraft, error).await;

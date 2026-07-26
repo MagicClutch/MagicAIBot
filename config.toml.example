@@ -10,7 +10,7 @@ maximum_attempts = 5
 
 [console]
 enabled = true
-send_plain_input_to_chat = true
+send_plain_input_to_chat = false
 show_system_messages = true
 show_action_bar_messages = false
 
@@ -47,7 +47,7 @@ maximum_search_radius = 128
 candidate_limit = 20
 interaction_distance = 4.5
 arrival_distance = 1.5
-maximum_target_attempts = 8
+maximum_target_attempts = 10
 stuck_timeout_seconds = 12
 maximum_navigation_seconds = 120
 repath_interval_ms = 1000
