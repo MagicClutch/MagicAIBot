@@ -17,6 +17,8 @@ show_action_bar_messages = false
 [logging]
 level = "info"
 debug = false
+# Logs stay local and are never relayed to Minecraft chat. Operation correlation
+# IDs are random diagnostics identifiers; account/session secrets are not logged.
 
 [world_state]
 nearby_entity_radius = 64
@@ -99,6 +101,8 @@ auto_navigate = true
 auto_precise_look = true
 # Select the best suitable tool currently in the hotbar before breaking.
 auto_tool_switch = true
+# Intentional breaking uses this interaction controller. Pathfinder mining is a
+# separate, explicit command mode (`/goto-mine` or `mine` on `/gotoblock`).
 
 [interaction.face_targeting]
 face_inset = 0.001

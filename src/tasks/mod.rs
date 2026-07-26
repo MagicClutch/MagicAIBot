@@ -22,6 +22,9 @@ use crate::{
     navigation::BlockNavigationService,
 };
 
+#[allow(dead_code)] // Lifecycle API lands before composed production tasks use it.
+pub mod runtime;
+
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub enum TaskState {
     #[default]
