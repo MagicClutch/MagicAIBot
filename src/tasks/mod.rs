@@ -22,6 +22,8 @@ use crate::{
     navigation::BlockNavigationService,
 };
 
+pub mod gather;
+
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub enum TaskState {
     #[default]

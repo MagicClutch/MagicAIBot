@@ -277,6 +277,33 @@ impl App {
                     self.tasks.cancel(&self.minecraft).await;
                 }
                 ConsoleCommand::TaskStatus => self.print_task_status().await,
+                ConsoleCommand::Gather {
+                    resource,
+                    quantity,
+                    deposit,
+                } => {
+                    println!(
+                        "Gather request: {resource} x{quantity}{}",
+                        if deposit { " (deposit enabled)" } else { "" }
+                    );
+                    println!(
+                        "Gather not started: this build has no live Phase 2/3 crafting, storage, pickup, or smelting adapters; no world action was attempted."
+                    );
+                }
+                ConsoleCommand::GatherStatus => self.print_task_status().await,
+                ConsoleCommand::GatherCancel => {
+                    self.interaction
+                        .cancel(&self.minecraft, &self.movement, &self.look)
+                        .await;
+                    self.block_navigation
+                        .cancel(&self.minecraft, &self.movement)
+                        .await;
+                    let _ = self.movement.stop(&self.minecraft).await;
+                    self.tasks.cancel(&self.minecraft).await;
+                    println!(
+                        "Gather cancellation requested; movement and interaction stopped; confirmed partial inventory remains unchanged."
+                    );
+                }
                 ConsoleCommand::Follow { player } => {
                     self.interaction
                         .cancel(&self.minecraft, &self.movement, &self.look)
@@ -1015,6 +1042,9 @@ fn print_help() {
     println!("/stop or /stopmovement  Stop movement only");
     println!("/stopall    Stop movement and looking");
     println!("/taskstatus Show movement and look tasks");
+    println!("/gather RESOURCE QUANTITY [deposit]  Gather a bounded supported resource quantity");
+    println!("/gatherstatus  Show gather/task progress and last failure");
+    println!("/gathercancel  Cancel gathering and preserve confirmed partial progress");
     println!("/follow NAME Follow a player");
     println!("/movement   Show movement status");
     println!("/look X Y Z  Look at a world position");
