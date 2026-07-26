@@ -118,7 +118,6 @@ impl App {
         }
         logging::info("Connected");
         logging::info("Joined world");
-        self.tasks.start_session();
 
         let (input_tx, mut input_rx) = mpsc::channel(32);
         let mut movement_tick = tokio::time::interval(Duration::from_millis(
@@ -152,33 +151,18 @@ impl App {
                         continue;
                     }
                     self.session_ready = true;
-                    let alive = self.minecraft.world_state_snapshot().await.bot.health.is_none_or(|health| health > 0.0);
-                    if let Err(reason) = self.tasks.guard_active(true, alive).await {
-                        self.interaction.cancel(&self.minecraft, &self.movement, &self.look).await;
-                        self.block_navigation.cancel(&self.minecraft, &self.movement).await;
-                        self.look.cancel().await;
-                        let _ = self.movement.stop(&self.minecraft).await;
-                        self.tasks.cancel(&self.minecraft).await;
-                        logging::warning(format!("Action guard stopped task: {reason}"));
-                        continue;
                     if self.minecraft.world_state_snapshot().await.bot.alive == Some(false) {
                         self.tasks.player_died();
                     }
                     let explicit_look = self.look.snapshot().await.state == LookState::Looking;
                     self.movement.tick(&self.minecraft, explicit_look).await;
                     self.block_navigation.tick(&self.minecraft, &self.movement).await;
-                    self.reconcile_task_terminal().await;
                 },
                 _ = look_tick.tick() => {
                     let status = self.minecraft.navigation_status().await.ok();
                     if !status.is_some_and(|status| status.calculating || status.executing) {
                         self.look.tick(&self.minecraft).await;
                     }
-                    self.reconcile_task_terminal().await;
-                },
-                _ = interaction_tick.tick() => {
-                    self.interaction.tick(&self.minecraft, &self.movement, &self.look).await;
-                    self.reconcile_task_terminal().await;
                 },
                 _ = interaction_tick.tick() => {
                     self.interaction.tick(&self.minecraft, &self.movement, &self.look).await;
@@ -1275,42 +1259,6 @@ impl App {
         }
     }
 
-    async fn reconcile_task_terminal(&self) {
-        use crate::tasks::{ActionResource, ActionState};
-
-        let task = self.tasks.status().await;
-        if task.state != ActionState::Running {
-            return;
-        }
-        let state = if task.resources.contains(&ActionResource::Interaction) {
-            match self.interaction.snapshot().await.state {
-                InteractionState::Completed => ActionState::Completed,
-                InteractionState::Cancelled => ActionState::Cancelled,
-                InteractionState::Failed => ActionState::Failed,
-                _ => return,
-            }
-        } else if task.resources.contains(&ActionResource::Movement) {
-            match self.movement.snapshot().await.status {
-                crate::minecraft::world_state::MovementStatus::Completed => ActionState::Completed,
-                crate::minecraft::world_state::MovementStatus::Cancelled => ActionState::Cancelled,
-                crate::minecraft::world_state::MovementStatus::Failed => ActionState::Failed,
-                _ => return,
-            }
-        } else if task.resources.contains(&ActionResource::Rotation) {
-            match self.look.snapshot().await.state {
-                LookState::Completed => ActionState::Completed,
-                LookState::Cancelled => ActionState::Cancelled,
-                LookState::Failed => ActionState::Failed,
-                _ => return,
-            }
-        } else {
-            return;
-        };
-        self.tasks
-            .observe_terminal(&self.minecraft, state, None)
-            .await;
-    }
-
     async fn print_task_status(&self) {
         let workflow = self.tasks.status().await;
         let movement = self.movement.snapshot().await;
@@ -1347,24 +1295,6 @@ impl App {
         };
         println!("Movement: {movement_text}");
         println!("Look: {look_text}");
-        if let Some(name) = workflow.name {
-            println!("Workflow: {name} ({:?})", workflow.state);
-            if let Some(operation_id) = workflow.operation_id {
-                println!("Operation: {operation_id}");
-            }
-            if !workflow.resources.is_empty() {
-                println!(
-                    "Leases: {}",
-                    workflow
-                        .resources
-                        .iter()
-                        .map(ToString::to_string)
-                        .collect::<Vec<_>>()
-                        .join(", ")
-                );
-            }
-            if let Some(step) = workflow.current_step {
-                println!("Current task: {step}");
         println!(
             "Workflow: #{} {} ({:?})",
             workflow.metadata.id, workflow.metadata.task_type, workflow.state
