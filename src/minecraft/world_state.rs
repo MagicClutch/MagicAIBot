@@ -107,8 +107,16 @@ impl InventorySnapshot {
             .collect()
     }
     pub fn selected_item(&self) -> Option<&InventorySlot> {
-        self.selected_hotbar_slot
-            .map(|slot| self.slots.iter().find(|s| s.slot == usize::from(slot)))?
+        let selected = usize::from(self.selected_hotbar_slot?);
+        if self.slots.len() < 9 {
+            return self.slots.iter().find(|slot| slot.slot == selected);
+        }
+        let first_hotbar = self.slots.len() - 9;
+        self.slots.iter().find(|slot| slot.slot == first_hotbar + selected)
+    }
+    pub fn item_is_in_hotbar(&self, id: &str) -> bool {
+        let Some(first_hotbar) = self.slots.len().checked_sub(9) else { return false };
+        self.slots.iter().any(|slot| slot.slot >= first_hotbar && slot.item_id.as_deref() == Some(id))
     }
     fn rebuild_counts(&mut self) {
         self.total_counts.clear();
@@ -140,7 +148,15 @@ pub struct EntitySnapshot {
     pub alive: Option<bool>,
     pub health: Option<f32>,
     pub custom_name: Option<String>,
+    /// Present only for `minecraft:item`; sourced from Azalea's authoritative
+    /// item metadata component rather than inferred from the entity kind.
+    pub item: Option<DroppedItemSnapshot>,
     pub last_seen: SystemTime,
+}
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct DroppedItemSnapshot {
+    pub item_id: String,
+    pub count: u32,
 }
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ChatMessageKind {
@@ -571,6 +587,7 @@ mod tests {
             alive: Some(true),
             health: Some(20.0),
             custom_name: None,
+            item: None,
             last_seen: SystemTime::now(),
         }
     }
