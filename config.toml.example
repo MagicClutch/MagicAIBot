@@ -17,6 +17,8 @@ show_action_bar_messages = false
 [logging]
 level = "info"
 debug = false
+# Logs stay local and are never relayed to Minecraft chat. Operation correlation
+# IDs are random diagnostics identifiers; account/session secrets are not logged.
 
 [world_state]
 nearby_entity_radius = 64
@@ -109,9 +111,18 @@ held_tool_equivalence = 0.10
 protected_tools = []
 # Exact item IDs temporarily reserved for other tasks.
 reserved_tools = []
+# Intentional breaking uses this interaction controller. Pathfinder mining is a
+# separate, explicit command mode (`/goto-mine` or `mine` on `/gotoblock`).
 
 [interaction.face_targeting]
 face_inset = 0.001
 edge_margin = 0.12
 maximum_face_attempts = 6
 maximum_hit_points_per_face = 5
+[ensure_tool]
+# Highest preference first. Unsupported or insufficient tiers are skipped.
+material_tier_preference = ["iron", "stone", "wood"]
+# A tool at or below this remaining durability is not eligible.
+durability_reserve = 10
+# Uses the existing furnace executor when a recipe dependency requires it.
+allow_smelting = false
