@@ -62,6 +62,13 @@ cargo fmt --check
 cargo check
 cargo test
 ```
+# Tool-selection debug command
+
+`/select-tool <block_id>` runs the same deterministic policy used by
+intentional block breaking, prints its explanation, and selects the winning
+hotbar slot. It is a debug command and does not break the block. The selector
+never crafts, repairs, or enchants tools. Azalea pathfinder mining remains
+independent and unchanged.
 
 ## Chest interaction primitive
 

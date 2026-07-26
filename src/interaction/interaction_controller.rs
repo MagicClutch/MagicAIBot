@@ -16,6 +16,7 @@ use crate::{
         placement_rules::{has_support, is_air, is_replaceable},
         progress::estimated_progress,
         reach::{distance_to_block_center, within_reach},
+        tool_selection::{ToolFallbackPolicy, ToolSelectionPolicy},
     },
     logging,
     look::{LookController, LookTarget, aim_point::LookPrecision},
@@ -655,12 +656,25 @@ impl InteractionController {
                 target, expected, ..
             } => {
                 if self.config.auto_tool_switch {
-                    match minecraft.select_best_tool_in_hotbar(expected).await {
-                        Ok(Some(tool)) => logging::info(format!("Selected {tool} for {expected}")),
-                        Ok(None) => debug!(
-                            block = expected,
-                            "no suitable hotbar tool; breaking with current item"
-                        ),
+                    let policy = ToolSelectionPolicy {
+                        minimum_remaining_durability: self.config.minimum_tool_durability,
+                        fallback: if self.config.allow_hand_fallback {
+                            ToolFallbackPolicy::AllowHand
+                        } else {
+                            ToolFallbackPolicy::RequireSuitableTool
+                        },
+                        held_material_equivalence: self.config.held_tool_equivalence,
+                    };
+                    match minecraft
+                        .select_tool_for_block(
+                            expected,
+                            &policy,
+                            &self.config.protected_tools,
+                            &self.config.reserved_tools,
+                        )
+                        .await
+                    {
+                        Ok(selection) => logging::info(selection.explanation),
                         Err(error) => return self.retry_or_fail(&error.to_string()).await,
                     }
                 }
