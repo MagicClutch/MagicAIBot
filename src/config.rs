@@ -40,6 +40,7 @@ pub struct Config {
     pub multitasking: MultitaskingConfig,
     #[serde(default)]
     pub inventory_cleanup: crate::inventory_cleanup::CleanupPolicy,
+    #[serde(default)]
     pub tree_chopping: TreeChoppingConfig,
     #[serde(default)]
     pub ensure_tool: EnsureToolConfig,

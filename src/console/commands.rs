@@ -196,7 +196,7 @@ pub fn parse_input(input: &str) -> Result<ConsoleInput, AppError> {
         "status" => no_arguments(command, arguments, ConsoleCommand::Status)?,
         "players" => no_arguments(command, arguments, ConsoleCommand::Players)?,
         "inventory" => no_arguments(command, arguments, ConsoleCommand::Inventory)?,
-        "containerstatus" | "container-status" => {
+        "containerstatus" => {
             no_arguments(command, arguments, ConsoleCommand::ObservedContainerStatus)?
         }
         "recipe" => ConsoleCommand::Recipe {

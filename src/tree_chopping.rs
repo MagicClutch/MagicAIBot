@@ -24,7 +24,8 @@ fn tree_type(id: &str) -> Option<&str> { LOG_SUFFIXES.iter().find_map(|suffix| i
 fn adjacent(a: BlockPosition, b: BlockPosition, base_y: i32) -> bool {
     let dx=(a.x-b.x).unsigned_abs(); let dy=(a.y-b.y).unsigned_abs(); let dz=(a.z-b.z).unsigned_abs();
     // Do not fuse neighboring ground-level trunks; horizontal links are treated as branches only above the base.
-    dx <= 1 && dy <= 1 && dz <= 1 && dx+dy+dz > 0 && (dx+dz == 0 || a.y.min(b.y) > base_y)
+    dx <= 1 && dy <= 1 && dz <= 1 && dx + dy + dz > 0
+        && (dx + dz == 0 || a.y.min(b.y) > base_y + 1)
 }
 pub fn detect_tree(seed: BlockPosition, observations: &[TreeObservation], config: &TreeChoppingConfig) -> Option<TreeModel> {
     let blocks: HashMap<_,_> = observations.iter().map(|b|(b.position,b.block_id.as_str())).collect();
