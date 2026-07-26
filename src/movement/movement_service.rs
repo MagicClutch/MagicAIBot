@@ -30,6 +30,8 @@ pub struct MovementService {
     state: Arc<Mutex<MovementSnapshot>>,
     local_input: Arc<Mutex<LocalMovementInput>>,
     suppress_terminal_log: Arc<Mutex<bool>>,
+    navigation_mode: Arc<Mutex<NavigationMode>>,
+    last_goal_submission: Arc<Mutex<Option<SystemTime>>>,
 }
 
 impl MovementService {
@@ -40,6 +42,8 @@ impl MovementService {
             state: Arc::new(Mutex::new(MovementSnapshot::default())),
             local_input: Arc::new(Mutex::new(LocalMovementInput::default())),
             suppress_terminal_log: Arc::new(Mutex::new(false)),
+            navigation_mode: Arc::new(Mutex::new(NavigationMode::MovementOnly)),
+            last_goal_submission: Arc::new(Mutex::new(None)),
         }
     }
     pub async fn snapshot(&self) -> MovementSnapshot {
@@ -87,9 +91,11 @@ impl MovementService {
         }
         let world = minecraft.world_state_snapshot().await;
         *self.suppress_terminal_log.lock().await = !log_start;
+        *self.navigation_mode.lock().await = mode;
         minecraft
             .start_navigation_to(destination, None, mode)
             .await?;
+        *self.last_goal_submission.lock().await = Some(SystemTime::now());
         if log_start {
             logger::going_to(destination);
         }
@@ -136,6 +142,8 @@ impl MovementService {
                 NavigationMode::MovementOnly,
             )
             .await?;
+        *self.navigation_mode.lock().await = NavigationMode::MovementOnly;
+        *self.last_goal_submission.lock().await = Some(SystemTime::now());
         logger::following(&player.username);
         self.replace_and_publish(
             minecraft,
@@ -196,29 +204,23 @@ impl MovementService {
                 snapshot.last_movement_update = Some(SystemTime::now());
                 self.replace_and_publish(minecraft, snapshot).await;
             }
-            Ok(status) if status.reached && pathfinder_startup_grace_elapsed(&snapshot) => {
-                // Azalea can briefly report the previous goal as complete
-                // while a new goal event is still being consumed. Re-submit
-                // the goal instead of abandoning movement at that point.
-                if let Some(destination) = snapshot.destination {
-                    let _ = minecraft
-                        .start_navigation_to(destination, None, NavigationMode::MovementOnly)
-                        .await;
-                    snapshot.started_at = Some(SystemTime::now());
-                }
-                snapshot.last_movement_update = Some(SystemTime::now());
-                self.replace_and_publish(minecraft, snapshot).await;
-            }
             Ok(status)
-                if !status.calculating
-                    && !status.executing
-                    && pathfinder_startup_grace_elapsed(&snapshot) =>
+                if (status.reached || (!status.calculating && !status.executing))
+                    && self.goal_resubmission_due().await =>
             {
+                // Keep task-owned goto navigation alive exactly like follow:
+                // the MovementService remains the owner and re-submits the
+                // goal when Azalea has no active path.
                 if let Some(destination) = snapshot.destination {
-                    let _ = minecraft
-                        .start_navigation_to(destination, None, NavigationMode::MovementOnly)
-                        .await;
-                    snapshot.started_at = Some(SystemTime::now());
+                    let mode = *self.navigation_mode.lock().await;
+                    if minecraft
+                        .start_navigation_to(destination, None, mode)
+                        .await
+                        .is_ok()
+                    {
+                        *self.last_goal_submission.lock().await = Some(SystemTime::now());
+                        snapshot.started_at = Some(SystemTime::now());
+                    }
                 }
                 snapshot.last_movement_update = Some(SystemTime::now());
                 self.replace_and_publish(minecraft, snapshot).await;
@@ -234,6 +236,16 @@ impl MovementService {
             }
             Err(error) => self.fail(minecraft, snapshot, error.to_string()).await,
         }
+    }
+
+    async fn goal_resubmission_due(&self) -> bool {
+        self.last_goal_submission
+            .lock()
+            .await
+            .is_none_or(|submitted| {
+                submitted.elapsed().unwrap_or_default()
+                    >= Duration::from_millis(self.config.repath_interval_ms)
+            })
     }
 
     async fn tick_follow(
@@ -301,6 +313,7 @@ impl MovementService {
                 self.fail(minecraft, snapshot, error.to_string()).await;
                 return;
             }
+            *self.last_goal_submission.lock().await = Some(SystemTime::now());
             snapshot.last_movement_update = Some(SystemTime::now());
         }
         self.replace_and_publish(minecraft, snapshot).await;
