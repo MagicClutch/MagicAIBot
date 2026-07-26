@@ -14,6 +14,7 @@ use crate::{
         self,
         commands::{ConsoleCommand, ConsoleInput, plain_chat_message},
     },
+    container::{model::TransferDirection, service::ContainerService},
     error::AppError,
     food::{CollectFoodRequest, FoodCollector, FoodGoal},
     interaction::{InteractionController, interaction_controller::InteractionState},
@@ -38,6 +39,7 @@ pub struct App {
     look: LookController,
     interaction: InteractionController,
     tasks: TaskService,
+    container: ContainerService,
     food_collector: FoodCollector,
     session_ready: bool,
     started_at: Instant,
@@ -92,6 +94,7 @@ impl App {
                 block_navigation,
             ),
             tasks: TaskService::default(),
+            container: ContainerService::default(),
             food_collector: FoodCollector::default(),
             session_ready: false,
             config,
@@ -157,6 +160,7 @@ impl App {
                 },
                 _ = interaction_tick.tick() => {
                     self.interaction.tick(&self.minecraft, &self.movement, &self.look).await;
+                    self.container.tick(&self.minecraft, &self.movement, &self.block_navigation, &self.look).await;
                     self.food_collector.tick(&self.minecraft, &self.movement, &self.interaction, &self.look).await;
                 },
                 input = input_rx.recv() => match input {
@@ -173,6 +177,14 @@ impl App {
         };
 
         self.shutdown.cancel();
+        self.container
+            .cancel(
+                &self.minecraft,
+                &self.block_navigation,
+                &self.movement,
+                &self.look,
+            )
+            .await;
         self.tasks.shutdown();
         self.block_navigation
             .cancel(&self.minecraft, &self.movement)
@@ -577,6 +589,52 @@ impl App {
                         .await
                 }
                 ConsoleCommand::InteractionStatus => self.print_interaction_status().await,
+                ConsoleCommand::OpenChest { x, y, z } => {
+                    if let Err(error) = self
+                        .container
+                        .open(
+                            &self.minecraft,
+                            &self.movement,
+                            &self.block_navigation,
+                            crate::minecraft::world_state::BlockPosition { x, y, z },
+                        )
+                        .await
+                    {
+                        println!("Open chest failed: {error}");
+                    }
+                }
+                ConsoleCommand::TakeItem { item_id, count } => {
+                    if let Err(error) = self
+                        .container
+                        .transfer(&self.minecraft, TransferDirection::Take, item_id, count)
+                        .await
+                    {
+                        println!("Take failed: {error}");
+                    }
+                }
+                ConsoleCommand::StoreItem { item_id, count } => {
+                    if let Err(error) = self
+                        .container
+                        .transfer(&self.minecraft, TransferDirection::Store, item_id, count)
+                        .await
+                    {
+                        println!("Store failed: {error}");
+                    }
+                }
+                ConsoleCommand::ContainerStatus => {
+                    let s = self.container.status().await;
+                    println!(
+                        "Container: {:?}; target={:?}; menu={:?}; transferred={}/{}; outcome={:?}{}",
+                        s.phase,
+                        s.target,
+                        s.window_id,
+                        s.transferred,
+                        s.requested,
+                        s.outcome,
+                        s.detail.map(|d| format!(" ({d})")).unwrap_or_default()
+                    );
+                }
+                ConsoleCommand::CloseContainer => self.container.close(&self.minecraft).await,
                 ConsoleCommand::CollectFood {
                     item,
                     count,
@@ -1197,6 +1255,8 @@ fn print_help() {
     println!("Local-console commands only. Success requires observed state confirmation.");
     println!("Cancellation: /stopinteraction, /stop, or /stopall (in increasing scope).");
     println!("/help       Show available commands");
+    println!("/open-chest X Y Z | /take-item ITEM COUNT | /store-item ITEM COUNT");
+    println!("/container-status | /close-container");
     println!("/status     Show connection and application status");
     println!("/chat TEXT  Send TEXT to Minecraft chat");
     println!("/players    Show known online players");

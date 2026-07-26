@@ -112,6 +112,21 @@ pub enum ConsoleCommand {
         block_id: String,
     },
     TestOakLog,
+    OpenChest {
+        x: i32,
+        y: i32,
+        z: i32,
+    },
+    TakeItem {
+        item_id: String,
+        count: u32,
+    },
+    StoreItem {
+        item_id: String,
+        count: u32,
+    },
+    ContainerStatus,
+    CloseContainer,
     Reconnect,
     Quit,
 }
@@ -260,6 +275,18 @@ pub fn parse_input(input: &str) -> Result<ConsoleInput, AppError> {
             )?)?,
         },
         "testoaklog" => no_arguments(command, arguments, ConsoleCommand::TestOakLog)?,
+        "open-chest" => {
+            let p = parse_coordinates(arguments)?;
+            ConsoleCommand::OpenChest {
+                x: p.x as i32,
+                y: p.y as i32,
+                z: p.z as i32,
+            }
+        }
+        "take-item" => parse_container_transfer(arguments, true)?,
+        "store-item" => parse_container_transfer(arguments, false)?,
+        "container-status" => no_arguments(command, arguments, ConsoleCommand::ContainerStatus)?,
+        "close-container" => no_arguments(command, arguments, ConsoleCommand::CloseContainer)?,
         "reconnect" => no_arguments(command, arguments, ConsoleCommand::Reconnect)?,
         "quit" => no_arguments(command, arguments, ConsoleCommand::Quit)?,
         "chat" => {
@@ -278,6 +305,57 @@ pub fn parse_input(input: &str) -> Result<ConsoleInput, AppError> {
     Ok(ConsoleInput::Command(parsed))
 }
 
+fn normalize_item_id(value: &str) -> Result<String, AppError> {
+    let id = if value.contains(':') {
+        value.to_ascii_lowercase()
+    } else {
+        format!("minecraft:{}", value.to_ascii_lowercase())
+    };
+    if id.split_once(':').is_some_and(|(namespace, path)| {
+        !namespace.is_empty()
+            && !path.is_empty()
+            && namespace.chars().all(|c| {
+                c.is_ascii_lowercase() || c.is_ascii_digit() || matches!(c, '_' | '-' | '.')
+            })
+            && path.chars().all(|c| {
+                c.is_ascii_lowercase() || c.is_ascii_digit() || matches!(c, '_' | '-' | '.' | '/')
+            })
+    }) {
+        Ok(id)
+    } else {
+        Err(AppError::InvalidConsoleSyntax(
+            "invalid item identifier".into(),
+        ))
+    }
+}
+
+fn parse_container_transfer(arguments: &str, take: bool) -> Result<ConsoleCommand, AppError> {
+    let mut parts = arguments.split_whitespace();
+    let item = normalize_item_id(
+        parts
+            .next()
+            .ok_or_else(|| AppError::MissingConsoleArgument("<item> <count>".into()))?,
+    )?;
+    let count: u32 = parts
+        .next()
+        .ok_or_else(|| AppError::MissingConsoleArgument("<item> <count>".into()))?
+        .parse()
+        .map_err(|_| AppError::InvalidConsoleSyntax("count must be positive".into()))?;
+    if count == 0 || parts.next().is_some() {
+        return Err(AppError::InvalidConsoleSyntax(
+            "<item> <positive-count>".into(),
+        ));
+    }
+    Ok(if take {
+        ConsoleCommand::TakeItem {
+            item_id: item,
+            count,
+        }
+    } else {
+        ConsoleCommand::StoreItem {
+            item_id: item,
+            count,
+        }
 fn parse_collect_food(arguments: &str) -> Result<ConsoleCommand, AppError> {
     let parts: Vec<_> = arguments.split_whitespace().collect();
     let parsed = match parts.as_slice() {
@@ -780,6 +858,27 @@ mod tests {
             ConsoleInput::Command(ConsoleCommand::TestOakLog)
         );
     }
+    #[test]
+    fn parses_container_debug_commands() {
+        assert_eq!(
+            parse_input("/open-chest 1 64 -2").unwrap(),
+            ConsoleInput::Command(ConsoleCommand::OpenChest { x: 1, y: 64, z: -2 })
+        );
+        assert_eq!(
+            parse_input("/take-item diamond 3").unwrap(),
+            ConsoleInput::Command(ConsoleCommand::TakeItem {
+                item_id: "minecraft:diamond".into(),
+                count: 3
+            })
+        );
+        assert_eq!(
+            parse_input("/store-item cobblestone 64").unwrap(),
+            ConsoleInput::Command(ConsoleCommand::StoreItem {
+                item_id: "minecraft:cobblestone".into(),
+                count: 64
+            })
+        );
+        assert!(parse_input("/take-item diamond 0").is_err());
 
     #[test]
     fn parses_food_collection_and_controls() {
