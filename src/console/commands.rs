@@ -340,22 +340,6 @@ fn normalize_item_id(value: &str) -> Result<String, AppError> {
     });
     if valid {
         Ok(value)
-    let id = if value.contains(':') {
-        value.to_ascii_lowercase()
-    } else {
-        format!("minecraft:{}", value.to_ascii_lowercase())
-    };
-    if id.split_once(':').is_some_and(|(namespace, path)| {
-        !namespace.is_empty()
-            && !path.is_empty()
-            && namespace.chars().all(|c| {
-                c.is_ascii_lowercase() || c.is_ascii_digit() || matches!(c, '_' | '-' | '.')
-            })
-            && path.chars().all(|c| {
-                c.is_ascii_lowercase() || c.is_ascii_digit() || matches!(c, '_' | '-' | '.' | '/')
-            })
-    }) {
-        Ok(id)
     } else {
         Err(AppError::InvalidConsoleSyntax(
             "invalid item identifier".into(),
@@ -383,6 +367,9 @@ fn parse_craft(arguments: &str) -> Result<ConsoleCommand, AppError> {
             "craft count must be positive".into(),
         )),
         other => Ok(other),
+    })
+}
+
 fn parse_container_transfer(arguments: &str, take: bool) -> Result<ConsoleCommand, AppError> {
     let mut parts = arguments.split_whitespace();
     let item = normalize_item_id(
