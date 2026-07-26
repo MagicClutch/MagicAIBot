@@ -197,9 +197,15 @@ impl MovementService {
                 self.replace_and_publish(minecraft, snapshot).await;
             }
             Ok(status) if status.reached && pathfinder_startup_grace_elapsed(&snapshot) => {
-                snapshot.status = MovementStatus::Failed;
-                snapshot.failure_reason =
-                    Some("pathfinder reported completion before arrival".into());
+                // Azalea can briefly report the previous goal as complete
+                // while a new goal event is still being consumed. Re-submit
+                // the goal instead of abandoning movement at that point.
+                if let Some(destination) = snapshot.destination {
+                    let _ = minecraft
+                        .start_navigation_to(destination, None, NavigationMode::MovementOnly)
+                        .await;
+                    snapshot.started_at = Some(SystemTime::now());
+                }
                 snapshot.last_movement_update = Some(SystemTime::now());
                 self.replace_and_publish(minecraft, snapshot).await;
             }
@@ -208,8 +214,12 @@ impl MovementService {
                     && !status.executing
                     && pathfinder_startup_grace_elapsed(&snapshot) =>
             {
-                snapshot.status = MovementStatus::Failed;
-                snapshot.failure_reason = Some("no path was found".into());
+                if let Some(destination) = snapshot.destination {
+                    let _ = minecraft
+                        .start_navigation_to(destination, None, NavigationMode::MovementOnly)
+                        .await;
+                    snapshot.started_at = Some(SystemTime::now());
+                }
                 snapshot.last_movement_update = Some(SystemTime::now());
                 self.replace_and_publish(minecraft, snapshot).await;
             }
