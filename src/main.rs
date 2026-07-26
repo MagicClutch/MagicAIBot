@@ -5,6 +5,7 @@ mod config;
 mod console;
 mod container;
 mod error;
+mod food;
 mod interaction;
 mod logging;
 mod look;

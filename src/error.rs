@@ -126,6 +126,8 @@ pub enum AppError {
     InvalidConsoleSyntax(String),
     #[error("console input failed: {0}")]
     ConsoleInputFailure(String),
+    #[error("task runtime failure: {0}")]
+    TaskRuntime(String),
     #[error("reconnect is already in progress")]
     ReconnectAlreadyInProgress,
     #[error("failed to initialize logging: {0}")]
