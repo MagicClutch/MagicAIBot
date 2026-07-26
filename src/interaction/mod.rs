@@ -6,3 +6,4 @@ pub mod reach;
 pub(crate) mod tool_selection;
 
 pub use interaction_controller::InteractionController;
+pub mod block_placement;

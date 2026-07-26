@@ -55,6 +55,7 @@ use crate::{
     error::AppError,
     logging,
     minecraft::{
+        container::{ContainerIdentity, ContainerLayout, MenuObservation},
         events::handle_chat,
         inventory_actions::InventoryActionService,
         world_state::{
@@ -693,6 +694,9 @@ impl MinecraftClient {
         }
     }
 
+    /// Dispatches Azalea's explicit block interaction. The caller must first
+    /// validate the raycast face/hit point; this avoids degrading a placement
+    /// into a generic use-item action when the crosshair changes between ticks.
     /// Explicitly interacts with a validated block instead of relying on the
     /// currently ray-cast block. Azalea sends the normal use-on-block packet.
     pub(crate) async fn interact_block(&self, position: BlockPosition) -> Result<(), AppError> {
@@ -1377,6 +1381,7 @@ async fn refresh_ecs_state(
         bot.alive = Some(dead.is_none());
     }
     let inventory_snapshot = inventory_from_component(&bot_inventory);
+    let container_observation = bot_inventory.and_then(container_from_component);
     let mut entities = ecs.query::<(
         azalea::ecs::entity::Entity,
         &MinecraftEntityId,
@@ -1390,6 +1395,7 @@ async fn refresh_ecs_state(
     )>();
     let mut updates = Vec::new();
     let mut existing_ids = HashSet::new();
+    for (entity, minecraft_id, uuid, kind, position, dead, health, dimension, item) in
     for (entity, minecraft_id, uuid, kind, position, dead, health, _dimension, item) in
         entities.iter(&ecs)
     {
@@ -1406,6 +1412,9 @@ async fn refresh_ecs_state(
             entity_id,
             uuid: Some(**uuid),
             entity_type: kind.0.to_string(),
+            item_id: item.and_then(|item| (!item.is_empty()).then(|| item.kind().to_string())),
+            item_count: item.map_or(0, |item| item.count().max(0) as u32),
+            dimension: dimension.map(ToString::to_string),
             position: crate::minecraft::world_state::PositionSnapshot {
                 x: v.x,
                 y: v.y,
@@ -1456,6 +1465,7 @@ async fn refresh_ecs_state(
         if let Some(inventory) = inventory_snapshot {
             world.update_inventory(inventory);
         }
+        world.observe_container(container_observation, bot.alive.unwrap_or(false));
         world.update_bot(bot);
     }
     for entity in updates {
@@ -1466,6 +1476,57 @@ async fn refresh_ecs_state(
         world.upsert_player(player);
     }
     world.remove_stale_entities();
+}
+
+fn container_from_component(inventory: &Inventory) -> Option<MenuObservation> {
+    use azalea::inventory::Menu;
+
+    let menu = inventory.container_menu.as_ref()?;
+    let (menu_type, layout) = match menu {
+        Menu::Generic9x1 { .. } => ("generic_9x1", ContainerLayout::generic(1)),
+        Menu::Generic9x2 { .. } => ("generic_9x2", ContainerLayout::generic(2)),
+        Menu::Generic9x3 { .. } => ("generic_9x3", ContainerLayout::generic(3)),
+        Menu::Generic9x4 { .. } => ("generic_9x4", ContainerLayout::generic(4)),
+        Menu::Generic9x5 { .. } => ("generic_9x5", ContainerLayout::generic(5)),
+        Menu::Generic9x6 { .. } => ("generic_9x6", ContainerLayout::generic(6)),
+        _ => ("unsupported", None),
+    };
+    Some(MenuObservation {
+        identity: ContainerIdentity {
+            window_id: inventory.id,
+            menu_type: menu_type.into(),
+            title: inventory
+                .container_menu_title
+                .as_ref()
+                .map(ToString::to_string),
+            // Open Screen does not carry a block position. A later active-open
+            // command may supply one, but passive observation must not guess.
+            world_position: None,
+        },
+        layout,
+        revision: inventory.state_id,
+        cursor: inventory_slot(usize::MAX, &inventory.carried),
+        slots: menu
+            .slots()
+            .iter()
+            .enumerate()
+            .map(|(index, item)| inventory_slot(index, item))
+            .collect(),
+    })
+}
+
+fn inventory_slot(slot: usize, item: &azalea::inventory::ItemStack) -> InventorySlot {
+    let (item_id, count) = if item.is_empty() {
+        (None, 0)
+    } else {
+        (Some(item.kind().to_string()), item.count().max(0) as u32)
+    };
+    InventorySlot {
+        slot,
+        item_id,
+        display_name: None,
+        count,
+    }
 }
 
 fn inventory_from_component(inventory: &Option<&Inventory>) -> Option<InventorySnapshot> {
@@ -1504,6 +1565,7 @@ fn inventory_from_component(inventory: &Option<&Inventory>) -> Option<InventoryS
         available: true,
         sync_state: InventorySyncState::Synchronized,
         server_state_id: Some(inventory.state_id),
+        revision: 0,
         slots,
         selected_hotbar_slot: Some(inventory.selected_hotbar_slot),
         ..Default::default()

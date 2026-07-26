@@ -7,6 +7,7 @@ use std::{
 
 use uuid::Uuid;
 
+use super::container::{ContainerObserver, ContainerSnapshot, MenuObservation};
 use crate::error::AppError;
 
 pub const DEFAULT_ENTITY_RADIUS: f64 = 64.0;
@@ -162,6 +163,8 @@ pub struct InventorySnapshot {
     pub sync_state: InventorySyncState,
     pub revision: u64,
     pub server_state_id: Option<u32>,
+    /// Monotonically increases only when slot contents change.
+    pub revision: u64,
     pub slots: Vec<InventorySlot>,
     pub selected_hotbar_slot: Option<u8>,
     pub selected_slot: Option<InventorySlotId>,
@@ -187,6 +190,16 @@ impl InventorySnapshot {
     pub fn selected_item(&self) -> Option<&InventorySlot> {
         self.selected_slot
             .and_then(|id| self.slots.iter().find(|s| s.id == id))
+        let selected = usize::from(self.selected_hotbar_slot?);
+        if self.slots.len() < 9 {
+            return self.slots.iter().find(|slot| slot.slot == selected);
+        }
+        let first_hotbar = self.slots.len() - 9;
+        self.slots.iter().find(|slot| slot.slot == first_hotbar + selected)
+    }
+    pub fn item_is_in_hotbar(&self, id: &str) -> bool {
+        let Some(first_hotbar) = self.slots.len().checked_sub(9) else { return false };
+        self.slots.iter().any(|slot| slot.slot >= first_hotbar && slot.item_id.as_deref() == Some(id))
     }
     fn rebuild_counts(&mut self) {
         self.total_counts.clear();
@@ -227,6 +240,10 @@ pub struct EntitySnapshot {
     pub entity_id: u32,
     pub uuid: Option<Uuid>,
     pub entity_type: String,
+    /// Present for Azalea's `minecraft:item` entities.
+    pub item_id: Option<String>,
+    pub item_count: u32,
+    pub dimension: Option<String>,
     pub position: PositionSnapshot,
     pub distance: f64,
     pub alive: Option<bool>,
@@ -292,6 +309,7 @@ pub struct WorldStateSnapshot {
     pub connection: ConnectionSnapshot,
     pub bot: BotSnapshot,
     pub inventory: InventorySnapshot,
+    pub container: ContainerSnapshot,
     pub players: Vec<PlayerSnapshot>,
     pub entities: Vec<EntitySnapshot>,
     pub last_received_chat: Option<ChatRecord>,
@@ -306,6 +324,7 @@ impl Default for WorldStateSnapshot {
             connection: ConnectionSnapshot::default(),
             bot: BotSnapshot::default(),
             inventory: InventorySnapshot::default(),
+            container: ContainerSnapshot::default(),
             players: Vec::new(),
             entities: Vec::new(),
             last_received_chat: None,
@@ -332,6 +351,7 @@ pub struct WorldState {
     pub(crate) connection: ConnectionSnapshot,
     bot: BotSnapshot,
     inventory: InventorySnapshot,
+    container: ContainerObserver,
     players: HashMap<Uuid, PlayerSnapshot>,
     entities: HashMap<u32, EntitySnapshot>,
     last_received_chat: Option<ChatRecord>,
@@ -366,6 +386,7 @@ impl WorldState {
             connection: ConnectionSnapshot::default(),
             bot: BotSnapshot::default(),
             inventory: InventorySnapshot::default(),
+            container: ContainerObserver::default(),
             players: HashMap::new(),
             entities: HashMap::new(),
             last_received_chat: None,
@@ -396,6 +417,7 @@ impl WorldState {
         self.connection.joined_world = joined;
         if joined {
             self.connection.last_successful_join = Some(SystemTime::now());
+            self.container.begin_session(SystemTime::now());
         }
         self.touch();
     }
@@ -419,8 +441,20 @@ impl WorldState {
         inventory.slots.sort_by_key(|s| s.id);
         inventory.revision = self.inventory.revision.saturating_add(1);
         inventory.rebuild_counts();
+        inventory.revision = if inventory.slots != self.inventory.slots {
+            self.inventory.revision.wrapping_add(1)
+        } else {
+            self.inventory.revision
+        };
         self.inventory = inventory;
         self.touch();
+    }
+    pub(crate) fn observe_container(&mut self, menu: Option<MenuObservation>, alive: bool) {
+        self.container.observe(menu, alive, SystemTime::now());
+        self.touch();
+    }
+    pub fn container_snapshot_for_generation(&self, generation: u64) -> ContainerSnapshot {
+        self.container.snapshot_for_generation(generation)
     }
     pub fn clear_inventory(&mut self) {
         let revision = self.inventory.revision.saturating_add(1);
@@ -432,6 +466,7 @@ impl WorldState {
     }
     /// Drop observations that belong to a disconnected Azalea session.
     pub fn clear_session_state(&mut self) {
+        self.container.disconnect(SystemTime::now());
         self.bot = BotSnapshot::default();
         self.players.clear();
         self.entities.clear();
@@ -601,6 +636,7 @@ impl WorldState {
             connection: self.connection.clone(),
             bot: self.bot.clone(),
             inventory: self.inventory.clone(),
+            container: self.container.snapshot(),
             players,
             entities,
             last_received_chat: self.last_received_chat.clone(),
@@ -661,6 +697,9 @@ mod tests {
             entity_id: id,
             uuid: Some(uuid(u128::from(id))),
             entity_type: "minecraft:pig".into(),
+            item_id: None,
+            item_count: 0,
+            dimension: Some("minecraft:overworld".into()),
             position: PositionSnapshot { x, y: 0., z: 0. },
             distance: 0.,
             alive: Some(true),
@@ -705,6 +744,7 @@ mod tests {
         let mut state = WorldState::default();
         state.update_inventory(InventorySnapshot {
             available: true,
+            revision: 0,
             selected_hotbar_slot: Some(1),
             slots: vec![
                 InventorySlot {

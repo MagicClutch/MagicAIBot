@@ -35,8 +35,11 @@ pub struct Config {
     #[serde(default)]
     pub interaction: InteractionConfig,
     #[serde(default)]
+    pub smelting: crate::smelting::SmeltingConfig,
+    #[serde(default)]
     pub multitasking: MultitaskingConfig,
     #[serde(default)]
+    pub inventory_cleanup: crate::inventory_cleanup::CleanupPolicy,
     pub tree_chopping: TreeChoppingConfig,
 }
 
