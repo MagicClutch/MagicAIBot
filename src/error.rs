@@ -16,6 +16,15 @@ pub enum AppError {
     WorldStateUnavailable,
     #[error("inventory is unavailable")]
     InventoryUnavailable,
+    #[error("inventory mutation is busy")]
+    InventoryBusy,
+    #[error("inventory mutation was rejected: {0}")]
+    InventoryMutationRejected(String),
+    #[error("no suitable tool for {block_id}: {explanation}")]
+    NoSuitableTool {
+        block_id: String,
+        explanation: String,
+    },
     #[error("invalid entity query: {0}")]
     InvalidEntityQuery(String),
     #[error("world-state update failed: {0}")]

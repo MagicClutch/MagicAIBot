@@ -497,6 +497,21 @@ pub struct InteractionConfig {
     /// Select the fastest suitable tool already present in the hotbar before breaking.
     #[serde(default = "default_true")]
     pub auto_tool_switch: bool,
+    /// Never intentionally spend the last uses of a damageable tool.
+    #[serde(default = "default_minimum_tool_durability")]
+    pub minimum_tool_durability: u32,
+    /// Permit the held item/hand when the block does not require a tool.
+    #[serde(default = "default_true")]
+    pub allow_hand_fallback: bool,
+    /// Fractional speed difference within which the held tool is preferred.
+    #[serde(default = "default_held_tool_equivalence")]
+    pub held_tool_equivalence: f32,
+    /// Item identifiers excluded from automatic tool selection.
+    #[serde(default)]
+    pub protected_tools: Vec<String>,
+    /// Item identifiers temporarily reserved for another purpose.
+    #[serde(default)]
+    pub reserved_tools: Vec<String>,
     #[serde(default)]
     pub face_targeting: FaceTargetingConfig,
 }
@@ -545,6 +560,12 @@ fn default_interaction_retry_delay() -> u64 {
 fn default_interaction_verification_timeout() -> u64 {
     1500
 }
+fn default_minimum_tool_durability() -> u32 {
+    2
+}
+fn default_held_tool_equivalence() -> f32 {
+    0.10
+}
 impl Default for InteractionConfig {
     fn default() -> Self {
         Self {
@@ -557,6 +578,11 @@ impl Default for InteractionConfig {
             auto_navigate: true,
             auto_precise_look: true,
             auto_tool_switch: true,
+            minimum_tool_durability: default_minimum_tool_durability(),
+            allow_hand_fallback: true,
+            held_tool_equivalence: default_held_tool_equivalence(),
+            protected_tools: Vec::new(),
+            reserved_tools: Vec::new(),
             face_targeting: FaceTargetingConfig::default(),
         }
     }
@@ -760,6 +786,8 @@ impl Config {
             || interaction.face_targeting.maximum_face_attempts > 36
             || interaction.face_targeting.maximum_hit_points_per_face == 0
             || interaction.face_targeting.maximum_hit_points_per_face > 5
+            || !interaction.held_tool_equivalence.is_finite()
+            || !(0.0..=1.0).contains(&interaction.held_tool_equivalence)
         {
             return Err(AppError::InvalidInteractionConfiguration(
                 "reach, retry, or verification values are invalid".into(),
