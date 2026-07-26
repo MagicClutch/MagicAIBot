@@ -17,6 +17,8 @@ show_action_bar_messages = false
 [logging]
 level = "info"
 debug = false
+# Logs stay local and are never relayed to Minecraft chat. Operation correlation
+# IDs are random diagnostics identifiers; account/session secrets are not logged.
 
 [world_state]
 nearby_entity_radius = 64
@@ -99,6 +101,18 @@ auto_navigate = true
 auto_precise_look = true
 # Select the best suitable tool currently in the hotbar before breaking.
 auto_tool_switch = true
+# Preserve at least this many uses; unknown durability remains eligible.
+minimum_tool_durability = 2
+# Only applies to blocks that do not require a correct harvesting tool.
+allow_hand_fallback = true
+# Keep the held tool when it is within 10% of the best candidate's speed.
+held_tool_equivalence = 0.10
+# Exact item IDs that automatic breaking must not select.
+protected_tools = []
+# Exact item IDs temporarily reserved for other tasks.
+reserved_tools = []
+# Intentional breaking uses this interaction controller. Pathfinder mining is a
+# separate, explicit command mode (`/goto-mine` or `mine` on `/gotoblock`).
 
 [interaction.face_targeting]
 face_inset = 0.001
@@ -112,3 +126,31 @@ observation_interval_ms = 250
 confirmation_timeout_ms = 3000
 total_timeout_seconds = 300
 reopen_limit = 2
+# Inventory cleanup is deny-by-default: with no rules every item is kept.
+# Rules are evaluated deterministically; exact item rules beat tag rules and
+# the first rule wins ties. `discard` is the only authorization to drop.
+[inventory_cleanup]
+protect_rare_items = true
+protect_tools = true
+rules = []
+# Conservative loaded-world tree recognition. It never crafts, builds, climbs, or replants.
+[tree_chopping]
+allowed_tree_types = ["oak", "birch", "spruce", "jungle", "acacia", "dark_oak", "mangrove", "cherry", "pale_oak"]
+require_nearby_leaves = true
+maximum_connected_logs = 192
+maximum_tree_height = 48
+maximum_branch_distance = 12
+maximum_horizontal_logs = 48
+break_leaves = false
+collect_saplings = true
+allow_hand_chopping = false
+search_radius = 32
+maximum_trees = 16
+total_timeout_seconds = 300
+[ensure_tool]
+# Highest preference first. Unsupported or insufficient tiers are skipped.
+material_tier_preference = ["iron", "stone", "wood"]
+# A tool at or below this remaining durability is not eligible.
+durability_reserve = 10
+# Uses the existing furnace executor when a recipe dependency requires it.
+allow_smelting = false

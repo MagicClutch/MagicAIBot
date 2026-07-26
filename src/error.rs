@@ -2,6 +2,8 @@ use thiserror::Error;
 
 #[derive(Debug, Error)]
 pub enum AppError {
+    #[error(transparent)]
+    Action(#[from] crate::tasks::ActionFailure),
     #[error("I/O failure: {0}")]
     Io(#[from] std::io::Error),
     #[error("failed to parse configuration: {0}")]
@@ -16,6 +18,17 @@ pub enum AppError {
     WorldStateUnavailable,
     #[error("inventory is unavailable")]
     InventoryUnavailable,
+    #[error("recipe data unavailable: {0}")]
+    RecipeData(String),
+    #[error("inventory mutation is busy")]
+    InventoryBusy,
+    #[error("inventory mutation was rejected: {0}")]
+    InventoryMutationRejected(String),
+    #[error("no suitable tool for {block_id}: {explanation}")]
+    NoSuitableTool {
+        block_id: String,
+        explanation: String,
+    },
     #[error("invalid entity query: {0}")]
     InvalidEntityQuery(String),
     #[error("world-state update failed: {0}")]
@@ -44,6 +57,8 @@ pub enum AppError {
     InteractionOutOfReach,
     #[error("cannot break air")]
     CannotBreakAir,
+    #[error("no suitable harvest tool is available")]
+    NoSuitableHarvestTool,
     #[error("inventory does not contain {0}")]
     InteractionItemMissing(String),
     #[error("cannot place block: {0}")]
@@ -126,6 +141,8 @@ pub enum AppError {
     InvalidConsoleSyntax(String),
     #[error("console input failed: {0}")]
     ConsoleInputFailure(String),
+    #[error("task runtime failure: {0}")]
+    TaskRuntime(String),
     #[error("reconnect is already in progress")]
     ReconnectAlreadyInProgress,
     #[error("failed to initialize logging: {0}")]
