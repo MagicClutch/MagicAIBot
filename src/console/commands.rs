@@ -15,6 +15,13 @@ pub enum ConsoleCommand {
     },
     Players,
     Inventory,
+    SelectHotbar {
+        slot: u8,
+    },
+    EnsureHotbar {
+        item_id: String,
+        slot: Option<u8>,
+    },
     Entities {
         radius: Option<u32>,
     },
@@ -129,6 +136,30 @@ pub fn parse_input(input: &str) -> Result<ConsoleInput, AppError> {
         "status" => no_arguments(command, arguments, ConsoleCommand::Status)?,
         "players" => no_arguments(command, arguments, ConsoleCommand::Players)?,
         "inventory" => no_arguments(command, arguments, ConsoleCommand::Inventory)?,
+        "select-hotbar" => ConsoleCommand::SelectHotbar {
+            slot: arguments.parse().map_err(|_| {
+                AppError::InvalidConsoleSyntax("usage: /select-hotbar SLOT (0-8)".into())
+            })?,
+        },
+        "ensure-hotbar" => {
+            let mut parts = arguments.split_whitespace();
+            let item_id = parts
+                .next()
+                .ok_or_else(|| {
+                    AppError::InvalidConsoleSyntax("usage: /ensure-hotbar ITEM [SLOT]".into())
+                })?
+                .to_owned();
+            let slot =
+                parts.next().map(str::parse).transpose().map_err(|_| {
+                    AppError::InvalidConsoleSyntax("hotbar slot must be 0-8".into())
+                })?;
+            if parts.next().is_some() {
+                return Err(AppError::InvalidConsoleSyntax(
+                    "usage: /ensure-hotbar ITEM [SLOT]".into(),
+                ));
+            }
+            ConsoleCommand::EnsureHotbar { item_id, slot }
+        }
         "entities" => {
             let radius = if arguments.is_empty() {
                 None

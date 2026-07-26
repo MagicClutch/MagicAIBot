@@ -11,6 +11,7 @@ use std::{
     time::{Duration, SystemTime},
 };
 
+use async_trait::async_trait;
 use azalea::core::position::ChunkPos;
 use azalea::world::find_blocks::find_blocks_in_chunk;
 use azalea::{
@@ -31,6 +32,10 @@ use azalea::{
     registry::builtin::BlockKind,
     world::WorldName,
 };
+use azalea_inventory::item::MaxStackSizeExt;
+use azalea_inventory::operations::{
+    ClickOperation, PickupClick, QuickMoveClick, SwapClick, ThrowClick,
+};
 use tokio::{
     sync::{Mutex, watch},
     task::JoinHandle,
@@ -46,6 +51,7 @@ use crate::{
     },
     config::{AccountMode, ConsoleConfig, MinecraftConfig, ReconnectConfig, WorldStateConfig},
     error::AppError,
+    inventory::{InventoryClick, InventorySlotView, InventoryTransport, InventoryView, MenuKind},
     logging,
     minecraft::{
         events::handle_chat,
@@ -871,6 +877,115 @@ impl MinecraftClient {
                 ConnectionState::Reconnecting => WorldConnectionState::Reconnecting,
             });
         }
+    }
+}
+
+#[async_trait]
+impl InventoryTransport for MinecraftClient {
+    async fn inventory_view(&self) -> Result<InventoryView, ()> {
+        let connected = *self.state.borrow() == ConnectionState::Connected;
+        let alive = self
+            .world_state
+            .lock()
+            .await
+            .snapshot()
+            .bot
+            .alive
+            .unwrap_or(true);
+        let client = self.current_client.lock().await.clone().ok_or(())?;
+        let inventory = client.component::<Inventory>().map_err(|_| ())?;
+        let menu = inventory.menu();
+        let slots = menu
+            .slots()
+            .into_iter()
+            .enumerate()
+            .map(|(index, item)| {
+                if item.is_empty() {
+                    InventorySlotView::empty(index as u16)
+                } else {
+                    let maximum = item.kind().max_stack_size() as u32;
+                    InventorySlotView::stack(
+                        index as u16,
+                        item.kind().to_string(),
+                        item.count() as u32,
+                        maximum,
+                    )
+                }
+            })
+            .collect();
+        let carried = (!inventory.carried.is_empty()).then(|| {
+            InventorySlotView::stack(
+                u16::MAX,
+                inventory.carried.kind().to_string(),
+                inventory.carried.count() as u32,
+                inventory.carried.kind().max_stack_size() as u32,
+            )
+        });
+        let player_slots = menu.player_slots_range().map(|slot| slot as u16).collect();
+        let hotbar: Vec<u16> = menu.hotbar_slots_range().map(|slot| slot as u16).collect();
+        let hotbar_slots: [u16; 9] = hotbar.try_into().map_err(|_| ())?;
+        Ok(InventoryView {
+            session: client.entity.to_bits(),
+            menu_id: inventory.id,
+            menu_kind: if inventory.id == 0 {
+                MenuKind::Player
+            } else {
+                MenuKind::Container
+            },
+            revision: inventory.state_id,
+            alive,
+            connected,
+            cursor: carried,
+            slots,
+            player_slots,
+            hotbar_slots,
+            selected_hotbar: inventory.selected_hotbar_slot,
+        })
+    }
+
+    async fn click_inventory(
+        &self,
+        bound: &InventoryView,
+        click: InventoryClick,
+    ) -> Result<(), ()> {
+        let client = self.current_client.lock().await.clone().ok_or(())?;
+        let inventory = client.component::<Inventory>().map_err(|_| ())?;
+        if client.entity.to_bits() != bound.session
+            || inventory.id != bound.menu_id
+            || inventory.state_id != bound.revision
+        {
+            return Err(());
+        }
+        let operation: ClickOperation = match click {
+            InventoryClick::Left(slot) => PickupClick::Left { slot: Some(slot) }.into(),
+            InventoryClick::Right(slot) => PickupClick::Right { slot: Some(slot) }.into(),
+            InventoryClick::QuickMove(slot) => QuickMoveClick::Left { slot }.into(),
+            InventoryClick::Swap { slot, hotbar } => SwapClick {
+                source_slot: slot,
+                target_slot: hotbar,
+            }
+            .into(),
+            InventoryClick::DropOne(slot) => ThrowClick::Single { slot }.into(),
+            InventoryClick::DropStack(slot) => ThrowClick::All { slot }.into(),
+        };
+        client.get_inventory().map_err(|_| ())?.click(operation);
+        Ok(())
+    }
+
+    async fn select_hotbar(&self, bound: &InventoryView, slot: u8) -> Result<(), ()> {
+        if slot > 8 {
+            return Err(());
+        }
+        let client = self.current_client.lock().await.clone().ok_or(())?;
+        let inventory = client.component::<Inventory>().map_err(|_| ())?;
+        if client.entity.to_bits() != bound.session
+            || inventory.id != bound.menu_id
+            || inventory.state_id != bound.revision
+        {
+            return Err(());
+        }
+        client.set_selected_hotbar_slot(slot);
+        Ok(())
     }
 }
 

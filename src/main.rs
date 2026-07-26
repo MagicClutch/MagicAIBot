@@ -5,6 +5,7 @@ mod config;
 mod console;
 mod error;
 mod interaction;
+mod inventory;
 mod logging;
 mod look;
 pub mod minecraft;
