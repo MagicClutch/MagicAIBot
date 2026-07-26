@@ -36,6 +36,8 @@ pub struct Config {
     pub interaction: InteractionConfig,
     #[serde(default)]
     pub multitasking: MultitaskingConfig,
+    #[serde(default)]
+    pub inventory_cleanup: crate::inventory_cleanup::CleanupPolicy,
 }
 
 #[derive(Clone, Debug, Deserialize)]

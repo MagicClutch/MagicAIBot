@@ -15,6 +15,9 @@ pub enum ConsoleCommand {
     },
     Players,
     Inventory,
+    CleanupInventory {
+        operation: CleanupOperation,
+    },
     Entities {
         radius: Option<u32>,
     },
@@ -100,6 +103,14 @@ pub enum ConsoleInput {
     Empty,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum CleanupOperation {
+    DryRun,
+    Execute,
+    Status,
+    Stop,
+}
+
 #[must_use]
 pub fn plain_chat_message(input: &ConsoleInput, enabled: bool) -> Option<&str> {
     if enabled && let ConsoleInput::ChatMessage(message) = input {
@@ -129,6 +140,20 @@ pub fn parse_input(input: &str) -> Result<ConsoleInput, AppError> {
         "status" => no_arguments(command, arguments, ConsoleCommand::Status)?,
         "players" => no_arguments(command, arguments, ConsoleCommand::Players)?,
         "inventory" => no_arguments(command, arguments, ConsoleCommand::Inventory)?,
+        "cleanup-inventory" => {
+            let operation = match arguments {
+                "dry-run" => CleanupOperation::DryRun,
+                "execute" => CleanupOperation::Execute,
+                "status" => CleanupOperation::Status,
+                "stop" => CleanupOperation::Stop,
+                _ => {
+                    return Err(AppError::InvalidConsoleSyntax(
+                        "/cleanup-inventory dry-run|execute|status|stop".into(),
+                    ));
+                }
+            };
+            ConsoleCommand::CleanupInventory { operation }
+        }
         "entities" => {
             let radius = if arguments.is_empty() {
                 None
@@ -441,6 +466,23 @@ mod tests {
                 message: "hello".to_owned()
             })
         );
+    }
+
+    #[test]
+    fn parses_cleanup_inventory_commands_strictly() {
+        for (text, operation) in [
+            ("/cleanup-inventory dry-run", CleanupOperation::DryRun),
+            ("/cleanup-inventory execute", CleanupOperation::Execute),
+            ("/cleanup-inventory status", CleanupOperation::Status),
+            ("/cleanup-inventory stop", CleanupOperation::Stop),
+        ] {
+            assert_eq!(
+                parse_input(text).unwrap(),
+                ConsoleInput::Command(ConsoleCommand::CleanupInventory { operation })
+            );
+        }
+        assert!(parse_input("/cleanup-inventory").is_err());
+        assert!(parse_input("/cleanup-inventory run").is_err());
     }
 
     #[test]
