@@ -243,7 +243,7 @@ impl App {
                 }
                 ConsoleCommand::Players => self.print_players().await,
                 ConsoleCommand::Inventory => self.print_inventory().await,
-                ConsoleCommand::ContainerStatus => self.print_container_status().await,
+                ConsoleCommand::ObservedContainerStatus => self.print_container_status().await,
                 ConsoleCommand::Recipe { id } => self.print_recipe(&id),
                 ConsoleCommand::CraftCheck { item, count, depth } => {
                     self.print_craft_check(&item, count, depth).await

@@ -15,7 +15,7 @@ pub enum ConsoleCommand {
     },
     Players,
     Inventory,
-    ContainerStatus,
+    ObservedContainerStatus,
     Recipe {
         id: String,
     },
@@ -193,7 +193,7 @@ pub fn parse_input(input: &str) -> Result<ConsoleInput, AppError> {
         "players" => no_arguments(command, arguments, ConsoleCommand::Players)?,
         "inventory" => no_arguments(command, arguments, ConsoleCommand::Inventory)?,
         "containerstatus" | "container-status" => {
-            no_arguments(command, arguments, ConsoleCommand::ContainerStatus)?
+            no_arguments(command, arguments, ConsoleCommand::ObservedContainerStatus)?
         }
         "recipe" => ConsoleCommand::Recipe {
             id: normalize_item_id(single_argument(command, arguments, "/recipe <recipe_id>")?)?,
@@ -772,7 +772,7 @@ mod tests {
         );
         assert_eq!(
             parse_input("/containerstatus").unwrap(),
-            ConsoleInput::Command(ConsoleCommand::ContainerStatus)
+            ConsoleInput::Command(ConsoleCommand::ObservedContainerStatus)
         );
         assert_eq!(
             parse_input("/chat hello").unwrap(),
