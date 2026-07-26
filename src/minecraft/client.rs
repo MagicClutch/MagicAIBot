@@ -688,6 +688,9 @@ impl MinecraftClient {
         }
     }
 
+    /// Dispatches Azalea's explicit block interaction. The caller must first
+    /// validate the raycast face/hit point; this avoids degrading a placement
+    /// into a generic use-item action when the crosshair changes between ticks.
     /// Explicitly interacts with a validated block instead of relying on the
     /// currently ray-cast block. Azalea sends the normal use-on-block packet.
     pub(crate) async fn interact_block(&self, position: BlockPosition) -> Result<(), AppError> {
