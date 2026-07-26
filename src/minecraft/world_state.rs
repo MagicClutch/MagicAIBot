@@ -140,7 +140,15 @@ pub struct EntitySnapshot {
     pub alive: Option<bool>,
     pub health: Option<f32>,
     pub custom_name: Option<String>,
+    /// Present only for `minecraft:item`; sourced from Azalea's authoritative
+    /// item metadata component rather than inferred from the entity kind.
+    pub item: Option<DroppedItemSnapshot>,
     pub last_seen: SystemTime,
+}
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct DroppedItemSnapshot {
+    pub item_id: String,
+    pub count: u32,
 }
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ChatMessageKind {
@@ -614,6 +622,7 @@ mod tests {
             alive: Some(true),
             health: Some(20.0),
             custom_name: None,
+            item: None,
             last_seen: SystemTime::now(),
         }
     }

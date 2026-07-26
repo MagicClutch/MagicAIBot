@@ -24,6 +24,7 @@ use azalea::{
         dimensions::EntityDimensions,
         inventory::Inventory,
         metadata::{Health, Item, ItemItem},
+        metadata::{Health, ItemItem},
     },
     pathfinder::{
         PathfinderClientExt, PathfinderOpts,
@@ -33,6 +34,7 @@ use azalea::{
     registry::builtin::BlockKind,
     world::WorldName,
 };
+use azalea_inventory::components::{Damage, Enchantments, MaxDamage, Tool};
 use tokio::{
     sync::{Mutex, watch},
     task::JoinHandle,
@@ -51,6 +53,7 @@ use crate::{
     logging,
     minecraft::{
         events::handle_chat,
+        inventory_actions::InventoryActionService,
         world_state::{
             BlockPosition, InventorySlot, InventorySnapshot, MovementSnapshot, PlayerSnapshot,
             PositionSnapshot, TaskSnapshot, WorldConnectionState, WorldState, WorldStateSnapshot,
@@ -112,6 +115,7 @@ pub struct MinecraftClient {
     world_state: Arc<Mutex<WorldState>>,
     shutdown: CancellationToken,
     supervisor: Option<JoinHandle<()>>,
+    inventory_actions: InventoryActionService,
 }
 
 #[derive(Clone, Debug)]
@@ -207,6 +211,7 @@ impl MinecraftClient {
             world_state: Arc::new(Mutex::new(world)),
             shutdown: CancellationToken::new(),
             supervisor: None,
+            inventory_actions: InventoryActionService::default(),
         }
     }
 
@@ -342,6 +347,10 @@ impl MinecraftClient {
     #[must_use]
     pub async fn world_state_snapshot(&self) -> WorldStateSnapshot {
         self.world_state.lock().await.snapshot()
+    }
+
+    pub(crate) async fn block_id_at(&self, position: BlockPosition) -> Result<Option<String>, AppError> {
+        Ok(self.block_ids_at(&[position]).await?.remove(&position).flatten())
     }
 
     pub(crate) async fn scan_loaded_blocks(
@@ -505,6 +514,42 @@ impl MinecraftClient {
         Ok(result)
     }
 
+    /// Reads the exact block kind and its generated property map while the
+    /// chunk read lock is held. A missing entry means the observation is not
+    /// reliable enough to act on.
+    pub(crate) async fn block_state_at(
+        &self,
+        position: BlockPosition,
+    ) -> Result<Option<(String, HashMap<String, String>)>, AppError> {
+        if self.connection_state() != ConnectionState::Connected {
+            return Err(AppError::BlockSearchCancelled);
+        }
+        let client = self
+            .current_client
+            .lock()
+            .await
+            .clone()
+            .ok_or(AppError::BlockSearchUnavailable)?;
+        let world = client
+            .world()
+            .map_err(|e| AppError::WorldStateUpdateFailure(e.to_string()))?;
+        let guard = world.read();
+        let Some(state) =
+            guard.get_block_state(azalea::BlockPos::new(position.x, position.y, position.z))
+        else {
+            return Ok(None);
+        };
+        let block = state.to_trait();
+        Ok(Some((
+            format!("minecraft:{}", block.id()),
+            block
+                .property_map()
+                .into_iter()
+                .map(|(k, v)| (k.to_owned(), v.to_owned()))
+                .collect(),
+        )))
+    }
+
     pub(crate) async fn look_data(&self) -> Result<([f64; 3], f32, f32), AppError> {
         let client = self
             .current_client
@@ -644,6 +689,125 @@ impl MinecraftClient {
         }
     }
 
+    /// Explicitly interacts with a validated block instead of relying on the
+    /// currently ray-cast block. Azalea sends the normal use-on-block packet.
+    pub(crate) async fn interact_block(&self, position: BlockPosition) -> Result<(), AppError> {
+        let client = self
+            .current_client
+            .lock()
+            .await
+            .clone()
+            .ok_or(AppError::MovementUnavailable)?;
+        client.block_interact(azalea::BlockPos::new(position.x, position.y, position.z));
+        Ok(())
+    }
+
+    pub(crate) async fn any_container_open(&self) -> bool {
+        let Some(client) = self.current_client.lock().await.clone() else {
+            return false;
+        };
+        client
+            .component::<Inventory>()
+            .is_ok_and(|inventory| inventory.container_menu.is_some())
+    }
+
+    /// Maps Azalea's authoritative active menu into the application model.
+    pub(crate) async fn chest_menu_snapshot(
+        &self,
+    ) -> Result<Option<crate::container::model::MenuSnapshot>, AppError> {
+        use crate::container::model::{ContainerKind, MenuSnapshot, StackSnapshot};
+        use azalea::inventory::item::MaxStackSizeExt;
+        let client = self
+            .current_client
+            .lock()
+            .await
+            .clone()
+            .ok_or(AppError::InventoryUnavailable)?;
+        let inventory = client
+            .component::<Inventory>()
+            .map_err(|_| AppError::InventoryUnavailable)?;
+        let Some(menu) = inventory.container_menu.as_ref() else {
+            return Ok(None);
+        };
+        let kind = match menu {
+            azalea::inventory::Menu::Generic9x3 { .. } => ContainerKind::SingleChest,
+            azalea::inventory::Menu::Generic9x6 { .. } => ContainerKind::DoubleChest,
+            _ => return Ok(None),
+        };
+        let content_count = match kind {
+            ContainerKind::SingleChest => 27,
+            ContainerKind::DoubleChest => 54,
+        };
+        let map = |item: &azalea::inventory::ItemStack| {
+            item.as_present().map(|item| StackSnapshot {
+                item_id: item.kind.to_string(),
+                count: item.count.max(0) as u32,
+                max_count: item.kind.max_stack_size().max(1) as u32,
+            })
+        };
+        let slots = menu.slots();
+        Ok(Some(MenuSnapshot {
+            kind,
+            position: None,
+            window_id: inventory.id,
+            revision: inventory.state_id,
+            container_slots: slots[..content_count].iter().map(map).collect(),
+            player_slots: slots[content_count..].iter().map(map).collect(),
+        }))
+    }
+
+    pub(crate) async fn container_click(
+        &self,
+        window_id: i32,
+        click: crate::container::model::InventoryClick,
+    ) -> Result<(), AppError> {
+        use crate::container::model::ClickButton;
+        use azalea::inventory::operations::PickupClick;
+        let client = self
+            .current_client
+            .lock()
+            .await
+            .clone()
+            .ok_or(AppError::InventoryUnavailable)?;
+        let inventory = client
+            .component::<Inventory>()
+            .map_err(|_| AppError::InventoryUnavailable)?;
+        if inventory.id != window_id || inventory.container_menu.is_none() {
+            return Err(AppError::InventoryUnavailable);
+        }
+        let handle = client
+            .get_inventory()
+            .map_err(|_| AppError::InventoryUnavailable)?;
+        handle.click(match click.button {
+            ClickButton::Left => PickupClick::Left {
+                slot: Some(click.slot as u16),
+            },
+            ClickButton::Right => PickupClick::Right {
+                slot: Some(click.slot as u16),
+            },
+        });
+        Ok(())
+    }
+
+    pub(crate) async fn close_container(&self) -> Result<(), AppError> {
+        let client = self
+            .current_client
+            .lock()
+            .await
+            .clone()
+            .ok_or(AppError::InventoryUnavailable)?;
+        let inventory = client
+            .component::<Inventory>()
+            .map_err(|_| AppError::InventoryUnavailable)?;
+        if inventory.container_menu.is_some() {
+            client
+                .get_inventory()
+                .map_err(|_| AppError::InventoryUnavailable)?
+                .close();
+        }
+        Ok(())
+    }
+
     pub(crate) async fn use_item_at_look_target(&self) -> Result<(), AppError> {
         let client = self
             .current_client
@@ -656,73 +820,148 @@ impl MinecraftClient {
     }
 
     pub(crate) async fn select_item_in_hotbar(&self, item_id: &str) -> Result<bool, AppError> {
-        let client = self
-            .current_client
-            .lock()
+        self.inventory_actions
+            .mutate(|| async {
+                let client = self
+                    .current_client
+                    .lock()
+                    .await
+                    .clone()
+                    .ok_or(AppError::InventoryUnavailable)?;
+                let menu = client.menu().map_err(|_| AppError::InventoryUnavailable)?;
+                let slot =
+                    menu.hotbar_slots_range()
+                        .enumerate()
+                        .find_map(|(hotbar_slot, menu_slot)| {
+                            menu.slots()
+                                .get(menu_slot)
+                                .filter(|item| {
+                                    !item.is_empty() && item.kind().to_string() == item_id
+                                })
+                                .map(|_| hotbar_slot as u8)
+                        });
+                if let Some(slot) = slot {
+                    client.set_selected_hotbar_slot(slot);
+                    Ok(true)
+                } else {
+                    Ok(false)
+                }
+            })
             .await
-            .clone()
-            .ok_or(AppError::InventoryUnavailable)?;
-        let menu = client.menu().map_err(|_| AppError::InventoryUnavailable)?;
-        let slot = menu
-            .hotbar_slots_range()
-            .enumerate()
-            .find_map(|(hotbar_slot, menu_slot)| {
-                menu.slots()
-                    .get(menu_slot)
-                    .filter(|item| !item.is_empty() && item.kind().to_string() == item_id)
-                    .map(|_| hotbar_slot as u8)
-            });
-        if let Some(slot) = slot {
-            client.set_selected_hotbar_slot(slot);
-            Ok(true)
-        } else {
-            Ok(false)
-        }
     }
 
-    /// Select the highest-scoring suitable tool in the hotbar. Equal scores
-    /// keep the current selection, then prefer the lowest hotbar slot.
-    pub(crate) async fn select_best_tool_in_hotbar(
+    /// Inspect Azalea's pinned block behavior and item data components, run the
+    /// pure policy, then serialize only the selected-slot mutation.
+    pub(crate) async fn select_tool_for_block(
         &self,
         block_id: &str,
-    ) -> Result<Option<String>, AppError> {
+        policy: &crate::interaction::tool_selection::ToolSelectionPolicy,
+        protected_tools: &[String],
+        reserved_tools: &[String],
+    ) -> Result<crate::interaction::tool_selection::ToolSelection, AppError> {
         let client = self
             .current_client
             .lock()
             .await
             .clone()
             .ok_or(AppError::InventoryUnavailable)?;
+        let block_kind = block_id
+            .parse::<BlockKind>()
+            .map_err(|_| AppError::UnknownBlockIdentifier(block_id.into()))?;
+        let block_states = BlockStates::from(block_kind);
+        let block_trait = block_states
+            .set
+            .iter()
+            .next()
+            .expect("a registered block has a state")
+            .to_trait();
+        let requires_correct_tool = block_trait.behavior().requires_correct_tool_for_drops;
         let menu = client.menu().map_err(|_| AppError::InventoryUnavailable)?;
         let current = client
             .component::<Inventory>()
             .map_err(|_| AppError::InventoryUnavailable)?
             .selected_hotbar_slot;
-        let slots = menu.slots();
-        let best = menu
+        let menu_slots = menu.slots();
+        let candidates = menu
             .hotbar_slots_range()
             .enumerate()
             .filter_map(|(hotbar_slot, menu_slot)| {
-                let item = slots.get(menu_slot)?;
+                let item = menu_slots.get(menu_slot)?;
                 if item.is_empty() {
                     return None;
                 }
                 let id = item.kind().to_string();
-                let score = crate::interaction::tool_selection::score(&id, block_id);
-                (score > 0).then_some((score, hotbar_slot as u8 == current, hotbar_slot as u8, id))
+                let tool = item.get_component::<Tool>();
+                let (speed, correct) =
+                    tool.as_ref().map_or((1.0, !requires_correct_tool), |tool| {
+                        let rule = tool
+                            .rules
+                            .iter()
+                            .find(|rule| rule.blocks.contains(block_kind));
+                        (
+                            rule.and_then(|rule| rule.speed)
+                                .unwrap_or(tool.default_mining_speed),
+                            rule.and_then(|rule| rule.correct_for_drops)
+                                .unwrap_or(!requires_correct_tool),
+                        )
+                    });
+                let remaining = item.get_component::<MaxDamage>().map(|maximum| {
+                    let damage = item
+                        .get_component::<Damage>()
+                        .map_or(0, |damage| damage.amount);
+                    maximum.amount.saturating_sub(damage).max(0) as u32
+                });
+                let efficiency = item
+                    .get_component::<Enchantments>()
+                    .and_then(|enchantments| {
+                        enchantments.levels.iter().find_map(|(kind, level)| {
+                            format!("{kind:?}")
+                                .to_ascii_lowercase()
+                                .contains("efficiency")
+                                .then_some((*level).max(0) as u32)
+                        })
+                    });
+                Some(crate::interaction::tool_selection::ToolCandidate {
+                    hotbar_slot: hotbar_slot as u8,
+                    item_id: id.clone(),
+                    category: crate::interaction::tool_selection::category(&id),
+                    tier: crate::interaction::tool_selection::tier(&id),
+                    correct_for_drops: correct,
+                    mining_speed: speed,
+                    remaining_durability: remaining,
+                    efficiency_level: efficiency,
+                    protected: protected_tools.contains(&id),
+                    reserved: reserved_tools.contains(&id),
+                    held: hotbar_slot as u8 == current,
+                })
             })
-            .max_by(|a, b| {
-                a.0.cmp(&b.0)
-                    .then(a.1.cmp(&b.1))
-                    .then_with(|| b.2.cmp(&a.2))
-            });
-        if let Some((_, _, slot, id)) = best {
-            if slot != current {
-                client.set_selected_hotbar_slot(slot);
-            }
-            Ok(Some(id))
-        } else {
-            Ok(None)
+            .collect::<Vec<_>>();
+        drop(menu);
+        let selection = crate::interaction::tool_selection::select_tool(
+            &crate::interaction::tool_selection::BlockKnowledge {
+                block_id: block_id.into(),
+                preferred_category: crate::interaction::tool_selection::preferred_category(
+                    block_id,
+                ),
+                requires_correct_tool,
+            },
+            &candidates,
+            policy,
+        )
+        .map_err(|outcome| AppError::NoSuitableTool {
+            block_id: outcome.block_id,
+            explanation: outcome.explanation,
+        })?;
+        if selection.hotbar_slot != current {
+            let slot = selection.hotbar_slot;
+            self.inventory_actions
+                .mutate(|| async {
+                    client.set_selected_hotbar_slot(slot);
+                    Ok(())
+                })
+                .await?;
         }
+        Ok(selection)
     }
 
     pub async fn set_movement_snapshot(&self, movement: MovementSnapshot) {
@@ -1143,10 +1382,11 @@ async fn refresh_ecs_state(
         Option<&Dead>,
         Option<&Health>,
         Option<&WorldName>,
+        Option<&ItemItem>,
     )>();
     let mut updates = Vec::new();
     let mut existing_ids = HashSet::new();
-    for (entity, minecraft_id, uuid, kind, position, dead, health, _dimension) in
+    for (entity, minecraft_id, uuid, kind, position, dead, health, _dimension, item) in
         entities.iter(&ecs)
     {
         if Some(entity) == bot_entity {
@@ -1171,6 +1411,12 @@ async fn refresh_ecs_state(
             alive: Some(true),
             health: health.map(|health| health.0),
             custom_name: None,
+            item: item.and_then(|item| item.0.as_present()).map(|stack| {
+                crate::minecraft::world_state::DroppedItemSnapshot {
+                    item_id: stack.kind.to_string(),
+                    count: stack.count.max(0) as u32,
+                }
+            }),
             last_seen: SystemTime::now(),
         });
     }

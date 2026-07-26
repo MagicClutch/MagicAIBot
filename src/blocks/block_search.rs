@@ -115,7 +115,15 @@ pub fn sort_deduplicate_limit(
     mut results: Vec<BlockSnapshot>,
     maximum_results: usize,
 ) -> Vec<BlockSnapshot> {
-    results.sort_by(|left, right| left.distance.total_cmp(&right.distance));
+    // Distance alone is not a total ordering.  A stable coordinate tie-break is
+    // important to callers which retry a search (notably bounded mining): the
+    // same loaded-world snapshot must produce the same target sequence.
+    results.sort_by(|left, right| {
+        left.distance.total_cmp(&right.distance).then_with(|| {
+            (left.position.x, left.position.y, left.position.z)
+                .cmp(&(right.position.x, right.position.y, right.position.z))
+        })
+    });
     results.dedup_by_key(|result| result.position);
     results.truncate(maximum_results);
     results
