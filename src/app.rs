@@ -256,7 +256,6 @@ impl App {
                     self.print_craft_check(&item, count, depth).await
                 }
                 ConsoleCommand::Entities { radius } => self.print_entities(radius).await,
-                ConsoleCommand::Drops { radius } => self.print_drops(radius).await,
                 ConsoleCommand::Goto { x, y, z } => {
                     self.interaction
                         .cancel(&self.minecraft, &self.movement, &self.look)

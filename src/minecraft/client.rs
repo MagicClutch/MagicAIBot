@@ -24,7 +24,6 @@ use azalea::{
         dimensions::EntityDimensions,
         inventory::Inventory,
         metadata::{Health, Item, ItemItem},
-        metadata::{Health, ItemItem},
     },
     pathfinder::{
         PathfinderClientExt, PathfinderOpts,
