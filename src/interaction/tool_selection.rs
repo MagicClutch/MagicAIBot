@@ -67,6 +67,31 @@ pub(crate) struct NoSuitableTool {
     pub explanation: String,
 }
 
+/// Injectable boundary for the pure selection decision. Runtime code remains
+/// responsible for observing inventory and applying the selected hotbar slot.
+pub(crate) trait ToolSelectionBoundary: Send + Sync {
+    fn select(
+        &self,
+        block: &BlockKnowledge,
+        candidates: &[ToolCandidate],
+        policy: &ToolSelectionPolicy,
+    ) -> Result<ToolSelection, NoSuitableTool>;
+}
+
+#[derive(Debug, Default)]
+pub(crate) struct DeterministicToolSelector;
+
+impl ToolSelectionBoundary for DeterministicToolSelector {
+    fn select(
+        &self,
+        block: &BlockKnowledge,
+        candidates: &[ToolCandidate],
+        policy: &ToolSelectionPolicy,
+    ) -> Result<ToolSelection, NoSuitableTool> {
+        select_tool(block, candidates, policy)
+    }
+}
+
 /// Select without side effects. Suitability/harvest ability dominates speed,
 /// durability and enchantment tie-breaks. Protected and reserved tools are
 /// never consumed by this policy.
