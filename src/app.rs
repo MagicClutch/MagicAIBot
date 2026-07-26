@@ -26,6 +26,8 @@ use crate::{
     minecraft::client::MinecraftClient,
     movement::{MovementService, NavigationMode},
     navigation::{BlockNavigationService, navigation_state::BlockNavigationState},
+    tasks::TaskService,
+    tree_chopping::TreeChopService,
     tasks::{CancellationReason, GatherRequest, TaskId, TaskService},
 };
 use tokio::{sync::mpsc, task::JoinHandle};
@@ -43,6 +45,7 @@ pub struct App {
     interaction: InteractionController,
     mining: MiningService,
     tasks: TaskService,
+    tree_chopping: TreeChopService,
     recipes: RecipeBook,
     crafting: CraftService,
     container: ContainerService,
@@ -68,6 +71,7 @@ impl App {
             ),
         );
 
+        let tree_chopping = TreeChopService::new(config.tree_chopping.clone());
         let mining = MiningService::new(BlockSearchService::new(
             config.block_search.maximum_radius, config.block_search.maximum_result_limit,
             config.block_search.default_vertical_range));
@@ -104,6 +108,7 @@ impl App {
             ),
             mining,
             tasks: TaskService::default(),
+            tree_chopping,
             recipes: RecipeBook::fallback().map_err(AppError::RecipeData)?,
             crafting: CraftService::default(),
             container: ContainerService::default(),
@@ -175,6 +180,10 @@ impl App {
                     self.container.tick(&self.minecraft, &self.movement, &self.block_navigation, &self.look).await;
                     self.food_collector.tick(&self.minecraft, &self.movement, &self.interaction, &self.look).await;
                     self.mining.tick(&self.minecraft, &self.movement, &self.look, &self.interaction).await;
+                },
+                _ = interaction_tick.tick() => {
+                    self.interaction.tick(&self.minecraft, &self.movement, &self.look).await;
+                    self.tree_chopping.tick(&self.minecraft, &self.movement, &self.look, &self.interaction).await;
                 },
                 input = input_rx.recv() => match input {
                     Some(Ok(ConsoleInput::Empty)) => {}
@@ -786,6 +795,21 @@ impl App {
                     {
                         logging::warning(format!("Oak-log test failed: {error}"));
                     }
+                }
+                ConsoleCommand::ChopTree { request } => {
+                    self.interaction.cancel(&self.minecraft, &self.movement, &self.look).await;
+                    let result = self.tree_chopping.start(request, &self.minecraft, &self.block_search).await;
+                    println!("Tree chopping: {:?} ({} candidate trees inspected)", result.outcome, result.trees_inspected);
+                }
+                ConsoleCommand::ChopTreeStatus => {
+                    match self.tree_chopping.status() {
+                        Some(result) => println!("Tree chopping: {:?}; logs {}/{}; broken {}; unreachable {}; uncertain skipped {}", result.outcome, result.logs_collected, result.requested_logs, result.logs_broken, result.unreachable_logs, result.uncertain_structures_skipped),
+                        None => println!("No tree chopping operation has run."),
+                    }
+                }
+                ConsoleCommand::ChopTreeStop => {
+                    let result = self.tree_chopping.stop(&self.minecraft, &self.movement, &self.look, &self.interaction).await;
+                    println!("Tree chopping: {:?}", result.outcome);
                 }
                 ConsoleCommand::Reconnect => {
                     let _ = self.movement.stop(&self.minecraft).await;
