@@ -1,6 +1,7 @@
 mod ai;
 mod app;
 mod blocks;
+mod collection;
 mod config;
 mod console;
 mod crafting;

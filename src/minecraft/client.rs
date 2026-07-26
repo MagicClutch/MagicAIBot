@@ -1390,6 +1390,7 @@ async fn refresh_ecs_state(
     )>();
     let mut updates = Vec::new();
     let mut existing_ids = HashSet::new();
+    for (entity, minecraft_id, uuid, kind, position, dead, health, dimension, item) in
     for (entity, minecraft_id, uuid, kind, position, dead, health, _dimension, item) in
         entities.iter(&ecs)
     {
@@ -1406,6 +1407,9 @@ async fn refresh_ecs_state(
             entity_id,
             uuid: Some(**uuid),
             entity_type: kind.0.to_string(),
+            item_id: item.and_then(|item| (!item.is_empty()).then(|| item.kind().to_string())),
+            item_count: item.map_or(0, |item| item.count().max(0) as u32),
+            dimension: dimension.map(ToString::to_string),
             position: crate::minecraft::world_state::PositionSnapshot {
                 x: v.x,
                 y: v.y,
@@ -1543,6 +1547,7 @@ fn inventory_from_component(inventory: &Option<&Inventory>) -> Option<InventoryS
         .collect();
     Some(InventorySnapshot {
         available: true,
+        revision: 0,
         slots,
         selected_hotbar_slot: Some(inventory.selected_hotbar_slot),
         total_counts: Default::default(),
