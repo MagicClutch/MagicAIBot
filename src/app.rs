@@ -282,19 +282,6 @@ impl App {
                     self.tasks.cancel(&self.minecraft).await;
                 }
                 ConsoleCommand::TaskStatus => self.print_task_status().await,
-                ConsoleCommand::Gather {
-                    resource,
-                    quantity,
-                    deposit,
-                } => {
-                    println!(
-                        "Gather request: {resource} x{quantity}{}",
-                        if deposit { " (deposit enabled)" } else { "" }
-                    );
-                    println!(
-                        "Gather not started: this build has no live Phase 2/3 crafting, storage, pickup, or smelting adapters; no world action was attempted."
-                    );
-                }
                 ConsoleCommand::GatherStatus => self.print_task_status().await,
                 ConsoleCommand::GatherCancel => {
                     self.interaction
@@ -308,6 +295,7 @@ impl App {
                     println!(
                         "Gather cancellation requested; movement and interaction stopped; confirmed partial inventory remains unchanged."
                     );
+                }
                 ConsoleCommand::TaskStatusById { id } => self.print_task_by_id(TaskId(id)),
                 ConsoleCommand::TaskCancel { id } => {
                     if let Some(id) = id {
