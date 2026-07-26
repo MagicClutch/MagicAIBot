@@ -29,24 +29,7 @@ cargo build
 cargo run
 ```
 
-The application waits for Ctrl+C and then shuts down gracefully.
-
-## Console commands
-
-With the console enabled, use `/help`, `/status`, `/chat <message>`, `/players`,
-`/reconnect`, and `/quit`. Plain terminal input is sent as Minecraft chat when
-`send_plain_input_to_chat` is enabled.
-
-Manual smoke-test sequence:
-
-```text
-/help
-/status
-/chat Hello from Magic AI Bot
-hello from plain console input
-/reconnect
-/quit
-```
+## Known Azalea limitations
 
 ## Project structure
 

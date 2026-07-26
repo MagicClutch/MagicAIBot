@@ -14,6 +14,7 @@ use crate::{
         self,
         commands::{ConsoleCommand, ConsoleInput, plain_chat_message},
     },
+    container::{model::TransferDirection, service::ContainerService},
     error::AppError,
     interaction::{InteractionController, interaction_controller::InteractionState},
     logging,
@@ -37,6 +38,7 @@ pub struct App {
     look: LookController,
     interaction: InteractionController,
     tasks: TaskService,
+    food_collector: FoodCollector,
     session_ready: bool,
     started_at: Instant,
 }
@@ -90,6 +92,7 @@ impl App {
                 block_navigation,
             ),
             tasks: TaskService::default(),
+            food_collector: FoodCollector::default(),
             session_ready: false,
             config,
             shutdown: CancellationToken::new(),
@@ -148,7 +151,10 @@ impl App {
                         self.look.tick(&self.minecraft).await;
                     }
                 },
-                _ = interaction_tick.tick() => self.interaction.tick(&self.minecraft, &self.movement, &self.look).await,
+                _ = interaction_tick.tick() => {
+                    self.interaction.tick(&self.minecraft, &self.movement, &self.look).await;
+                    self.food_collector.tick(&self.minecraft, &self.movement, &self.interaction, &self.look).await;
+                },
                 input = input_rx.recv() => match input {
                     Some(Ok(ConsoleInput::Empty)) => {}
                     Some(Ok(input)) => {
@@ -163,6 +169,7 @@ impl App {
         };
 
         self.shutdown.cancel();
+        self.tasks.shutdown();
         self.block_navigation
             .cancel(&self.minecraft, &self.movement)
             .await;
@@ -505,6 +512,65 @@ impl App {
                         .await
                 }
                 ConsoleCommand::InteractionStatus => self.print_interaction_status().await,
+                ConsoleCommand::CollectFood {
+                    item,
+                    count,
+                    food_value,
+                } => {
+                    let goal = if food_value {
+                        FoodGoal::FoodValue(count)
+                    } else {
+                        FoodGoal::Count { item, count }
+                    };
+                    match self
+                        .food_collector
+                        .start(
+                            CollectFoodRequest {
+                                goal,
+                                ..Default::default()
+                            },
+                            &self.minecraft,
+                            &self.movement,
+                            &self.block_search,
+                        )
+                        .await
+                    {
+                        Ok(()) => println!("Food collection started."),
+                        Err(result) => println!(
+                            "Food collection not started: {:?} ({})",
+                            result.outcome,
+                            result.detail.as_deref().unwrap_or("no detail")
+                        ),
+                    }
+                }
+                ConsoleCommand::CollectFoodStatus => {
+                    let status = self.food_collector.status();
+                    println!(
+                        "Food collection: {} ({})",
+                        if status.active { "active" } else { "idle" },
+                        status.phase
+                    );
+                    if let Some(result) = status.result {
+                        println!(
+                            "Last result: {:?}; count {}, food value {}, sources {}",
+                            result.outcome,
+                            result.collected_count,
+                            result.collected_food_value,
+                            result.sources_attempted
+                        );
+                    }
+                }
+                ConsoleCommand::CollectFoodStop => {
+                    self.food_collector
+                        .stop(
+                            &self.minecraft,
+                            &self.movement,
+                            &self.interaction,
+                            &self.look,
+                        )
+                        .await;
+                    println!("Food collection stopped.");
+                }
                 ConsoleCommand::TestOakLog => {
                     self.block_navigation
                         .cancel(&self.minecraft, &self.movement)
@@ -998,6 +1064,8 @@ fn fmt_opt<T: std::fmt::Display>(value: Option<T>) -> String {
 
 fn print_help() {
     println!("/help       Show available commands");
+    println!("/open-chest X Y Z | /take-item ITEM COUNT | /store-item ITEM COUNT");
+    println!("/container-status | /close-container");
     println!("/status     Show connection and application status");
     println!("/chat TEXT  Send TEXT to Minecraft chat");
     println!("/players    Show known online players");

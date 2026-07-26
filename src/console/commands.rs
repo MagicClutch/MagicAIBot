@@ -89,6 +89,21 @@ pub enum ConsoleCommand {
     StopInteraction,
     InteractionStatus,
     TestOakLog,
+    OpenChest {
+        x: i32,
+        y: i32,
+        z: i32,
+    },
+    TakeItem {
+        item_id: String,
+        count: u32,
+    },
+    StoreItem {
+        item_id: String,
+        count: u32,
+    },
+    ContainerStatus,
+    CloseContainer,
     Reconnect,
     Quit,
 }
@@ -220,6 +235,18 @@ pub fn parse_input(input: &str) -> Result<ConsoleInput, AppError> {
         "stopinteraction" => no_arguments(command, arguments, ConsoleCommand::StopInteraction)?,
         "interactionstatus" => no_arguments(command, arguments, ConsoleCommand::InteractionStatus)?,
         "testoaklog" => no_arguments(command, arguments, ConsoleCommand::TestOakLog)?,
+        "open-chest" => {
+            let p = parse_coordinates(arguments)?;
+            ConsoleCommand::OpenChest {
+                x: p.x as i32,
+                y: p.y as i32,
+                z: p.z as i32,
+            }
+        }
+        "take-item" => parse_container_transfer(arguments, true)?,
+        "store-item" => parse_container_transfer(arguments, false)?,
+        "container-status" => no_arguments(command, arguments, ConsoleCommand::ContainerStatus)?,
+        "close-container" => no_arguments(command, arguments, ConsoleCommand::CloseContainer)?,
         "reconnect" => no_arguments(command, arguments, ConsoleCommand::Reconnect)?,
         "quit" => no_arguments(command, arguments, ConsoleCommand::Quit)?,
         "chat" => {
@@ -236,6 +263,108 @@ pub fn parse_input(input: &str) -> Result<ConsoleInput, AppError> {
     };
 
     Ok(ConsoleInput::Command(parsed))
+}
+
+fn parse_collect_food(arguments: &str) -> Result<ConsoleCommand, AppError> {
+    let parts: Vec<_> = arguments.split_whitespace().collect();
+    let parsed = match parts.as_slice() {
+        [] => ConsoleCommand::CollectFood {
+            item: None,
+            count: 1,
+            food_value: false,
+        },
+        ["status"] => ConsoleCommand::CollectFoodStatus,
+        ["stop"] => ConsoleCommand::CollectFoodStop,
+        ["value", value] => ConsoleCommand::CollectFood {
+            item: None,
+            count: value.parse().map_err(|_| {
+                AppError::InvalidConsoleSyntax("/collect-food value <positive points>".into())
+            })?,
+            food_value: true,
+        },
+        [item, count] => ConsoleCommand::CollectFood {
+            item: Some(normalize_item_id(item)?),
+            count: count.parse().map_err(|_| {
+                AppError::InvalidConsoleSyntax("/collect-food <item> <positive count>".into())
+            })?,
+            food_value: false,
+        },
+        _ => {
+            return Err(AppError::InvalidConsoleSyntax(
+                "/collect-food [<item> <count>|value <points>]".into(),
+            ));
+        }
+    };
+    if matches!(parsed, ConsoleCommand::CollectFood { count: 0, .. }) {
+        return Err(AppError::InvalidConsoleSyntax(
+            "collection target must be positive".into(),
+        ));
+    }
+    Ok(parsed)
+}
+
+fn normalize_item_id(input: &str) -> Result<String, AppError> {
+    let id = if input.contains(':') {
+        input.to_ascii_lowercase()
+    } else {
+        format!("minecraft:{}", input.to_ascii_lowercase())
+    };
+    if id.split_once(':').is_none_or(|(namespace, path)| {
+        namespace.is_empty()
+            || path.is_empty()
+            || !namespace.chars().all(|c| {
+                c.is_ascii_lowercase() || c.is_ascii_digit() || matches!(c, '_' | '-' | '.')
+            })
+            || !path.chars().all(|c| {
+                c.is_ascii_lowercase() || c.is_ascii_digit() || matches!(c, '_' | '-' | '.' | '/')
+            })
+    }) {
+        return Err(AppError::InvalidConsoleSyntax(
+            "invalid item identifier".into(),
+        ));
+    }
+    Ok(id)
+fn parse_task(arguments: &str) -> Result<ConsoleCommand, AppError> {
+    let parts: Vec<_> = arguments.split_whitespace().collect();
+    match parts.as_slice() {
+        ["status", id] => Ok(ConsoleCommand::TaskStatusById {
+            id: id
+                .parse()
+                .map_err(|_| AppError::InvalidConsoleSyntax("/task status <id>".into()))?,
+        }),
+        ["cancel", "all"] => Ok(ConsoleCommand::TaskCancel { id: None }),
+        ["cancel", id] => Ok(ConsoleCommand::TaskCancel {
+            id: Some(
+                id.parse()
+                    .map_err(|_| AppError::InvalidConsoleSyntax("/task cancel <id|all>".into()))?,
+            ),
+        }),
+        ["recent"] | ["history"] => Ok(ConsoleCommand::TaskRecent),
+        _ => Err(AppError::InvalidConsoleSyntax(
+            "/task status <id> | /task cancel <id|all> | /task recent".into(),
+        )),
+    }
+}
+
+fn parse_gather(arguments: &str) -> Result<ConsoleCommand, AppError> {
+    let parts: Vec<_> = arguments.split_whitespace().collect();
+    let [target, quantity] = parts.as_slice() else {
+        return Err(AppError::InvalidConsoleSyntax(
+            "/gather <item|logs|stone|ores|food> <quantity>".into(),
+        ));
+    };
+    let quantity = quantity.parse().map_err(|_| {
+        AppError::InvalidConsoleSyntax("gather quantity must be a positive integer".into())
+    })?;
+    if quantity == 0 {
+        return Err(AppError::InvalidConsoleSyntax(
+            "gather quantity must be positive".into(),
+        ));
+    }
+    Ok(ConsoleCommand::Gather {
+        target: target.to_ascii_lowercase(),
+        quantity,
+    })
 }
 
 fn parse_place(arguments: &str) -> Result<ConsoleCommand, AppError> {
@@ -611,5 +740,53 @@ mod tests {
             parse_input("/testoaklog").unwrap(),
             ConsoleInput::Command(ConsoleCommand::TestOakLog)
         );
+    }
+
+    #[test]
+    fn parses_food_collection_and_controls() {
+        assert_eq!(
+            parse_input("/collect-food carrot 4").unwrap(),
+            ConsoleInput::Command(ConsoleCommand::CollectFood {
+                item: Some("minecraft:carrot".into()),
+                count: 4,
+                food_value: false
+            })
+        );
+        assert_eq!(
+            parse_input("/collect-food value 12").unwrap(),
+            ConsoleInput::Command(ConsoleCommand::CollectFood {
+                item: None,
+                count: 12,
+                food_value: true
+            })
+        );
+        assert_eq!(
+            parse_input("/collect-food status").unwrap(),
+            ConsoleInput::Command(ConsoleCommand::CollectFoodStatus)
+        );
+        assert_eq!(
+            parse_input("/collect-food stop").unwrap(),
+            ConsoleInput::Command(ConsoleCommand::CollectFoodStop)
+        );
+        assert!(parse_input("/collect-food carrot 0").is_err());
+    fn parses_gather_lifecycle_commands() {
+        assert_eq!(
+            parse_input("/gather logs 12 deposit").unwrap(),
+            ConsoleInput::Command(ConsoleCommand::Gather {
+                resource: "minecraft:oak_log".into(),
+                quantity: 12,
+                deposit: true
+            })
+        );
+        assert_eq!(
+            parse_input("/gatherstatus").unwrap(),
+            ConsoleInput::Command(ConsoleCommand::GatherStatus)
+        );
+        assert_eq!(
+            parse_input("/gathercancel").unwrap(),
+            ConsoleInput::Command(ConsoleCommand::GatherCancel)
+        );
+        assert!(parse_input("/gather beef 2").is_err());
+        assert!(parse_input("/gather stone 0").is_err());
     }
 }
