@@ -25,7 +25,6 @@ use azalea::{
         dimensions::EntityDimensions,
         inventory::Inventory,
         metadata::{Health, Item, ItemItem},
-        metadata::{Health, ItemItem},
     },
     pathfinder::{
         PathfinderClientExt, PathfinderOpts,
@@ -38,11 +37,12 @@ use azalea::{
 use azalea_inventory::item::MaxStackSizeExt;
 use azalea_inventory::operations::{
     ClickOperation, PickupClick, QuickMoveClick, SwapClick, ThrowClick,
+};
 use azalea_inventory::{
     ItemStack,
     components::{CustomName, Damage, Enchantments, ItemName, MaxDamage, MaxStackSize},
 };
-use azalea_inventory::components::{Damage, Enchantments, MaxDamage, Tool};
+use azalea_inventory::components::Tool;
 use tokio::{
     sync::{Mutex, watch},
     task::JoinHandle,
@@ -94,6 +94,14 @@ pub(crate) enum RaycastFace {
     South,
     West,
     East,
+}
+
+/// Token proving that this application intentionally started a mining action.
+/// Requiring it to stop mining prevents unrelated Azalea mining activity from
+/// being cancelled by interaction cleanup.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct BlockBreaking {
+    position: BlockPosition,
 }
 
 const CONNECTION_TIMEOUT: Duration = Duration::from_secs(30);
@@ -675,7 +683,10 @@ impl MinecraftClient {
         })
     }
 
-    pub(crate) async fn begin_breaking(&self, position: BlockPosition) -> Result<(), AppError> {
+    pub(crate) async fn begin_breaking(
+        &self,
+        position: BlockPosition,
+    ) -> Result<BlockBreaking, AppError> {
         let client = self
             .current_client
             .lock()
@@ -683,14 +694,15 @@ impl MinecraftClient {
             .clone()
             .ok_or(AppError::MovementUnavailable)?;
         client.start_mining(azalea::BlockPos::new(position.x, position.y, position.z));
-        Ok(())
+        Ok(BlockBreaking { position })
     }
 
-    pub(crate) async fn stop_breaking(&self) {
+    pub(crate) async fn stop_breaking(&self, breaking: BlockBreaking) {
         let Some(client) = self.current_client.lock().await.clone() else {
             return;
         };
         if client.is_mining() {
+            debug!(position = ?breaking.position, "stopping intentional block break");
             client
                 .ecs
                 .write()
@@ -872,6 +884,7 @@ impl MinecraftClient {
         policy: &crate::interaction::tool_selection::ToolSelectionPolicy,
         protected_tools: &[String],
         reserved_tools: &[String],
+        selector: &dyn crate::interaction::tool_selection::ToolSelectionBoundary,
     ) -> Result<crate::interaction::tool_selection::ToolSelection, AppError> {
         let client = self
             .current_client
@@ -951,7 +964,7 @@ impl MinecraftClient {
             })
             .collect::<Vec<_>>();
         drop(menu);
-        let selection = crate::interaction::tool_selection::select_tool(
+        let selection = selector.select(
             &crate::interaction::tool_selection::BlockKnowledge {
                 block_id: block_id.into(),
                 preferred_category: crate::interaction::tool_selection::preferred_category(
