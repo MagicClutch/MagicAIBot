@@ -78,19 +78,98 @@ pub struct BotSnapshot {
     pub last_position_update: Option<SystemTime>,
 }
 
+/// Stable application regions. These do not change when another menu is open.
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub enum InventoryRegion {
+    CraftResult,
+    Crafting,
+    Armor,
+    Main,
+    Hotbar,
+    Offhand,
+}
+
+/// Stable player-inventory slot ID. Its numeric value is deliberately the
+/// vanilla/Azalea `Menu::Player` slot: result 0, craft 1..=4, armor 5..=8
+/// (head to feet), main 9..=35, hotbar 36..=44, and offhand 45.
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub struct InventorySlotId(pub u8);
+impl InventorySlotId {
+    pub const SLOT_COUNT: usize = 46;
+    pub const STORAGE_CAPACITY: usize = 36;
+    pub fn new(value: usize) -> Option<Self> {
+        (value < Self::SLOT_COUNT).then_some(Self(value as u8))
+    }
+    pub fn region(self) -> InventoryRegion {
+        match self.0 {
+            0 => InventoryRegion::CraftResult,
+            1..=4 => InventoryRegion::Crafting,
+            5..=8 => InventoryRegion::Armor,
+            9..=35 => InventoryRegion::Main,
+            36..=44 => InventoryRegion::Hotbar,
+            45 => InventoryRegion::Offhand,
+            _ => unreachable!("validated inventory slot ID"),
+        }
+    }
+    pub fn hotbar(index: u8) -> Option<Self> {
+        (index < 9).then_some(Self(36 + index))
+    }
+    pub fn is_storage(self) -> bool {
+        matches!(
+            self.region(),
+            InventoryRegion::Main | InventoryRegion::Hotbar
+        )
+    }
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct ItemMetadata {
+    /// Effective values include Azalea's item defaults, not only server patches.
+    pub custom_name: Option<String>,
+    pub item_name: Option<String>,
+    pub damage: Option<u32>,
+    pub maximum_durability: Option<u32>,
+    pub remaining_durability: Option<u32>,
+    pub enchantments: Vec<(String, u32)>,
+    /// JSON representation of the server-provided component patch. Azalea does
+    /// not expose a lossless, stable application-level component iterator.
+    pub component_patch: Option<String>,
+    /// Kind + component patch identity; count is intentionally excluded.
+    pub stack_identity: Option<String>,
+    pub maximum_stack_size: u32,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct InventorySlot {
-    pub slot: usize,
+    pub id: InventorySlotId,
+    /// Verified Azalea `Menu::Player` index retained for diagnostics.
+    pub azalea_menu_slot: usize,
+    pub region: InventoryRegion,
     pub item_id: Option<String>,
     pub display_name: Option<String>,
     pub count: u32,
+    pub metadata: ItemMetadata,
+}
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum InventorySyncState {
+    #[default]
+    Unavailable,
+    Synchronized,
 }
 #[derive(Clone, Debug, Default)]
 pub struct InventorySnapshot {
     pub available: bool,
+    pub sync_state: InventorySyncState,
+    pub revision: u64,
+    pub server_state_id: Option<u32>,
     pub slots: Vec<InventorySlot>,
     pub selected_hotbar_slot: Option<u8>,
+    pub selected_slot: Option<InventorySlotId>,
+    pub held_item: Option<InventorySlot>,
     pub total_counts: HashMap<String, u32>,
+    pub used_storage_slots: usize,
+    pub storage_capacity: usize,
+    pub empty_storage_slots: usize,
 }
 impl InventorySnapshot {
     pub fn count_item(&self, id: &str) -> u32 {
@@ -106,8 +185,8 @@ impl InventorySnapshot {
             .collect()
     }
     pub fn selected_item(&self) -> Option<&InventorySlot> {
-        self.selected_hotbar_slot
-            .map(|slot| self.slots.iter().find(|s| s.slot == usize::from(slot)))?
+        self.selected_slot
+            .and_then(|id| self.slots.iter().find(|s| s.id == id))
     }
     fn rebuild_counts(&mut self) {
         self.total_counts.clear();
@@ -116,6 +195,20 @@ impl InventorySnapshot {
                 *self.total_counts.entry(id.clone()).or_default() += slot.count;
             }
         }
+        self.selected_slot = self.selected_hotbar_slot.and_then(InventorySlotId::hotbar);
+        self.held_item = self
+            .selected_item()
+            .filter(|slot| slot.item_id.is_some())
+            .cloned();
+        self.storage_capacity = InventorySlotId::STORAGE_CAPACITY;
+        self.used_storage_slots = self
+            .slots
+            .iter()
+            .filter(|s| s.id.is_storage() && s.item_id.is_some())
+            .count();
+        self.empty_storage_slots = self
+            .storage_capacity
+            .saturating_sub(self.used_storage_slots);
     }
 }
 
@@ -315,13 +408,18 @@ impl WorldState {
         self.touch();
     }
     pub fn update_inventory(&mut self, mut inventory: InventorySnapshot) {
-        inventory.slots.sort_by_key(|s| s.slot);
+        inventory.slots.sort_by_key(|s| s.id);
+        inventory.revision = self.inventory.revision.saturating_add(1);
         inventory.rebuild_counts();
         self.inventory = inventory;
         self.touch();
     }
     pub fn clear_inventory(&mut self) {
-        self.inventory = InventorySnapshot::default();
+        let revision = self.inventory.revision.saturating_add(1);
+        self.inventory = InventorySnapshot {
+            revision,
+            ..Default::default()
+        };
         self.touch();
     }
     /// Drop observations that belong to a disconnected Azalea session.
@@ -329,7 +427,11 @@ impl WorldState {
         self.bot = BotSnapshot::default();
         self.players.clear();
         self.entities.clear();
-        self.inventory = InventorySnapshot::default();
+        let revision = self.inventory.revision.saturating_add(1);
+        self.inventory = InventorySnapshot {
+            revision,
+            ..Default::default()
+        };
         self.movement = MovementSnapshot::default();
         self.current_task = None;
         self.touch();
@@ -597,24 +699,73 @@ mod tests {
             selected_hotbar_slot: Some(1),
             slots: vec![
                 InventorySlot {
-                    slot: 1,
+                    id: InventorySlotId(37),
+                    azalea_menu_slot: 37,
+                    region: InventoryRegion::Hotbar,
                     item_id: Some("minecraft:stone".into()),
                     display_name: None,
                     count: 3,
+                    metadata: ItemMetadata::default(),
                 },
                 InventorySlot {
-                    slot: 4,
+                    id: InventorySlotId(9),
+                    azalea_menu_slot: 9,
+                    region: InventoryRegion::Main,
                     item_id: Some("minecraft:stone".into()),
                     display_name: None,
                     count: 7,
+                    metadata: ItemMetadata::default(),
                 },
             ],
-            total_counts: Default::default(),
+            ..Default::default()
         });
         assert_eq!(state.inventory.count_item("minecraft:stone"), 10);
         assert!(state.inventory.has_item("minecraft:stone", 10));
         assert_eq!(state.inventory.find_slots("minecraft:stone").len(), 2);
         assert_eq!(state.inventory.selected_item().unwrap().count, 3);
+        assert_eq!(state.inventory.selected_slot, Some(InventorySlotId(37)));
+        assert_eq!(state.inventory.used_storage_slots, 2);
+        assert_eq!(state.inventory.empty_storage_slots, 34);
+    }
+    #[test]
+    fn player_slot_mapping_covers_every_region_and_fixes_hotbar_offset() {
+        assert_eq!(
+            InventorySlotId::new(0).unwrap().region(),
+            InventoryRegion::CraftResult
+        );
+        assert_eq!(
+            InventorySlotId::new(1).unwrap().region(),
+            InventoryRegion::Crafting
+        );
+        assert_eq!(
+            InventorySlotId::new(5).unwrap().region(),
+            InventoryRegion::Armor
+        );
+        assert_eq!(
+            InventorySlotId::new(9).unwrap().region(),
+            InventoryRegion::Main
+        );
+        assert_eq!(InventorySlotId::hotbar(0), Some(InventorySlotId(36)));
+        assert_eq!(InventorySlotId::hotbar(8), Some(InventorySlotId(44)));
+        assert_eq!(
+            InventorySlotId::new(45).unwrap().region(),
+            InventoryRegion::Offhand
+        );
+        assert_eq!(InventorySlotId::hotbar(9), None);
+        assert_eq!(InventorySlotId::new(46), None);
+    }
+    #[test]
+    fn inventory_revisions_and_disconnect_invalidation_are_monotonic() {
+        let mut state = WorldState::default();
+        state.update_inventory(InventorySnapshot {
+            available: true,
+            ..Default::default()
+        });
+        assert_eq!(state.inventory.revision, 1);
+        state.clear_session_state();
+        assert_eq!(state.inventory.revision, 2);
+        assert!(!state.inventory.available);
+        assert_eq!(state.inventory.sync_state, InventorySyncState::Unavailable);
     }
     #[test]
     fn empty_inventory_is_supported() {
