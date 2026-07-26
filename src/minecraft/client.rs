@@ -27,7 +27,7 @@ use azalea::{
     },
     pathfinder::{
         PathfinderClientExt, PathfinderOpts,
-        goals::{BlockPosGoal, RadiusGoal},
+        goals::RadiusGoal,
     },
     player::GameProfileComponent,
     registry::builtin::BlockKind,
@@ -994,25 +994,29 @@ impl MinecraftClient {
             .await
             .clone()
             .ok_or(AppError::MovementUnavailable)?;
-        if let Some(distance) = follow_distance {
-            client.start_goto_with_opts(
-                RadiusGoal::new(
-                    azalea::Vec3::new(destination.x, destination.y, destination.z),
-                    distance as f32,
-                ),
-                PathfinderOpts::new()
-                    .allow_mining(mode.allows_mining())
-                    .retry_on_no_path(true),
-            );
-        } else {
-            let block = destination.block();
-            client.start_goto_with_opts(
-                BlockPosGoal(azalea::BlockPos::new(block.x, block.y, block.z)),
-                PathfinderOpts::new()
-                    .allow_mining(mode.allows_mining())
-                    .retry_on_no_path(true),
-            );
-        }
+        // Use the same radius-based goal for direct movement, following, and
+        // task-owned navigation. BlockPosGoal can report the target as reached
+        // before Azalea begins executing when the requested Y coordinate is a
+        // fractional/player-position boundary; RadiusGoal keeps one reliable
+        // movement contract for every caller.
+        let radius = follow_distance.unwrap_or(0.75) as f32;
+        client.start_goto_with_opts(
+            RadiusGoal::new(
+                azalea::Vec3::new(destination.x, destination.y, destination.z),
+                radius,
+            ),
+            PathfinderOpts::new()
+                .allow_mining(mode.allows_mining())
+                .retry_on_no_path(true),
+        );
+        logging::info(format!(
+            "Pathfinding goal submitted at ({:.1}, {:.1}, {:.1}), radius {:.2}, mining={}",
+            destination.x,
+            destination.y,
+            destination.z,
+            radius,
+            mode.allows_mining()
+        ));
         Ok(())
     }
 
