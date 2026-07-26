@@ -15,6 +15,14 @@ pub enum ConsoleCommand {
     },
     Players,
     Inventory,
+    FurnaceStatus,
+    SmeltCheck {
+        output: String,
+        count: u32,
+    },
+    FuelInfo {
+        item: String,
+    },
     Entities {
         radius: Option<u32>,
     },
@@ -129,6 +137,31 @@ pub fn parse_input(input: &str) -> Result<ConsoleInput, AppError> {
         "status" => no_arguments(command, arguments, ConsoleCommand::Status)?,
         "players" => no_arguments(command, arguments, ConsoleCommand::Players)?,
         "inventory" => no_arguments(command, arguments, ConsoleCommand::Inventory)?,
+        "furnace-status" => no_arguments(command, arguments, ConsoleCommand::FurnaceStatus)?,
+        "smelt-check" => {
+            let mut parts = arguments.split_whitespace();
+            let output = minecraft_id(parts.next().ok_or_else(|| {
+                AppError::MissingConsoleArgument("/smelt-check <output> <count>".into())
+            })?);
+            let count = parts
+                .next()
+                .ok_or_else(|| {
+                    AppError::MissingConsoleArgument("/smelt-check <output> <count>".into())
+                })?
+                .parse()
+                .map_err(|_| {
+                    AppError::InvalidConsoleSyntax("count must be a positive integer".into())
+                })?;
+            if count == 0 || parts.next().is_some() {
+                return Err(AppError::InvalidConsoleSyntax(
+                    "/smelt-check <output> <count>".into(),
+                ));
+            }
+            ConsoleCommand::SmeltCheck { output, count }
+        }
+        "fuel-info" => ConsoleCommand::FuelInfo {
+            item: minecraft_id(single_argument(command, arguments, "/fuel-info <item>")?),
+        },
         "entities" => {
             let radius = if arguments.is_empty() {
                 None
@@ -236,6 +269,15 @@ pub fn parse_input(input: &str) -> Result<ConsoleInput, AppError> {
     };
 
     Ok(ConsoleInput::Command(parsed))
+}
+
+fn minecraft_id(value: &str) -> String {
+    let value = value.to_ascii_lowercase();
+    if value.contains(':') {
+        value
+    } else {
+        format!("minecraft:{value}")
+    }
 }
 
 fn parse_place(arguments: &str) -> Result<ConsoleCommand, AppError> {
@@ -441,6 +483,28 @@ mod tests {
                 message: "hello".to_owned()
             })
         );
+    }
+
+    #[test]
+    fn parses_processing_debug_commands() {
+        assert_eq!(
+            parse_input("/furnace-status").unwrap(),
+            ConsoleInput::Command(ConsoleCommand::FurnaceStatus)
+        );
+        assert_eq!(
+            parse_input("/smelt-check iron_ingot 3").unwrap(),
+            ConsoleInput::Command(ConsoleCommand::SmeltCheck {
+                output: "minecraft:iron_ingot".into(),
+                count: 3
+            })
+        );
+        assert_eq!(
+            parse_input("/fuel-info coal").unwrap(),
+            ConsoleInput::Command(ConsoleCommand::FuelInfo {
+                item: "minecraft:coal".into()
+            })
+        );
+        assert!(parse_input("/smelt-check iron_ingot 0").is_err());
     }
 
     #[test]

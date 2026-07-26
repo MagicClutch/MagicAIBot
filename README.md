@@ -63,3 +63,35 @@ src/
 ├── tasks/        # Future task orchestration
 └── ai/           # Future AI decision-making
 ```
+
+## Processing-station knowledge (Task 13 handoff)
+
+The processing module is observational and pure: it accepts immutable inventory,
+menu-slot, and menu-property snapshots and never opens, loads, waits on, collects
+from, places, or obtains a station. Its extensible station identity covers furnace,
+blast furnace, and smoker, while the bundled recipe catalog intentionally enables
+standard-furnace calculations first.
+
+**Pinned data/API decisions:** the lockfile pins Azalea commit
+`6249c295d353b9b3ef68f665b311cba39211fd19`. At that revision,
+`azalea-inventory::Menu` defines furnace, blast-furnace, and smoker as ingredient,
+fuel, and result slots; `ClientboundContainerSetData` exposes property id/value;
+the cooking-recipe display exposes ingredient, fuel, result, station, duration,
+and experience; and `ClientboundUpdateRecipes` does not expose the complete
+server cooking recipe set. Therefore third-party types remain at an adapter
+boundary, menu property values may be absent, and the versioned standard-furnace
+fallback catalog is deliberately small rather than pretending to be complete.
+Fuel burn values are explicit pinned vanilla fallback data, not inferred from item
+tags. Server/datapack recipe and fuel adapters can replace the catalog by revision.
+
+Debug commands are `/furnace-status`, `/smelt-check <output> <count>`, and
+`/fuel-info <item>`. The status command reports only an already-observed snapshot
+and deliberately performs no station discovery or interaction.
+
+**Limitations and Task 14 readiness:** live container identity/revision/property
+capture is not yet wired because the pinned Azalea client leaves container-set-data
+handling as a TODO. Blast-furnace and smoker types are modeled but their catalogs
+are deferred. Task 14 may consume `ProcessingStationSnapshot`, `CookingRecipe`,
+`Fuel`, and `ProcessingRequirements`; execution must separately add authoritative
+snapshot capture and serialized inventory ownership, without adding side effects to
+this knowledge module.
