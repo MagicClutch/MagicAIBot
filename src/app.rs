@@ -27,6 +27,7 @@ use crate::{
     minecraft::client::MinecraftClient,
     movement::{MovementService, NavigationMode},
     navigation::{BlockNavigationService, navigation_state::BlockNavigationState},
+    processing::{ProcessingKnowledge, StationKind},
     tasks::TaskService,
     tree_chopping::TreeChopService,
     tasks::{CancellationReason, GatherRequest, TaskId, TaskService},
@@ -283,6 +284,13 @@ impl App {
                         }
                 ConsoleCommand::Players => self.print_players().await,
                 ConsoleCommand::Inventory => self.print_inventory().await,
+                ConsoleCommand::FurnaceStatus => println!(
+                    "No processing-station snapshot is currently observed. Open/load/acquire operations are intentionally not performed."
+                ),
+                ConsoleCommand::SmeltCheck { output, count } => {
+                    self.print_smelt_check(&output, count).await
+                }
+                ConsoleCommand::FuelInfo { item } => print_fuel_info(&item),
                 ConsoleCommand::ContainerStatus => self.print_container_status().await,
                 ConsoleCommand::Recipe { id } => self.print_recipe(&id),
                 ConsoleCommand::CraftCheck { item, count, depth } => {
@@ -1383,6 +1391,33 @@ impl App {
         }
     }
 
+    async fn print_smelt_check(&self, output: &str, count: u32) {
+        let knowledge = ProcessingKnowledge::vanilla_furnace();
+        let world = self.minecraft.world_state_snapshot().await;
+        let Some(recipe) = knowledge.recipes_for_output(output).into_iter().next() else {
+            println!(
+                "No standard-furnace recipe data for {output} (catalog revision {}).",
+                knowledge.revision
+            );
+            return;
+        };
+        match knowledge.requirements(recipe, StationKind::Furnace, count, &world.inventory) {
+            Ok(r) => println!(
+                "Recipe: {} | operations: {} | output: {} | input available/missing: {}/{} | burn required/missing: {}/{} ticks | fuel: {} | time: {} ticks",
+                recipe.id,
+                r.operations,
+                r.expected_output,
+                r.available_input,
+                r.missing_input,
+                r.required_burn_ticks,
+                r.missing_burn_ticks,
+                r.fuel.map_or_else(
+                    || "none sufficient".into(),
+                    |f| format!("{} x{} ({} waste ticks)", f.item_id, f.items, f.waste_ticks)
+                ),
+                r.cooking_ticks
+            ),
+            Err(error) => println!("Smelt check unavailable: {error}"),
     fn print_recipe(&self, id: &str) {
         match self.recipes.recipe(id) {
             Ok(recipe) => {
@@ -1745,6 +1780,9 @@ fn print_help() {
     println!("/chat TEXT  Send TEXT to Minecraft chat");
     println!("/players    Show known online players");
     println!("/inventory  Show inventory summary");
+    println!("/furnace-status  Show the currently observed station snapshot only");
+    println!("/smelt-check OUTPUT COUNT  Calculate read-only furnace requirements");
+    println!("/fuel-info ITEM  Show pinned standard-furnace fuel data");
     println!("/containerstatus  Show read-only active-container debug state");
     println!("/recipe ID  Show a versioned read-only recipe");
     println!("/craft-check ITEM [COUNT] [DEPTH]  Plan with a virtual inventory");
@@ -1798,6 +1836,23 @@ fn print_help() {
     println!("/testoaklog  Break and restore the nearest oak log");
     println!("/reconnect  Reconnect to the configured server");
     println!("/quit       Shut down the application");
+}
+
+fn print_fuel_info(item: &str) {
+    let knowledge = ProcessingKnowledge::vanilla_furnace();
+    match knowledge.fuel(item) {
+        Some(fuel) => println!(
+            "Fuel: {} | burn: {} ticks | standard operations: {:.2} | preference: {} | protected: {} | emergency-only: {} | remainder: {}",
+            fuel.item_id,
+            fuel.burn_ticks,
+            fuel.standard_operations(),
+            fuel.preference,
+            fuel.protected,
+            fuel.emergency_only,
+            fuel.remainder.as_deref().unwrap_or("none")
+        ),
+        None => println!("No pinned fuel data for {item}."),
+    }
 }
 
 async fn await_console_task(task: JoinHandle<()>) {
