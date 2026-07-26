@@ -32,6 +32,24 @@ pub enum ConsoleCommand {
     Stop,
     StopAll,
     TaskStatus,
+    Gather {
+        resource: String,
+        quantity: u32,
+        deposit: bool,
+    },
+    GatherStatus,
+    GatherCancel,
+    TaskStatusById {
+        id: u64,
+    },
+    TaskCancel {
+        id: Option<u64>,
+    },
+    TaskRecent,
+    Gather {
+        target: String,
+        quantity: u32,
+    },
     Follow {
         player: String,
     },
@@ -88,6 +106,9 @@ pub enum ConsoleCommand {
     },
     StopInteraction,
     InteractionStatus,
+    EnsureTool {
+        block_id: String,
+    },
     TestOakLog,
     Reconnect,
     Quit,
@@ -166,6 +187,12 @@ pub fn parse_input(input: &str) -> Result<ConsoleInput, AppError> {
         "stop" | "stopmovement" => no_arguments(command, arguments, ConsoleCommand::Stop)?,
         "stopall" => no_arguments(command, arguments, ConsoleCommand::StopAll)?,
         "taskstatus" => no_arguments(command, arguments, ConsoleCommand::TaskStatus)?,
+        "gather" => parse_gather(arguments)?,
+        "gatherstatus" => no_arguments(command, arguments, ConsoleCommand::GatherStatus)?,
+        "gathercancel" => no_arguments(command, arguments, ConsoleCommand::GatherCancel)?,
+        "task" => parse_task(arguments)?,
+        "tasks" => no_arguments(command, arguments, ConsoleCommand::TaskStatus)?,
+        "gather" => parse_gather(arguments)?,
         "follow" => ConsoleCommand::Follow {
             player: parse_follow_name(arguments)?,
         },
@@ -219,6 +246,13 @@ pub fn parse_input(input: &str) -> Result<ConsoleInput, AppError> {
         "placeblock" => parse_placeblock(arguments)?,
         "stopinteraction" => no_arguments(command, arguments, ConsoleCommand::StopInteraction)?,
         "interactionstatus" => no_arguments(command, arguments, ConsoleCommand::InteractionStatus)?,
+        "ensure-tool" | "craft-tool" => ConsoleCommand::EnsureTool {
+            block_id: normalize_block_id(single_argument(
+                command,
+                arguments,
+                "/ensure-tool <block_id>",
+            )?)?,
+        },
         "testoaklog" => no_arguments(command, arguments, ConsoleCommand::TestOakLog)?,
         "reconnect" => no_arguments(command, arguments, ConsoleCommand::Reconnect)?,
         "quit" => no_arguments(command, arguments, ConsoleCommand::Quit)?,
@@ -236,6 +270,49 @@ pub fn parse_input(input: &str) -> Result<ConsoleInput, AppError> {
     };
 
     Ok(ConsoleInput::Command(parsed))
+}
+
+fn parse_task(arguments: &str) -> Result<ConsoleCommand, AppError> {
+    let parts: Vec<_> = arguments.split_whitespace().collect();
+    match parts.as_slice() {
+        ["status", id] => Ok(ConsoleCommand::TaskStatusById {
+            id: id
+                .parse()
+                .map_err(|_| AppError::InvalidConsoleSyntax("/task status <id>".into()))?,
+        }),
+        ["cancel", "all"] => Ok(ConsoleCommand::TaskCancel { id: None }),
+        ["cancel", id] => Ok(ConsoleCommand::TaskCancel {
+            id: Some(
+                id.parse()
+                    .map_err(|_| AppError::InvalidConsoleSyntax("/task cancel <id|all>".into()))?,
+            ),
+        }),
+        ["recent"] | ["history"] => Ok(ConsoleCommand::TaskRecent),
+        _ => Err(AppError::InvalidConsoleSyntax(
+            "/task status <id> | /task cancel <id|all> | /task recent".into(),
+        )),
+    }
+}
+
+fn parse_gather(arguments: &str) -> Result<ConsoleCommand, AppError> {
+    let parts: Vec<_> = arguments.split_whitespace().collect();
+    let [target, quantity] = parts.as_slice() else {
+        return Err(AppError::InvalidConsoleSyntax(
+            "/gather <item|logs|stone|ores|food> <quantity>".into(),
+        ));
+    };
+    let quantity = quantity.parse().map_err(|_| {
+        AppError::InvalidConsoleSyntax("gather quantity must be a positive integer".into())
+    })?;
+    if quantity == 0 {
+        return Err(AppError::InvalidConsoleSyntax(
+            "gather quantity must be positive".into(),
+        ));
+    }
+    Ok(ConsoleCommand::Gather {
+        target: target.to_ascii_lowercase(),
+        quantity,
+    })
 }
 
 fn parse_place(arguments: &str) -> Result<ConsoleCommand, AppError> {
@@ -257,6 +334,34 @@ fn parse_place(arguments: &str) -> Result<ConsoleCommand, AppError> {
             "/place <block_id> or /place <x> <y> <z> <block_id>".into(),
         )),
     }
+}
+
+fn parse_gather(arguments: &str) -> Result<ConsoleCommand, AppError> {
+    let parts: Vec<_> = arguments.split_whitespace().collect();
+    let (resource, quantity, deposit) = match parts.as_slice() {
+        [resource, quantity] => (*resource, *quantity, false),
+        [resource, quantity, "deposit"] => (*resource, *quantity, true),
+        _ => {
+            return Err(AppError::InvalidConsoleSyntax(
+                "/gather <resource> <quantity> [deposit]".into(),
+            ));
+        }
+    };
+    let quantity = quantity.parse::<u32>().map_err(|_| {
+        AppError::InvalidConsoleSyntax("gather quantity must be a positive integer".into())
+    })?;
+    if quantity == 0 || quantity > 4096 {
+        return Err(AppError::InvalidConsoleSyntax(
+            "gather quantity must be between 1 and 4096".into(),
+        ));
+    }
+    let resource = crate::tasks::gather::supported_resource(resource)
+        .ok_or_else(|| AppError::InvalidConsoleSyntax("unsupported gather resource; use logs, stone, coal, raw_iron, iron_ingot, diamond, apple, carrot, potato, wheat, bread, or baked_potato".into()))?;
+    Ok(ConsoleCommand::Gather {
+        resource: resource.item,
+        quantity,
+        deposit,
+    })
 }
 
 /// `/placeblock` keeps the task-oriented block-first syntax while mapping to
@@ -515,6 +620,30 @@ mod tests {
     }
 
     #[test]
+    fn parses_task_runtime_and_gather_commands() {
+        assert_eq!(
+            parse_input("/task status 42").unwrap(),
+            ConsoleInput::Command(ConsoleCommand::TaskStatusById { id: 42 })
+        );
+        assert_eq!(
+            parse_input("/task cancel all").unwrap(),
+            ConsoleInput::Command(ConsoleCommand::TaskCancel { id: None })
+        );
+        assert_eq!(
+            parse_input("/task recent").unwrap(),
+            ConsoleInput::Command(ConsoleCommand::TaskRecent)
+        );
+        assert_eq!(
+            parse_input("/gather logs 16").unwrap(),
+            ConsoleInput::Command(ConsoleCommand::Gather {
+                target: "logs".into(),
+                quantity: 16
+            })
+        );
+        assert!(parse_input("/gather stone 0").is_err());
+    }
+
+    #[test]
     fn parses_look_commands() {
         assert_eq!(
             parse_input("/look 1 64 -2").unwrap(),
@@ -611,5 +740,27 @@ mod tests {
             parse_input("/testoaklog").unwrap(),
             ConsoleInput::Command(ConsoleCommand::TestOakLog)
         );
+    }
+
+    #[test]
+    fn parses_gather_lifecycle_commands() {
+        assert_eq!(
+            parse_input("/gather logs 12 deposit").unwrap(),
+            ConsoleInput::Command(ConsoleCommand::Gather {
+                resource: "minecraft:oak_log".into(),
+                quantity: 12,
+                deposit: true
+            })
+        );
+        assert_eq!(
+            parse_input("/gatherstatus").unwrap(),
+            ConsoleInput::Command(ConsoleCommand::GatherStatus)
+        );
+        assert_eq!(
+            parse_input("/gathercancel").unwrap(),
+            ConsoleInput::Command(ConsoleCommand::GatherCancel)
+        );
+        assert!(parse_input("/gather beef 2").is_err());
+        assert!(parse_input("/gather stone 0").is_err());
     }
 }
