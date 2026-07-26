@@ -9,6 +9,7 @@ mod container;
 mod error;
 mod food;
 mod interaction;
+mod inventory_cleanup;
 mod logging;
 mod look;
 pub mod minecraft;

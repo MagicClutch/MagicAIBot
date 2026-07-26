@@ -14,7 +14,7 @@ use crate::{
     config::Config,
     console::{
         self,
-        commands::{ConsoleCommand, ConsoleInput, plain_chat_message},
+        commands::{CleanupOperation, ConsoleCommand, ConsoleInput, plain_chat_message},
     },
     crafting::RecipeBook,
     crafting::CraftService,
@@ -284,6 +284,46 @@ impl App {
                         }
                 ConsoleCommand::Players => self.print_players().await,
                 ConsoleCommand::Inventory => self.print_inventory().await,
+                ConsoleCommand::CleanupInventory { operation } => match operation {
+                    CleanupOperation::DryRun => {
+                        let world = self.minecraft.world_state_snapshot().await;
+                        let snapshot = crate::inventory_cleanup::CleanupSnapshot {
+                            revision: 0,
+                            items: world
+                                .inventory
+                                .slots
+                                .iter()
+                                .filter_map(|slot| {
+                                    Some(crate::inventory_cleanup::CleanupItem {
+                                        slot: slot.slot,
+                                        item_id: slot.item_id.clone()?,
+                                        count: slot.count,
+                                        tags: Default::default(),
+                                        rare: false,
+                                        tool: false,
+                                    })
+                                })
+                                .collect(),
+                        };
+                        let plan = crate::inventory_cleanup::plan_cleanup(
+                            &self.config.inventory_cleanup,
+                            &snapshot,
+                            &Default::default(),
+                        );
+                        println!("Cleanup dry-run (revision {}):", plan.revision);
+                        for step in plan.steps {
+                            println!(
+                                "slot {} {} x{}: {:?} ({})",
+                                step.slot, step.item_id, step.amount, step.action, step.reason
+                            );
+                        }
+                    }
+                    CleanupOperation::Execute => println!(
+                        "Cleanup result: Rejected (no chest/inventory mutation adapter is registered)"
+                    ),
+                    CleanupOperation::Status => println!("Cleanup status: idle"),
+                    CleanupOperation::Stop => println!("Cleanup result: Cancelled"),
+                },
                 ConsoleCommand::FurnaceStatus => println!(
                     "No processing-station snapshot is currently observed. Open/load/acquire operations are intentionally not performed."
                 ),
@@ -1780,6 +1820,7 @@ fn print_help() {
     println!("/chat TEXT  Send TEXT to Minecraft chat");
     println!("/players    Show known online players");
     println!("/inventory  Show inventory summary");
+    println!("/cleanup-inventory dry-run|execute|status|stop  Safely plan or control cleanup");
     println!("/furnace-status  Show the currently observed station snapshot only");
     println!("/smelt-check OUTPUT COUNT  Calculate read-only furnace requirements");
     println!("/fuel-info ITEM  Show pinned standard-furnace fuel data");
