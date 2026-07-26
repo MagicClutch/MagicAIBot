@@ -642,14 +642,17 @@ impl MinecraftClient {
         }
     }
 
-    pub(crate) async fn use_item_at_look_target(&self) -> Result<(), AppError> {
+    /// Dispatches Azalea's explicit block interaction. The caller must first
+    /// validate the raycast face/hit point; this avoids degrading a placement
+    /// into a generic use-item action when the crosshair changes between ticks.
+    pub(crate) async fn interact_block(&self, position: BlockPosition) -> Result<(), AppError> {
         let client = self
             .current_client
             .lock()
             .await
             .clone()
             .ok_or(AppError::MovementUnavailable)?;
-        client.start_use_item();
+        client.block_interact(azalea::BlockPos::new(position.x, position.y, position.z));
         Ok(())
     }
 
