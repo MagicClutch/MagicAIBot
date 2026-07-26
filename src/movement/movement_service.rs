@@ -17,6 +17,12 @@ use crate::{
     movement::{NavigationMode, logger},
 };
 
+/// Azalea starts path calculation asynchronously. Immediately after
+/// `start_goto_with_opts` its status can still describe the previous goal (or
+/// report no active calculation at all), so do not reject a freshly submitted
+/// destination until the pathfinder has had a chance to observe it.
+const PATHFINDER_STARTUP_GRACE: Duration = Duration::from_secs(2);
+
 #[derive(Clone)]
 pub struct MovementService {
     config: MovementConfig,
@@ -190,14 +196,18 @@ impl MovementService {
                 snapshot.last_movement_update = Some(SystemTime::now());
                 self.replace_and_publish(minecraft, snapshot).await;
             }
-            Ok(status) if status.reached => {
+            Ok(status) if status.reached && pathfinder_startup_grace_elapsed(&snapshot) => {
                 snapshot.status = MovementStatus::Failed;
                 snapshot.failure_reason =
                     Some("pathfinder reported completion before arrival".into());
                 snapshot.last_movement_update = Some(SystemTime::now());
                 self.replace_and_publish(minecraft, snapshot).await;
             }
-            Ok(status) if !status.calculating && !status.executing => {
+            Ok(status)
+                if !status.calculating
+                    && !status.executing
+                    && pathfinder_startup_grace_elapsed(&snapshot) =>
+            {
                 snapshot.status = MovementStatus::Failed;
                 snapshot.failure_reason = Some("no path was found".into());
                 snapshot.last_movement_update = Some(SystemTime::now());
@@ -358,5 +368,34 @@ impl MovementService {
         let travel_yaw = (-dx).atan2(dz).to_degrees() as f32;
         *self.local_input.lock().await =
             local_input_for_direction(travel_yaw, camera_yaw, explicit_look, &self.multitasking);
+    }
+}
+
+fn pathfinder_startup_grace_elapsed(snapshot: &MovementSnapshot) -> bool {
+    snapshot.started_at.is_none_or(|started| {
+        started.elapsed().unwrap_or_default() >= PATHFINDER_STARTUP_GRACE
+    })
+}
+
+#[cfg(test)]
+mod startup_tests {
+    use super::*;
+
+    #[test]
+    fn waits_for_fresh_pathfinder_goal_to_start() {
+        let snapshot = MovementSnapshot {
+            started_at: Some(SystemTime::now()),
+            ..MovementSnapshot::default()
+        };
+        assert!(!pathfinder_startup_grace_elapsed(&snapshot));
+    }
+
+    #[test]
+    fn eventually_treats_inactive_pathfinder_as_failure() {
+        let snapshot = MovementSnapshot {
+            started_at: Some(SystemTime::now() - PATHFINDER_STARTUP_GRACE),
+            ..MovementSnapshot::default()
+        };
+        assert!(pathfinder_startup_grace_elapsed(&snapshot));
     }
 }
