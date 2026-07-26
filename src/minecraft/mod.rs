@@ -2,4 +2,5 @@
 
 pub mod client;
 pub mod events;
+pub(crate) mod inventory_actions;
 pub mod world_state;
