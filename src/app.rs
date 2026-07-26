@@ -1206,11 +1206,24 @@ impl App {
     async fn print_inventory(&self) {
         let world = self.minecraft.world_state_snapshot().await;
         println!(
-            "Selected slot: {}",
+            "Inventory sync: {:?} | revision {} | server state {}",
+            world.inventory.sync_state,
+            world.inventory.revision,
+            world
+                .inventory
+                .server_state_id
+                .map_or_else(|| "unknown".into(), |v| v.to_string())
+        );
+        println!(
+            "Selected hotbar slot: {} | application slot: {}",
             world
                 .inventory
                 .selected_hotbar_slot
-                .map_or_else(|| "unknown".into(), |v| v.to_string())
+                .map_or_else(|| "unknown".into(), |v| v.to_string()),
+            world
+                .inventory
+                .selected_slot
+                .map_or_else(|| "unknown".into(), |v| v.0.to_string())
         );
         println!(
             "Selected item: {}",
@@ -1220,19 +1233,46 @@ impl App {
             )
         );
         println!(
-            "Used slots: {}",
-            world
-                .inventory
-                .slots
-                .iter()
-                .filter(|s| s.item_id.is_some())
-                .count()
+            "Storage slots: {}/{} used ({} empty)",
+            world.inventory.used_storage_slots,
+            world.inventory.storage_capacity,
+            world.inventory.empty_storage_slots
         );
-        println!("Total item stacks: {}", world.inventory.total_counts.len());
+        println!(
+            "Distinct item kinds: {}",
+            world.inventory.total_counts.len()
+        );
         let mut items: Vec<_> = world.inventory.total_counts.iter().collect();
         items.sort_by_key(|(id, _)| *id);
         for (id, count) in items {
             println!("{id} x{count}");
+        }
+        for slot in world
+            .inventory
+            .slots
+            .iter()
+            .filter(|slot| slot.item_id.is_some())
+        {
+            let durability = slot
+                .metadata
+                .remaining_durability
+                .zip(slot.metadata.maximum_durability)
+                .map_or_else(String::new, |(left, max)| {
+                    format!(" durability={left}/{max}")
+                });
+            let name = slot
+                .display_name
+                .as_deref()
+                .map_or_else(String::new, |name| format!(" name={name:?}"));
+            println!(
+                "slot {} [{:?}] {} x{}{}{}",
+                slot.id.0,
+                slot.region,
+                slot.item_id.as_deref().unwrap_or("unknown"),
+                slot.count,
+                name,
+                durability
+            );
         }
     }
 
