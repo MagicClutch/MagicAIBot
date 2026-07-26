@@ -21,7 +21,9 @@ use azalea::{
     core::entity_id::MinecraftEntityId,
     entity::{
         Dead, EntityKindComponent, EntityUuid, LocalEntity, LookDirection, Physics, Position,
-        dimensions::EntityDimensions, inventory::Inventory, metadata::Health,
+        dimensions::EntityDimensions,
+        inventory::Inventory,
+        metadata::{Health, Item, ItemItem},
     },
     pathfinder::{
         PathfinderClientExt, PathfinderOpts,
@@ -1173,6 +1175,39 @@ async fn refresh_ecs_state(
         });
     }
     let mut player_updates = Vec::new();
+    let mut dropped_item_updates = Vec::new();
+    let mut dropped_items = ecs.query_filtered::<(
+        &MinecraftEntityId,
+        Option<&EntityUuid>,
+        &Position,
+        &WorldName,
+        &ItemItem,
+    ), azalea::ecs::query::With<Item>>();
+    for (minecraft_id, uuid, position, dimension, item) in dropped_items.iter(&ecs) {
+        let Some(stack) = item.0.as_present() else {
+            continue;
+        };
+        let v: azalea::Vec3 = **position;
+        dropped_item_updates.push(crate::minecraft::dropped_items::DroppedItemObservation {
+            session_id: 0,
+            entity_id: minecraft_id.0 as u32,
+            uuid: uuid.map(|uuid| **uuid),
+            stack: crate::minecraft::dropped_items::ObservableItemStack {
+                item_id: stack.kind.to_string(),
+                count: u32::try_from(stack.count).unwrap_or(0),
+                components: serde_json::to_value(&stack.component_patch)
+                    .unwrap_or(serde_json::Value::Null),
+            },
+            position: PositionSnapshot {
+                x: v.x,
+                y: v.y,
+                z: v.z,
+            },
+            distance: 0.0,
+            dimension: dimension.to_string(),
+            last_seen: SystemTime::now(),
+        });
+    }
     let mut players = ecs.query::<(
         &EntityUuid,
         &GameProfileComponent,
@@ -1200,6 +1235,10 @@ async fn refresh_ecs_state(
     }
     drop(ecs);
     let mut world = world_state.lock().await;
+    let session_id = world.session_id();
+    for item in &mut dropped_item_updates {
+        item.session_id = session_id;
+    }
     if bot_entity.is_some() {
         if let Some(inventory) = inventory_snapshot {
             world.update_inventory(inventory);
@@ -1210,6 +1249,7 @@ async fn refresh_ecs_state(
         world.upsert_entity(entity);
     }
     world.remove_entities_not_in(&existing_ids);
+    world.replace_dropped_items(dropped_item_updates);
     for player in player_updates {
         world.upsert_player(player);
     }

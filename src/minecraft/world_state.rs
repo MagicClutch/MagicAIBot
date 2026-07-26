@@ -7,6 +7,7 @@ use std::{
 
 use uuid::Uuid;
 
+use super::dropped_items::DroppedItemObservation;
 use crate::error::AppError;
 
 pub const DEFAULT_ENTITY_RADIUS: f64 = 64.0;
@@ -188,11 +189,13 @@ pub struct MovementSnapshot {
 
 #[derive(Clone, Debug)]
 pub struct WorldStateSnapshot {
+    pub session_id: u64,
     pub connection: ConnectionSnapshot,
     pub bot: BotSnapshot,
     pub inventory: InventorySnapshot,
     pub players: Vec<PlayerSnapshot>,
     pub entities: Vec<EntitySnapshot>,
+    pub dropped_items: Vec<DroppedItemObservation>,
     pub last_received_chat: Option<ChatRecord>,
     pub last_sent_chat: Option<ChatRecord>,
     pub current_task: Option<TaskSnapshot>,
@@ -202,11 +205,13 @@ pub struct WorldStateSnapshot {
 impl Default for WorldStateSnapshot {
     fn default() -> Self {
         Self {
+            session_id: 0,
             connection: ConnectionSnapshot::default(),
             bot: BotSnapshot::default(),
             inventory: InventorySnapshot::default(),
             players: Vec::new(),
             entities: Vec::new(),
+            dropped_items: Vec::new(),
             last_received_chat: None,
             last_sent_chat: None,
             current_task: None,
@@ -228,11 +233,13 @@ impl WorldStateSnapshot {
 
 #[derive(Debug)]
 pub struct WorldState {
+    session_id: u64,
     pub(crate) connection: ConnectionSnapshot,
     bot: BotSnapshot,
     inventory: InventorySnapshot,
     players: HashMap<Uuid, PlayerSnapshot>,
     entities: HashMap<u32, EntitySnapshot>,
+    dropped_items: HashMap<u32, DroppedItemObservation>,
     last_received_chat: Option<ChatRecord>,
     last_sent_chat: Option<ChatRecord>,
     current_task: Option<TaskSnapshot>,
@@ -262,11 +269,13 @@ impl WorldState {
     ) -> Result<Self, AppError> {
         validate_limits(radius, maximum_entities, stale_seconds)?;
         Ok(Self {
+            session_id: 0,
             connection: ConnectionSnapshot::default(),
             bot: BotSnapshot::default(),
             inventory: InventorySnapshot::default(),
             players: HashMap::new(),
             entities: HashMap::new(),
+            dropped_items: HashMap::new(),
             last_received_chat: None,
             last_sent_chat: None,
             current_task: None,
@@ -326,9 +335,11 @@ impl WorldState {
     }
     /// Drop observations that belong to a disconnected Azalea session.
     pub fn clear_session_state(&mut self) {
+        self.session_id = self.session_id.wrapping_add(1);
         self.bot = BotSnapshot::default();
         self.players.clear();
         self.entities.clear();
+        self.dropped_items.clear();
         self.inventory = InventorySnapshot::default();
         self.movement = MovementSnapshot::default();
         self.current_task = None;
@@ -369,10 +380,12 @@ impl WorldState {
     }
     pub fn remove_entity(&mut self, id: u32) {
         self.entities.remove(&id);
+        self.dropped_items.remove(&id);
         self.touch();
     }
     pub fn remove_entities_not_in(&mut self, existing_ids: &std::collections::HashSet<u32>) {
         self.entities.retain(|id, _| existing_ids.contains(id));
+        self.dropped_items.retain(|id, _| existing_ids.contains(id));
         self.touch();
     }
     pub fn remove_stale_entities(&mut self) {
@@ -380,7 +393,44 @@ impl WorldState {
         self.entities.retain(|_, e| {
             now.duration_since(e.last_seen).unwrap_or_default() <= self.stale_entity_after
         });
+        self.dropped_items.retain(|_, e| {
+            now.duration_since(e.last_seen).unwrap_or_default() <= self.stale_entity_after
+        });
         self.touch();
+    }
+    /// Atomically reconcile the item subset observed in the current ECS tick.
+    pub fn replace_dropped_items(&mut self, items: Vec<DroppedItemObservation>) {
+        let bot_position = self.bot.position;
+        let bot_dimension = self.bot.dimension.as_deref();
+        let mut items: Vec<_> = items
+            .into_iter()
+            .filter_map(|mut item| {
+                if item.session_id != self.session_id
+                    || bot_dimension.is_none_or(|dimension| item.dimension != dimension)
+                {
+                    return None;
+                }
+                if let Some(origin) = bot_position {
+                    item.distance = distance(origin, item.position);
+                }
+                (item.distance <= self.entity_radius).then_some(item)
+            })
+            .collect();
+        items.sort_by(|a, b| {
+            a.distance
+                .total_cmp(&b.distance)
+                .then_with(|| a.entity_id.cmp(&b.entity_id))
+        });
+        items.truncate(self.maximum_entities);
+        self.dropped_items = items
+            .into_iter()
+            .map(|item| (item.entity_id, item))
+            .collect();
+        self.touch();
+    }
+
+    pub fn session_id(&self) -> u64 {
+        self.session_id
     }
     fn trim_entities(&mut self) {
         if self.entities.len() > self.maximum_entities {
@@ -487,12 +537,20 @@ impl WorldState {
         });
         let mut entities: Vec<_> = self.entities.values().cloned().collect();
         entities.sort_by(|a, b| a.distance.total_cmp(&b.distance));
+        let mut dropped_items: Vec<_> = self.dropped_items.values().cloned().collect();
+        dropped_items.sort_by(|a, b| {
+            a.distance
+                .total_cmp(&b.distance)
+                .then_with(|| a.entity_id.cmp(&b.entity_id))
+        });
         WorldStateSnapshot {
+            session_id: self.session_id,
             connection: self.connection.clone(),
             bot: self.bot.clone(),
             inventory: self.inventory.clone(),
             players,
             entities,
+            dropped_items,
             last_received_chat: self.last_received_chat.clone(),
             last_sent_chat: self.last_sent_chat.clone(),
             current_task: self.current_task.clone(),
