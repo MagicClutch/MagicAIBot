@@ -25,7 +25,6 @@ use azalea::{
         dimensions::EntityDimensions,
         inventory::Inventory,
         metadata::{Health, Item, ItemItem},
-        metadata::{Health, ItemItem},
     },
     pathfinder::{
         PathfinderClientExt, PathfinderOpts,
@@ -34,13 +33,6 @@ use azalea::{
     player::GameProfileComponent,
     registry::builtin::BlockKind,
     world::WorldName,
-};
-use azalea_inventory::item::MaxStackSizeExt;
-use azalea_inventory::operations::{
-    ClickOperation, PickupClick, QuickMoveClick, SwapClick, ThrowClick,
-use azalea_inventory::{
-    ItemStack,
-    components::{CustomName, Damage, Enchantments, ItemName, MaxDamage, MaxStackSize},
 };
 use azalea_inventory::components::{Damage, Enchantments, MaxDamage, Tool};
 use tokio::{
@@ -1511,7 +1503,6 @@ async fn refresh_ecs_state(
     let mut updates = Vec::new();
     let mut existing_ids = HashSet::new();
     for (entity, minecraft_id, uuid, kind, position, dead, health, dimension, item) in
-    for (entity, minecraft_id, uuid, kind, position, dead, health, _dimension, item) in
         entities.iter(&ecs)
     {
         if Some(entity) == bot_entity {
@@ -1716,8 +1707,6 @@ fn inventory_from_component(inventory: &Option<&Inventory>) -> Option<InventoryS
         .collect();
     Some(InventorySnapshot {
         available: true,
-        sync_state: InventorySyncState::Synchronized,
-        server_state_id: Some(inventory.state_id),
         revision: 0,
         slots,
         selected_hotbar_slot: Some(inventory.selected_hotbar_slot),

@@ -40,7 +40,10 @@ pub struct Config {
     pub multitasking: MultitaskingConfig,
     #[serde(default)]
     pub inventory_cleanup: crate::inventory_cleanup::CleanupPolicy,
+    #[serde(default)]
     pub tree_chopping: TreeChoppingConfig,
+    #[serde(default)]
+    pub ensure_tool: EnsureToolConfig,
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -80,7 +83,6 @@ fn default_maximum_trees() -> u32 { 16 }
 fn default_tree_timeout() -> u64 { 300 }
 impl Default for TreeChoppingConfig {
     fn default() -> Self { Self { allowed_tree_types: default_tree_types(), require_nearby_leaves: true, maximum_connected_logs: default_max_connected_logs(), maximum_tree_height: default_max_tree_height(), maximum_branch_distance: default_max_branch_distance(), maximum_horizontal_logs: default_max_horizontal_logs(), break_leaves: false, collect_saplings: true, allow_hand_chopping: false, search_radius: default_tree_search_radius(), maximum_trees: default_maximum_trees(), total_timeout_seconds: default_tree_timeout() } }
-    pub ensure_tool: EnsureToolConfig,
 }
 
 #[derive(Clone, Debug, Deserialize)]

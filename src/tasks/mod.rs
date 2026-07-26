@@ -45,10 +45,11 @@ use crate::{
     navigation::BlockNavigationService,
 };
 
-pub type TaskState = ActionState;
 #[allow(dead_code)] // Lifecycle API lands before composed production tasks use it.
 pub mod runtime;
 pub mod gather;
+pub mod lifecycle;
+pub use lifecycle::{ActionFailure, Invalidation, OperationId};
 pub const DEFAULT_HISTORY_LIMIT: usize = 64;
 pub const DEFAULT_LEASE_TIMEOUT: Duration = Duration::from_secs(10);
 

@@ -469,14 +469,15 @@ fn validate_recipe(r: &Recipe) -> Result<(), String> {
         }
     }
     Ok(())
-//! Transactional execution of an already-resolved crafting plan.
-//!
-//! Recipe discovery deliberately lives outside this module.  The executor only
-//! consumes a concrete grid layout and delegates menu clicks/navigation to a
-//! driver, making the confirmation rules usable with both Azalea and tests.
+}
+
+// Transactional execution of an already-resolved crafting plan.
+//
+// Recipe discovery deliberately lives outside this module. The executor only
+// consumes a concrete grid layout and delegates menu clicks/navigation to a
+// driver, making the confirmation rules usable with both Azalea and tests.
 
 use std::{
-    collections::BTreeMap,
     sync::{Arc, Mutex},
     time::{Duration, Instant},
 };

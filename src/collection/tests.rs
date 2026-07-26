@@ -50,6 +50,10 @@ fn world(items: &[(u32, &str, u32, f64)]) -> WorldStateSnapshot {
                 alive: Some(true),
                 health: None,
                 custom_name: None,
+                item: Some(crate::minecraft::world_state::DroppedItemSnapshot {
+                    item_id: (*item).into(),
+                    count: *count,
+                }),
                 last_seen: SystemTime::now(),
             })
             .collect(),
@@ -59,6 +63,7 @@ fn world(items: &[(u32, &str, u32, f64)]) -> WorldStateSnapshot {
         current_task: None,
         movement: MovementSnapshot::default(),
         last_updated_at: SystemTime::now(),
+        ..Default::default()
     }
 }
 fn req() -> CollectRequest {

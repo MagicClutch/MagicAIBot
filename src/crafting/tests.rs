@@ -144,6 +144,8 @@ fn failures_are_structured() {
         book.preferred("not_real"),
         Err(Failure::UnknownItem("minecraft:not_real".into()))
     );
+}
+
 struct Mock {
     state: MenuSnapshot,
     table: Result<(), DriverError>,

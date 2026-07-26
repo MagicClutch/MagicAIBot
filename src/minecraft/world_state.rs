@@ -161,9 +161,6 @@ pub enum InventorySyncState {
 #[derive(Clone, Debug, Default)]
 pub struct InventorySnapshot {
     pub available: bool,
-    pub sync_state: InventorySyncState,
-    pub revision: u64,
-    pub server_state_id: Option<u32>,
     /// Monotonically increases only when slot contents change.
     pub revision: u64,
     pub slots: Vec<InventorySlot>,
@@ -189,8 +186,6 @@ impl InventorySnapshot {
             .collect()
     }
     pub fn selected_item(&self) -> Option<&InventorySlot> {
-        self.selected_slot
-            .and_then(|id| self.slots.iter().find(|s| s.id == id))
         let selected = usize::from(self.selected_hotbar_slot?);
         if self.slots.len() < 9 {
             return self.slots.iter().find(|slot| slot.slot == selected);
@@ -476,6 +471,12 @@ impl WorldState {
     /// Drop observations that belong to a disconnected Azalea session.
     pub fn clear_session_state(&mut self) {
         self.session_id = self.session_id.wrapping_add(1);
+        self.bot = BotSnapshot::default();
+        self.players.clear();
+        self.entities.clear();
+        self.dropped_items.clear();
+        self.inventory = InventorySnapshot::default();
+        self.container.disconnect(SystemTime::now());
         self.bot = BotSnapshot::default();
         self.players.clear();
         self.entities.clear();
