@@ -77,6 +77,10 @@ pub enum ConsoleCommand {
     BreakNearest {
         block_id: String,
     },
+    /// Debug-only: score the hotbar and select the policy winner for a block.
+    SelectTool {
+        block_id: String,
+    },
     PlaceLooked {
         block_id: String,
     },
@@ -213,6 +217,13 @@ pub fn parse_input(input: &str) -> Result<ConsoleInput, AppError> {
                 command,
                 arguments,
                 "/breaknearest <block_id>",
+            )?)?,
+        },
+        "select-tool" => ConsoleCommand::SelectTool {
+            block_id: normalize_block_id(single_argument(
+                command,
+                arguments,
+                "/select-tool <block_id>",
             )?)?,
         },
         "place" => parse_place(arguments)?,
@@ -574,6 +585,12 @@ mod tests {
             parse_input("/breaknearest oak_log").unwrap(),
             ConsoleInput::Command(ConsoleCommand::BreakNearest {
                 block_id: "minecraft:oak_log".into()
+            })
+        );
+        assert_eq!(
+            parse_input("/select-tool diamond_ore").unwrap(),
+            ConsoleInput::Command(ConsoleCommand::SelectTool {
+                block_id: "minecraft:diamond_ore".into()
             })
         );
         assert_eq!(

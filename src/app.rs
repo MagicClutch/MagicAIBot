@@ -462,6 +462,33 @@ impl App {
                         logging::warning(format!("Cannot break block: {error}"));
                     }
                 }
+                ConsoleCommand::SelectTool { block_id } => {
+                    let policy = crate::interaction::tool_selection::ToolSelectionPolicy {
+                        minimum_remaining_durability: self
+                            .config
+                            .interaction
+                            .minimum_tool_durability,
+                        fallback: if self.config.interaction.allow_hand_fallback {
+                            crate::interaction::tool_selection::ToolFallbackPolicy::AllowHand
+                        } else {
+                            crate::interaction::tool_selection::ToolFallbackPolicy::RequireSuitableTool
+                        },
+                        held_material_equivalence: self.config.interaction.held_tool_equivalence,
+                    };
+                    match self
+                        .minecraft
+                        .select_tool_for_block(
+                            &block_id,
+                            &policy,
+                            &self.config.interaction.protected_tools,
+                            &self.config.interaction.reserved_tools,
+                        )
+                        .await
+                    {
+                        Ok(selection) => println!("{}", selection.explanation),
+                        Err(error) => println!("Tool selection error: {error}"),
+                    }
+                }
                 ConsoleCommand::PlaceLooked { block_id } => {
                     self.block_navigation
                         .cancel(&self.minecraft, &self.movement)
@@ -1026,6 +1053,7 @@ fn print_help() {
     println!("/breakblock  Break the block in the crosshair");
     println!("/break X Y Z  Break a block");
     println!("/breaknearest ID  Find, navigate to, and break a block");
+    println!("/select-tool ID  DEBUG: score the hotbar for a block, explain and select the winner");
     println!("/place ID  Place the held block beside the crosshair target");
     println!("/place X Y Z ID  Place a block at coordinates");
     println!("/placeblock ID [X Y Z]  Place through the reusable placement workflow");
