@@ -7,6 +7,7 @@ use std::{
 
 use uuid::Uuid;
 
+use super::container::{ContainerObserver, ContainerSnapshot, MenuObservation};
 use crate::error::AppError;
 
 pub const DEFAULT_ENTITY_RADIUS: f64 = 64.0;
@@ -78,19 +79,100 @@ pub struct BotSnapshot {
     pub last_position_update: Option<SystemTime>,
 }
 
+/// Stable application regions. These do not change when another menu is open.
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub enum InventoryRegion {
+    CraftResult,
+    Crafting,
+    Armor,
+    Main,
+    Hotbar,
+    Offhand,
+}
+
+/// Stable player-inventory slot ID. Its numeric value is deliberately the
+/// vanilla/Azalea `Menu::Player` slot: result 0, craft 1..=4, armor 5..=8
+/// (head to feet), main 9..=35, hotbar 36..=44, and offhand 45.
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub struct InventorySlotId(pub u8);
+impl InventorySlotId {
+    pub const SLOT_COUNT: usize = 46;
+    pub const STORAGE_CAPACITY: usize = 36;
+    pub fn new(value: usize) -> Option<Self> {
+        (value < Self::SLOT_COUNT).then_some(Self(value as u8))
+    }
+    pub fn region(self) -> InventoryRegion {
+        match self.0 {
+            0 => InventoryRegion::CraftResult,
+            1..=4 => InventoryRegion::Crafting,
+            5..=8 => InventoryRegion::Armor,
+            9..=35 => InventoryRegion::Main,
+            36..=44 => InventoryRegion::Hotbar,
+            45 => InventoryRegion::Offhand,
+            _ => unreachable!("validated inventory slot ID"),
+        }
+    }
+    pub fn hotbar(index: u8) -> Option<Self> {
+        (index < 9).then_some(Self(36 + index))
+    }
+    pub fn is_storage(self) -> bool {
+        matches!(
+            self.region(),
+            InventoryRegion::Main | InventoryRegion::Hotbar
+        )
+    }
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct ItemMetadata {
+    /// Effective values include Azalea's item defaults, not only server patches.
+    pub custom_name: Option<String>,
+    pub item_name: Option<String>,
+    pub damage: Option<u32>,
+    pub maximum_durability: Option<u32>,
+    pub remaining_durability: Option<u32>,
+    pub enchantments: Vec<(String, u32)>,
+    /// JSON representation of the server-provided component patch. Azalea does
+    /// not expose a lossless, stable application-level component iterator.
+    pub component_patch: Option<String>,
+    /// Kind + component patch identity; count is intentionally excluded.
+    pub stack_identity: Option<String>,
+    pub maximum_stack_size: u32,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct InventorySlot {
-    pub slot: usize,
+    pub id: InventorySlotId,
+    /// Verified Azalea `Menu::Player` index retained for diagnostics.
+    pub azalea_menu_slot: usize,
+    pub region: InventoryRegion,
     pub item_id: Option<String>,
     pub display_name: Option<String>,
     pub count: u32,
+    pub metadata: ItemMetadata,
+}
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum InventorySyncState {
+    #[default]
+    Unavailable,
+    Synchronized,
 }
 #[derive(Clone, Debug, Default)]
 pub struct InventorySnapshot {
     pub available: bool,
+    pub sync_state: InventorySyncState,
+    pub revision: u64,
+    pub server_state_id: Option<u32>,
+    /// Monotonically increases only when slot contents change.
+    pub revision: u64,
     pub slots: Vec<InventorySlot>,
     pub selected_hotbar_slot: Option<u8>,
+    pub selected_slot: Option<InventorySlotId>,
+    pub held_item: Option<InventorySlot>,
     pub total_counts: HashMap<String, u32>,
+    pub used_storage_slots: usize,
+    pub storage_capacity: usize,
+    pub empty_storage_slots: usize,
 }
 impl InventorySnapshot {
     pub fn count_item(&self, id: &str) -> u32 {
@@ -106,8 +188,18 @@ impl InventorySnapshot {
             .collect()
     }
     pub fn selected_item(&self) -> Option<&InventorySlot> {
-        self.selected_hotbar_slot
-            .map(|slot| self.slots.iter().find(|s| s.slot == usize::from(slot)))?
+        self.selected_slot
+            .and_then(|id| self.slots.iter().find(|s| s.id == id))
+        let selected = usize::from(self.selected_hotbar_slot?);
+        if self.slots.len() < 9 {
+            return self.slots.iter().find(|slot| slot.slot == selected);
+        }
+        let first_hotbar = self.slots.len() - 9;
+        self.slots.iter().find(|slot| slot.slot == first_hotbar + selected)
+    }
+    pub fn item_is_in_hotbar(&self, id: &str) -> bool {
+        let Some(first_hotbar) = self.slots.len().checked_sub(9) else { return false };
+        self.slots.iter().any(|slot| slot.slot >= first_hotbar && slot.item_id.as_deref() == Some(id))
     }
     fn rebuild_counts(&mut self) {
         self.total_counts.clear();
@@ -116,6 +208,20 @@ impl InventorySnapshot {
                 *self.total_counts.entry(id.clone()).or_default() += slot.count;
             }
         }
+        self.selected_slot = self.selected_hotbar_slot.and_then(InventorySlotId::hotbar);
+        self.held_item = self
+            .selected_item()
+            .filter(|slot| slot.item_id.is_some())
+            .cloned();
+        self.storage_capacity = InventorySlotId::STORAGE_CAPACITY;
+        self.used_storage_slots = self
+            .slots
+            .iter()
+            .filter(|s| s.id.is_storage() && s.item_id.is_some())
+            .count();
+        self.empty_storage_slots = self
+            .storage_capacity
+            .saturating_sub(self.used_storage_slots);
     }
 }
 
@@ -134,6 +240,10 @@ pub struct EntitySnapshot {
     pub entity_id: u32,
     pub uuid: Option<Uuid>,
     pub entity_type: String,
+    /// Present for Azalea's `minecraft:item` entities.
+    pub item_id: Option<String>,
+    pub item_count: u32,
+    pub dimension: Option<String>,
     pub position: PositionSnapshot,
     pub distance: f64,
     pub alive: Option<bool>,
@@ -199,6 +309,7 @@ pub struct WorldStateSnapshot {
     pub connection: ConnectionSnapshot,
     pub bot: BotSnapshot,
     pub inventory: InventorySnapshot,
+    pub container: ContainerSnapshot,
     pub players: Vec<PlayerSnapshot>,
     pub entities: Vec<EntitySnapshot>,
     pub last_received_chat: Option<ChatRecord>,
@@ -213,6 +324,7 @@ impl Default for WorldStateSnapshot {
             connection: ConnectionSnapshot::default(),
             bot: BotSnapshot::default(),
             inventory: InventorySnapshot::default(),
+            container: ContainerSnapshot::default(),
             players: Vec::new(),
             entities: Vec::new(),
             last_received_chat: None,
@@ -239,6 +351,7 @@ pub struct WorldState {
     pub(crate) connection: ConnectionSnapshot,
     bot: BotSnapshot,
     inventory: InventorySnapshot,
+    container: ContainerObserver,
     players: HashMap<Uuid, PlayerSnapshot>,
     entities: HashMap<u32, EntitySnapshot>,
     last_received_chat: Option<ChatRecord>,
@@ -273,6 +386,7 @@ impl WorldState {
             connection: ConnectionSnapshot::default(),
             bot: BotSnapshot::default(),
             inventory: InventorySnapshot::default(),
+            container: ContainerObserver::default(),
             players: HashMap::new(),
             entities: HashMap::new(),
             last_received_chat: None,
@@ -303,6 +417,7 @@ impl WorldState {
         self.connection.joined_world = joined;
         if joined {
             self.connection.last_successful_join = Some(SystemTime::now());
+            self.container.begin_session(SystemTime::now());
         }
         self.touch();
     }
@@ -323,21 +438,43 @@ impl WorldState {
         self.touch();
     }
     pub fn update_inventory(&mut self, mut inventory: InventorySnapshot) {
-        inventory.slots.sort_by_key(|s| s.slot);
+        inventory.slots.sort_by_key(|s| s.id);
+        inventory.revision = self.inventory.revision.saturating_add(1);
         inventory.rebuild_counts();
+        inventory.revision = if inventory.slots != self.inventory.slots {
+            self.inventory.revision.wrapping_add(1)
+        } else {
+            self.inventory.revision
+        };
         self.inventory = inventory;
         self.touch();
     }
+    pub(crate) fn observe_container(&mut self, menu: Option<MenuObservation>, alive: bool) {
+        self.container.observe(menu, alive, SystemTime::now());
+        self.touch();
+    }
+    pub fn container_snapshot_for_generation(&self, generation: u64) -> ContainerSnapshot {
+        self.container.snapshot_for_generation(generation)
+    }
     pub fn clear_inventory(&mut self) {
-        self.inventory = InventorySnapshot::default();
+        let revision = self.inventory.revision.saturating_add(1);
+        self.inventory = InventorySnapshot {
+            revision,
+            ..Default::default()
+        };
         self.touch();
     }
     /// Drop observations that belong to a disconnected Azalea session.
     pub fn clear_session_state(&mut self) {
+        self.container.disconnect(SystemTime::now());
         self.bot = BotSnapshot::default();
         self.players.clear();
         self.entities.clear();
-        self.inventory = InventorySnapshot::default();
+        let revision = self.inventory.revision.saturating_add(1);
+        self.inventory = InventorySnapshot {
+            revision,
+            ..Default::default()
+        };
         self.movement = MovementSnapshot::default();
         self.current_task = None;
         self.touch();
@@ -499,6 +636,7 @@ impl WorldState {
             connection: self.connection.clone(),
             bot: self.bot.clone(),
             inventory: self.inventory.clone(),
+            container: self.container.snapshot(),
             players,
             entities,
             last_received_chat: self.last_received_chat.clone(),
@@ -559,6 +697,9 @@ mod tests {
             entity_id: id,
             uuid: Some(uuid(u128::from(id))),
             entity_type: "minecraft:pig".into(),
+            item_id: None,
+            item_count: 0,
+            dimension: Some("minecraft:overworld".into()),
             position: PositionSnapshot { x, y: 0., z: 0. },
             distance: 0.,
             alive: Some(true),
@@ -603,27 +744,77 @@ mod tests {
         let mut state = WorldState::default();
         state.update_inventory(InventorySnapshot {
             available: true,
+            revision: 0,
             selected_hotbar_slot: Some(1),
             slots: vec![
                 InventorySlot {
-                    slot: 1,
+                    id: InventorySlotId(37),
+                    azalea_menu_slot: 37,
+                    region: InventoryRegion::Hotbar,
                     item_id: Some("minecraft:stone".into()),
                     display_name: None,
                     count: 3,
+                    metadata: ItemMetadata::default(),
                 },
                 InventorySlot {
-                    slot: 4,
+                    id: InventorySlotId(9),
+                    azalea_menu_slot: 9,
+                    region: InventoryRegion::Main,
                     item_id: Some("minecraft:stone".into()),
                     display_name: None,
                     count: 7,
+                    metadata: ItemMetadata::default(),
                 },
             ],
-            total_counts: Default::default(),
+            ..Default::default()
         });
         assert_eq!(state.inventory.count_item("minecraft:stone"), 10);
         assert!(state.inventory.has_item("minecraft:stone", 10));
         assert_eq!(state.inventory.find_slots("minecraft:stone").len(), 2);
         assert_eq!(state.inventory.selected_item().unwrap().count, 3);
+        assert_eq!(state.inventory.selected_slot, Some(InventorySlotId(37)));
+        assert_eq!(state.inventory.used_storage_slots, 2);
+        assert_eq!(state.inventory.empty_storage_slots, 34);
+    }
+    #[test]
+    fn player_slot_mapping_covers_every_region_and_fixes_hotbar_offset() {
+        assert_eq!(
+            InventorySlotId::new(0).unwrap().region(),
+            InventoryRegion::CraftResult
+        );
+        assert_eq!(
+            InventorySlotId::new(1).unwrap().region(),
+            InventoryRegion::Crafting
+        );
+        assert_eq!(
+            InventorySlotId::new(5).unwrap().region(),
+            InventoryRegion::Armor
+        );
+        assert_eq!(
+            InventorySlotId::new(9).unwrap().region(),
+            InventoryRegion::Main
+        );
+        assert_eq!(InventorySlotId::hotbar(0), Some(InventorySlotId(36)));
+        assert_eq!(InventorySlotId::hotbar(8), Some(InventorySlotId(44)));
+        assert_eq!(
+            InventorySlotId::new(45).unwrap().region(),
+            InventoryRegion::Offhand
+        );
+        assert_eq!(InventorySlotId::hotbar(9), None);
+        assert_eq!(InventorySlotId::new(46), None);
+    }
+    #[test]
+    fn inventory_revisions_and_disconnect_invalidation_are_monotonic() {
+        let mut state = WorldState::default();
+        state.update_inventory(InventorySnapshot {
+            available: true,
+            ..Default::default()
+        });
+        assert_eq!(state.inventory.revision, 1);
+        state.clear_session_state();
+        assert_eq!(state.inventory.revision, 2);
+        assert!(!state.inventory.available);
+        assert_eq!(state.inventory.sync_state, InventorySyncState::Unavailable);
     }
     #[test]
     fn empty_inventory_is_supported() {
