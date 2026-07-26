@@ -17,12 +17,15 @@ use crate::{
         placement_rules::{has_support, is_air, is_replaceable},
         progress::estimated_progress,
         reach::{distance_to_block_center, within_reach},
-        tool_selection::{ToolFallbackPolicy, ToolSelectionPolicy},
+        tool_selection::{
+            DeterministicToolSelector, ToolFallbackPolicy, ToolSelectionBoundary,
+            ToolSelectionPolicy,
+        },
     },
     logging,
     look::{LookController, LookTarget, aim_point::LookPrecision},
     minecraft::{
-        client::{MinecraftClient, RaycastFace},
+        client::{BlockBreaking, MinecraftClient, RaycastFace},
         world_state::{BlockPosition, InventorySnapshot, PositionSnapshot},
     },
     movement::MovementService,
@@ -83,6 +86,7 @@ struct Inner {
     face_attempt: usize,
     hit_point_attempt: usize,
     failed_hit_points: HashSet<(BlockPosition, BlockFace, usize)>,
+    block_breaking: Option<BlockBreaking>,
 }
 #[derive(Clone)]
 pub struct InteractionController {
@@ -90,6 +94,7 @@ pub struct InteractionController {
     search: BlockSearchService,
     navigation: BlockNavigationService,
     inner: Arc<Mutex<Inner>>,
+    tool_selector: Arc<dyn ToolSelectionBoundary>,
 }
 
 impl InteractionController {
@@ -97,6 +102,15 @@ impl InteractionController {
         config: InteractionConfig,
         search: BlockSearchService,
         navigation: BlockNavigationService,
+    ) -> Self {
+        Self::with_tool_selector(config, search, navigation, Arc::new(DeterministicToolSelector))
+    }
+
+    pub(crate) fn with_tool_selector(
+        config: InteractionConfig,
+        search: BlockSearchService,
+        navigation: BlockNavigationService,
+        tool_selector: Arc<dyn ToolSelectionBoundary>,
     ) -> Self {
         Self {
             config,
@@ -112,7 +126,9 @@ impl InteractionController {
                 face_attempt: 0,
                 hit_point_attempt: 0,
                 failed_hit_points: HashSet::new(),
+                block_breaking: None,
             })),
+            tool_selector,
         }
     }
     pub async fn snapshot(&self) -> InteractionSnapshot {
@@ -401,7 +417,7 @@ impl InteractionController {
         let _ = movement.stop(minecraft).await;
         self.navigation.cancel(minecraft, movement).await;
         let _ = look.release_precise(minecraft).await;
-        minecraft.stop_breaking().await;
+        self.stop_block_breaking(minecraft).await;
         let mut inner = self.inner.lock().await;
         if !matches!(
             inner.snapshot.state,
@@ -442,6 +458,7 @@ impl InteractionController {
             if retry_at.is_some_and(|at| SystemTime::now() < at) {
                 return;
             }
+            self.stop_block_breaking(minecraft).await;
             self.prepare().await;
             return;
         }
@@ -662,11 +679,15 @@ impl InteractionController {
                         }
                         drop(inner);
                         if self.elapsed_exceeded().await {
+                            self.stop_block_breaking(minecraft).await;
                             self.retry_or_fail("break verification timed out").await;
                         }
                     }
                     Ok(_) => self.complete_break(minecraft, movement, look).await,
-                    Err(_) => self.retry_or_fail("chunk unloaded").await,
+                    Err(_) => {
+                        self.stop_block_breaking(minecraft).await;
+                        self.retry_or_fail("chunk unloaded").await;
+                    }
                 },
                 Operation::Place {
                     target, item_id, inventory_before, ..
@@ -730,6 +751,7 @@ impl InteractionController {
                             &policy,
                             &self.config.protected_tools,
                             &self.config.reserved_tools,
+                            self.tool_selector.as_ref(),
                         )
                         .await
                     {
@@ -737,7 +759,13 @@ impl InteractionController {
                         Err(error) => return self.retry_or_fail(&error.to_string()).await,
                     }
                 }
-                minecraft.begin_breaking(*target).await
+                match minecraft.begin_breaking(*target).await {
+                    Ok(block_breaking) => {
+                        self.inner.lock().await.block_breaking = Some(block_breaking);
+                        Ok(())
+                    }
+                    Err(error) => Err(error),
+                }
             }
             Operation::Place { item_id, .. } => {
                 match minecraft.select_item_in_hotbar(item_id).await {
@@ -907,6 +935,7 @@ impl InteractionController {
         movement: &MovementService,
         look: &LookController,
     ) {
+        self.stop_block_breaking(minecraft).await;
         let restore = {
             let mut inner = self.inner.lock().await;
             inner.snapshot.state = InteractionState::Completed;
@@ -925,6 +954,12 @@ impl InteractionController {
                 self.fail(&format!("oak-log restoration failed: {error}"))
                     .await;
             }
+        }
+    }
+
+    async fn stop_block_breaking(&self, minecraft: &MinecraftClient) {
+        if let Some(block_breaking) = self.inner.lock().await.block_breaking.take() {
+            minecraft.stop_breaking(block_breaking).await;
         }
     }
 }
