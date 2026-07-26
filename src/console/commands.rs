@@ -101,6 +101,13 @@ pub enum ConsoleCommand {
     },
     StopInteraction,
     InteractionStatus,
+    CollectFood {
+        item: Option<String>,
+        count: u32,
+        food_value: bool,
+    },
+    CollectFoodStatus,
+    CollectFoodStop,
     EnsureTool {
         block_id: String,
     },
@@ -240,6 +247,11 @@ pub fn parse_input(input: &str) -> Result<ConsoleInput, AppError> {
         "placeblock" => parse_placeblock(arguments)?,
         "stopinteraction" => no_arguments(command, arguments, ConsoleCommand::StopInteraction)?,
         "interactionstatus" => no_arguments(command, arguments, ConsoleCommand::InteractionStatus)?,
+        "collect-food" => parse_collect_food(arguments)?,
+        "collect-food-status" => {
+            no_arguments(command, arguments, ConsoleCommand::CollectFoodStatus)?
+        }
+        "collect-food-stop" => no_arguments(command, arguments, ConsoleCommand::CollectFoodStop)?,
         "ensure-tool" | "craft-tool" => ConsoleCommand::EnsureTool {
             block_id: normalize_block_id(single_argument(
                 command,
@@ -266,6 +278,65 @@ pub fn parse_input(input: &str) -> Result<ConsoleInput, AppError> {
     Ok(ConsoleInput::Command(parsed))
 }
 
+fn parse_collect_food(arguments: &str) -> Result<ConsoleCommand, AppError> {
+    let parts: Vec<_> = arguments.split_whitespace().collect();
+    let parsed = match parts.as_slice() {
+        [] => ConsoleCommand::CollectFood {
+            item: None,
+            count: 1,
+            food_value: false,
+        },
+        ["status"] => ConsoleCommand::CollectFoodStatus,
+        ["stop"] => ConsoleCommand::CollectFoodStop,
+        ["value", value] => ConsoleCommand::CollectFood {
+            item: None,
+            count: value.parse().map_err(|_| {
+                AppError::InvalidConsoleSyntax("/collect-food value <positive points>".into())
+            })?,
+            food_value: true,
+        },
+        [item, count] => ConsoleCommand::CollectFood {
+            item: Some(normalize_item_id(item)?),
+            count: count.parse().map_err(|_| {
+                AppError::InvalidConsoleSyntax("/collect-food <item> <positive count>".into())
+            })?,
+            food_value: false,
+        },
+        _ => {
+            return Err(AppError::InvalidConsoleSyntax(
+                "/collect-food [<item> <count>|value <points>]".into(),
+            ));
+        }
+    };
+    if matches!(parsed, ConsoleCommand::CollectFood { count: 0, .. }) {
+        return Err(AppError::InvalidConsoleSyntax(
+            "collection target must be positive".into(),
+        ));
+    }
+    Ok(parsed)
+}
+
+fn normalize_item_id(input: &str) -> Result<String, AppError> {
+    let id = if input.contains(':') {
+        input.to_ascii_lowercase()
+    } else {
+        format!("minecraft:{}", input.to_ascii_lowercase())
+    };
+    if id.split_once(':').is_none_or(|(namespace, path)| {
+        namespace.is_empty()
+            || path.is_empty()
+            || !namespace.chars().all(|c| {
+                c.is_ascii_lowercase() || c.is_ascii_digit() || matches!(c, '_' | '-' | '.')
+            })
+            || !path.chars().all(|c| {
+                c.is_ascii_lowercase() || c.is_ascii_digit() || matches!(c, '_' | '-' | '.' | '/')
+            })
+    }) {
+        return Err(AppError::InvalidConsoleSyntax(
+            "invalid item identifier".into(),
+        ));
+    }
+    Ok(id)
 fn parse_task(arguments: &str) -> Result<ConsoleCommand, AppError> {
     let parts: Vec<_> = arguments.split_whitespace().collect();
     match parts.as_slice() {
@@ -709,6 +780,32 @@ mod tests {
     }
 
     #[test]
+    fn parses_food_collection_and_controls() {
+        assert_eq!(
+            parse_input("/collect-food carrot 4").unwrap(),
+            ConsoleInput::Command(ConsoleCommand::CollectFood {
+                item: Some("minecraft:carrot".into()),
+                count: 4,
+                food_value: false
+            })
+        );
+        assert_eq!(
+            parse_input("/collect-food value 12").unwrap(),
+            ConsoleInput::Command(ConsoleCommand::CollectFood {
+                item: None,
+                count: 12,
+                food_value: true
+            })
+        );
+        assert_eq!(
+            parse_input("/collect-food status").unwrap(),
+            ConsoleInput::Command(ConsoleCommand::CollectFoodStatus)
+        );
+        assert_eq!(
+            parse_input("/collect-food stop").unwrap(),
+            ConsoleInput::Command(ConsoleCommand::CollectFoodStop)
+        );
+        assert!(parse_input("/collect-food carrot 0").is_err());
     fn parses_gather_lifecycle_commands() {
         assert_eq!(
             parse_input("/gather logs 12 deposit").unwrap(),
