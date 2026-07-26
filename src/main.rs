@@ -14,6 +14,7 @@ mod look;
 pub mod minecraft;
 mod movement;
 mod navigation;
+mod processing;
 mod skills;
 mod tasks;
 mod tree_chopping;
