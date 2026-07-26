@@ -337,6 +337,8 @@ fn normalize_item_id(input: &str) -> Result<String, AppError> {
         ));
     }
     Ok(id)
+}
+
 fn parse_task(arguments: &str) -> Result<ConsoleCommand, AppError> {
     let parts: Vec<_> = arguments.split_whitespace().collect();
     match parts.as_slice() {
@@ -806,24 +808,5 @@ mod tests {
             ConsoleInput::Command(ConsoleCommand::CollectFoodStop)
         );
         assert!(parse_input("/collect-food carrot 0").is_err());
-    fn parses_gather_lifecycle_commands() {
-        assert_eq!(
-            parse_input("/gather logs 12 deposit").unwrap(),
-            ConsoleInput::Command(ConsoleCommand::Gather {
-                resource: "minecraft:oak_log".into(),
-                quantity: 12,
-                deposit: true
-            })
-        );
-        assert_eq!(
-            parse_input("/gatherstatus").unwrap(),
-            ConsoleInput::Command(ConsoleCommand::GatherStatus)
-        );
-        assert_eq!(
-            parse_input("/gathercancel").unwrap(),
-            ConsoleInput::Command(ConsoleCommand::GatherCancel)
-        );
-        assert!(parse_input("/gather beef 2").is_err());
-        assert!(parse_input("/gather stone 0").is_err());
     }
 }

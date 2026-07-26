@@ -636,6 +636,11 @@ impl App {
                         .await;
                     println!("Food collection stopped.");
                 }
+                ConsoleCommand::EnsureTool { block_id } => {
+                    println!(
+                        "Ensure-tool planning is available, but no live crafting adapter is wired for {block_id}."
+                    );
+                }
                 ConsoleCommand::TestOakLog => {
                     self.block_navigation
                         .cancel(&self.minecraft, &self.movement)
