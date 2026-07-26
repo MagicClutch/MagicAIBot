@@ -2,6 +2,8 @@ use thiserror::Error;
 
 #[derive(Debug, Error)]
 pub enum AppError {
+    #[error(transparent)]
+    Action(#[from] crate::tasks::ActionFailure),
     #[error("I/O failure: {0}")]
     Io(#[from] std::io::Error),
     #[error("failed to parse configuration: {0}")]
