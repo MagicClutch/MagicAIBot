@@ -363,7 +363,7 @@ fn parse_collect_item(arguments: &str) -> Result<ConsoleCommand, AppError> {
                 _=>return Err(AppError::InvalidConsoleSyntax("groups: ores, logs, food".into())) };
             let mut r=CollectRequest::exact(String::new(),parse_quantity(quantity)?); r.filter=ItemFilter::Group(group); Ok(ConsoleCommand::CollectItem(r))
         }
-        [items, quantity] => { let ids=items.split(',').map(normalize_item_id).collect::<Vec<_>>();
+        [items, quantity] => { let ids=items.split(',').map(normalize_collect_item_id).collect::<Vec<_>>();
             let mut r=CollectRequest::exact(ids[0].clone(),parse_quantity(quantity)?); if ids.len()>1 {r.filter=ItemFilter::AnyOf(ids)}; Ok(ConsoleCommand::CollectItem(r)) }
         _ => Err(AppError::InvalidConsoleSyntax("/collect-item <item[,item]> <count> | group <ores|logs|food> <count> | nearest | status | stop".into()))
     }
@@ -379,12 +379,14 @@ fn parse_quantity(value: &str) -> Result<u32, AppError> {
     }
     Ok(n)
 }
-fn normalize_item_id(value: &str) -> String {
+fn normalize_collect_item_id(value: &str) -> String {
     if value.contains(':') {
         value.to_ascii_lowercase()
     } else {
         format!("minecraft:{}", value.to_ascii_lowercase())
     }
+}
+
 fn parse_chop_tree(arguments: &str) -> Result<ConsoleCommand, AppError> {
     use crate::tree_chopping::ChopRequest;
     let parts: Vec<_> = arguments.split_whitespace().collect();

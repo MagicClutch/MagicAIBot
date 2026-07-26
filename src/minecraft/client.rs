@@ -1391,7 +1391,6 @@ async fn refresh_ecs_state(
     let mut updates = Vec::new();
     let mut existing_ids = HashSet::new();
     for (entity, minecraft_id, uuid, kind, position, dead, health, dimension, item) in
-    for (entity, minecraft_id, uuid, kind, position, dead, health, _dimension, item) in
         entities.iter(&ecs)
     {
         if Some(entity) == bot_entity {
