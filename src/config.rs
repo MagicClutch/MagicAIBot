@@ -464,6 +464,9 @@ pub struct InteractionConfig {
     pub auto_navigate: bool,
     #[serde(default = "default_true")]
     pub auto_precise_look: bool,
+    /// Select the fastest suitable tool already present in the hotbar before breaking.
+    #[serde(default = "default_true")]
+    pub auto_tool_switch: bool,
     #[serde(default)]
     pub face_targeting: FaceTargetingConfig,
 }
@@ -523,6 +526,7 @@ impl Default for InteractionConfig {
             verification_timeout_ms: 1500,
             auto_navigate: true,
             auto_precise_look: true,
+            auto_tool_switch: true,
             face_targeting: FaceTargetingConfig::default(),
         }
     }

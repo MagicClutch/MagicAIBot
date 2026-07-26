@@ -97,6 +97,8 @@ retry_delay_ms = 150
 verification_timeout_ms = 1500
 auto_navigate = true
 auto_precise_look = true
+# Select the best suitable tool currently in the hotbar before breaking.
+auto_tool_switch = true
 
 [interaction.face_targeting]
 face_inset = 0.001
