@@ -12,6 +12,7 @@ mod movement;
 mod navigation;
 mod skills;
 mod tasks;
+mod tree_chopping;
 
 #[tokio::main(flavor = "current_thread")]
 async fn main() -> Result<(), error::AppError> {

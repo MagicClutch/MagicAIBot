@@ -63,3 +63,21 @@ src/
 ├── tasks/        # Future task orchestration
 └── ai/           # Future AI decision-making
 ```
+
+## Tree chopping (Task 32)
+
+`/chop-tree nearest`, `/chop-tree <tree_type>`, `/chop-tree logs <n>`, and
+`/chop-tree count <n>` inspect only loaded vanilla logs/leaves. Use
+`/chop-tree status` or `/chop-tree stop` for lifecycle control. Detection is
+bounded by the `[tree_chopping]` limits and skips structures without leaf
+support or with ambiguous/mixed topology. Execution delegates navigation,
+looking, hotbar tool selection, and server-confirmed breaking to the existing
+services. It does not craft tools, break leaves, climb/build, replant, or
+explore. Upper logs outside conservative ground reach are returned as partial.
+
+Manual server matrix: test each configured vanilla tree, a neighboring pair,
+a branched/tall tree, missing axe, full inventory, block changed mid-operation,
+and stop/disconnect/death while chopping. Mock tests do not exercise live
+Azalea networking, pathfinding, item-drop pickup, or server registry variants.
+Task 17 (entity interaction) remains independent and ready; this feature adds
+no entity-control ownership.

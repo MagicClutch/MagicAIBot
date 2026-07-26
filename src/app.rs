@@ -22,6 +22,7 @@ use crate::{
     movement::{MovementService, NavigationMode},
     navigation::{BlockNavigationService, navigation_state::BlockNavigationState},
     tasks::TaskService,
+    tree_chopping::TreeChopService,
 };
 use tokio::{sync::mpsc, task::JoinHandle};
 use tokio_util::sync::CancellationToken;
@@ -37,6 +38,7 @@ pub struct App {
     look: LookController,
     interaction: InteractionController,
     tasks: TaskService,
+    tree_chopping: TreeChopService,
     session_ready: bool,
     started_at: Instant,
 }
@@ -58,6 +60,7 @@ impl App {
             ),
         );
 
+        let tree_chopping = TreeChopService::new(config.tree_chopping.clone());
         Ok(Self {
             minecraft: MinecraftClient::new(
                 config.minecraft.clone(),
@@ -90,6 +93,7 @@ impl App {
                 block_navigation,
             ),
             tasks: TaskService::default(),
+            tree_chopping,
             session_ready: false,
             config,
             shutdown: CancellationToken::new(),
@@ -148,7 +152,10 @@ impl App {
                         self.look.tick(&self.minecraft).await;
                     }
                 },
-                _ = interaction_tick.tick() => self.interaction.tick(&self.minecraft, &self.movement, &self.look).await,
+                _ = interaction_tick.tick() => {
+                    self.interaction.tick(&self.minecraft, &self.movement, &self.look).await;
+                    self.tree_chopping.tick(&self.minecraft, &self.movement, &self.look, &self.interaction).await;
+                },
                 input = input_rx.recv() => match input {
                     Some(Ok(ConsoleInput::Empty)) => {}
                     Some(Ok(input)) => {
@@ -516,6 +523,21 @@ impl App {
                     {
                         logging::warning(format!("Oak-log test failed: {error}"));
                     }
+                }
+                ConsoleCommand::ChopTree { request } => {
+                    self.interaction.cancel(&self.minecraft, &self.movement, &self.look).await;
+                    let result = self.tree_chopping.start(request, &self.minecraft, &self.block_search).await;
+                    println!("Tree chopping: {:?} ({} candidate trees inspected)", result.outcome, result.trees_inspected);
+                }
+                ConsoleCommand::ChopTreeStatus => {
+                    match self.tree_chopping.status() {
+                        Some(result) => println!("Tree chopping: {:?}; logs {}/{}; broken {}; unreachable {}; uncertain skipped {}", result.outcome, result.logs_collected, result.requested_logs, result.logs_broken, result.unreachable_logs, result.uncertain_structures_skipped),
+                        None => println!("No tree chopping operation has run."),
+                    }
+                }
+                ConsoleCommand::ChopTreeStop => {
+                    let result = self.tree_chopping.stop(&self.minecraft, &self.movement, &self.look, &self.interaction).await;
+                    println!("Tree chopping: {:?}", result.outcome);
                 }
                 ConsoleCommand::Reconnect => {
                     let _ = self.movement.stop(&self.minecraft).await;
