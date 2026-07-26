@@ -191,6 +191,16 @@ impl MovementService {
             self.replace_and_publish(minecraft, snapshot).await;
             return;
         }
+        if let Some(destination) = snapshot.destination {
+            let mode = *self.navigation_mode.lock().await;
+            if let Err(error) = self
+                .refresh_navigation_goal(minecraft, destination, None, mode)
+                .await
+            {
+                self.fail(minecraft, snapshot, error.to_string()).await;
+                return;
+            }
+        }
         match minecraft.navigation_status().await {
             Ok(status)
                 if status.reached
@@ -201,27 +211,6 @@ impl MovementService {
                     ) =>
             {
                 snapshot.status = MovementStatus::Completed;
-                snapshot.last_movement_update = Some(SystemTime::now());
-                self.replace_and_publish(minecraft, snapshot).await;
-            }
-            Ok(status)
-                if (status.reached || (!status.calculating && !status.executing))
-                    && self.goal_resubmission_due().await =>
-            {
-                // Keep task-owned goto navigation alive exactly like follow:
-                // the MovementService remains the owner and re-submits the
-                // goal when Azalea has no active path.
-                if let Some(destination) = snapshot.destination {
-                    let mode = *self.navigation_mode.lock().await;
-                    if minecraft
-                        .start_navigation_to(destination, None, mode)
-                        .await
-                        .is_ok()
-                    {
-                        *self.last_goal_submission.lock().await = Some(SystemTime::now());
-                        snapshot.started_at = Some(SystemTime::now());
-                    }
-                }
                 snapshot.last_movement_update = Some(SystemTime::now());
                 self.replace_and_publish(minecraft, snapshot).await;
             }
@@ -236,6 +225,23 @@ impl MovementService {
             }
             Err(error) => self.fail(minecraft, snapshot, error.to_string()).await,
         }
+    }
+
+    async fn refresh_navigation_goal(
+        &self,
+        minecraft: &MinecraftClient,
+        destination: PositionSnapshot,
+        follow_distance: Option<f64>,
+        mode: NavigationMode,
+    ) -> Result<(), AppError> {
+        if !self.goal_resubmission_due().await {
+            return Ok(());
+        }
+        minecraft
+            .start_navigation_to(destination, follow_distance, mode)
+            .await?;
+        *self.last_goal_submission.lock().await = Some(SystemTime::now());
+        Ok(())
     }
 
     async fn goal_resubmission_due(&self) -> bool {
@@ -293,28 +299,17 @@ impl MovementService {
             self.replace_and_publish(minecraft, snapshot).await;
             return;
         }
-        let should_repath = snapshot.last_movement_update.is_none_or(|updated| {
-            updated.elapsed().unwrap_or_default()
-                >= Duration::from_millis(self.config.repath_interval_ms)
-        });
-        if should_repath
-            && snapshot
-                .estimated_distance
-                .is_none_or(|d| d > self.config.follow_distance)
+        if let Err(error) = self
+            .refresh_navigation_goal(
+                minecraft,
+                destination,
+                Some(self.config.follow_distance),
+                NavigationMode::MovementOnly,
+            )
+            .await
         {
-            if let Err(error) = minecraft
-                .start_navigation_to(
-                    destination,
-                    Some(self.config.follow_distance),
-                    NavigationMode::MovementOnly,
-                )
-                .await
-            {
-                self.fail(minecraft, snapshot, error.to_string()).await;
-                return;
-            }
-            *self.last_goal_submission.lock().await = Some(SystemTime::now());
-            snapshot.last_movement_update = Some(SystemTime::now());
+            self.fail(minecraft, snapshot, error.to_string()).await;
+            return;
         }
         self.replace_and_publish(minecraft, snapshot).await;
     }
