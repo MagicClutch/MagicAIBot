@@ -12,10 +12,12 @@ use crate::{
     config::InteractionConfig,
     error::AppError,
     interaction::{
+        block_placement::BlockPlacementRequest,
         faces::{BlockFace, BlockFacePurpose, best_face, face_hit_points},
         placement_rules::{has_support, is_air, is_replaceable},
         progress::estimated_progress,
         reach::{distance_to_block_center, within_reach},
+        tool_selection::{ToolFallbackPolicy, ToolSelectionPolicy},
     },
     logging,
     look::{LookController, LookTarget, aim_point::LookPrecision},
@@ -25,6 +27,7 @@ use crate::{
     },
     movement::MovementService,
     navigation::{BlockNavigationService, navigation_state::BlockNavigationState},
+    tasks::{ActionFailure, Invalidation, OperationId},
 };
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -44,6 +47,7 @@ pub enum InteractionState {
 }
 #[derive(Clone, Debug, Default)]
 pub struct InteractionSnapshot {
+    pub operation_id: Option<OperationId>,
     pub state: InteractionState,
     pub target: Option<String>,
     pub progress_percent: Option<u8>,
@@ -51,6 +55,7 @@ pub struct InteractionSnapshot {
     pub started_at: Option<SystemTime>,
     pub retries: u32,
     pub failure_reason: Option<String>,
+    pub failure: Option<ActionFailure>,
 }
 #[derive(Clone, Debug)]
 enum Operation {
@@ -65,6 +70,7 @@ enum Operation {
         support: BlockPosition,
         support_id: String,
         face: BlockFace,
+        inventory_before: u32,
     },
 }
 struct Inner {
@@ -233,8 +239,16 @@ impl InteractionController {
         item_id: String,
     ) -> Result<(), AppError> {
         let world = minecraft.world_state_snapshot().await;
+        if !world.inventory.available {
+            return Err(AppError::CannotPlaceBlock("inventory state is stale or unavailable".into()));
+        }
         if !world.inventory.has_item(&item_id, 1) {
             return Err(AppError::InteractionItemMissing(item_id));
+        }
+        if !world.inventory.item_is_in_hotbar(&item_id) {
+            return Err(AppError::CannotPlaceBlock(format!(
+                "item {item_id} is in a non-hotbar stack and no confirmed inventory move is available"
+            )));
         }
         if world.bot.block_position == Some(target) {
             return Err(AppError::CannotPlaceBlock(
@@ -275,6 +289,7 @@ impl InteractionController {
         let support_id = block_id(minecraft, support)
             .await?
             .ok_or(AppError::TargetChunkUnloaded)?;
+        let inventory_before = world.inventory.count_item(&item_id);
         self.replace(
             Operation::Place {
                 target,
@@ -282,12 +297,36 @@ impl InteractionController {
                 support,
                 support_id,
                 face,
+                inventory_before,
             },
             minecraft,
             movement,
             look,
         )
         .await
+    }
+
+    /// Starts a typed single-block request. Substitution is deliberately
+    /// limited to an explicitly supplied accepted-item list.
+    pub async fn place_request(
+        &self,
+        minecraft: &MinecraftClient,
+        movement: &MovementService,
+        look: &LookController,
+        request: BlockPlacementRequest,
+    ) -> Result<(), AppError> {
+        if request.cancellation.is_cancelled() {
+            return Err(AppError::InteractionCancelled);
+        }
+        let world = minecraft.world_state_snapshot().await;
+        if request.dimension.as_deref().is_some_and(|dimension| {
+            world.bot.dimension.as_deref() != Some(dimension)
+        }) {
+            return Err(AppError::CannotPlaceBlock("target dimension does not match the bot".into()));
+        }
+        let item = request.accepted_items.iter().find(|item| world.inventory.has_item(item, 1))
+            .cloned().ok_or_else(|| AppError::InteractionItemMissing(request.accepted_items.join(" or ")))?;
+        self.place_at(minecraft, movement, look, request.target, item).await
     }
     async fn replace(
         &self,
@@ -305,12 +344,19 @@ impl InteractionController {
             Operation::Break { target, .. } | Operation::Place { target, .. } => *target,
         };
         let world = minecraft.world_state_snapshot().await;
+        if !world.joined_world() {
+            return Err(AppError::MovementUnavailable);
+        }
+        if world.bot.alive == Some(false) || world.bot.health.is_some_and(|health| health <= 0.0) {
+            return Err(AppError::CannotPlaceBlock("bot is dead".into()));
+        }
         let distance = world
             .bot
             .position
             .map(|position| distance_to_block_center(position, block_position));
         let mut inner = self.inner.lock().await;
         inner.snapshot = InteractionSnapshot {
+            operation_id: Some(OperationId::new()),
             state: InteractionState::Preparing,
             target: Some(target),
             distance,
@@ -363,7 +409,8 @@ impl InteractionController {
         ) {
             logging::info("Interaction cancelled");
         }
-        inner.snapshot.state = InteractionState::Idle;
+        inner.snapshot.state = InteractionState::Cancelled;
+        inner.snapshot.failure = Some(ActionFailure::Cancelled);
         inner.operation = None;
         inner.dispatched = false;
         inner.retry_at = None;
@@ -402,6 +449,14 @@ impl InteractionController {
             Operation::Break { target, .. } | Operation::Place { target, .. } => *target,
         };
         let world = minecraft.world_state_snapshot().await;
+        if !world.joined_world() {
+            self.fail("disconnected during interaction").await;
+            return;
+        }
+        if world.bot.alive == Some(false) || world.bot.health.is_some_and(|health| health <= 0.0) {
+            self.fail("bot died during interaction").await;
+            return;
+        }
         let reach = if matches!(&operation, Operation::Break { .. }) {
             self.config.breaking_reach
         } else {
@@ -614,11 +669,16 @@ impl InteractionController {
                     Err(_) => self.retry_or_fail("chunk unloaded").await,
                 },
                 Operation::Place {
-                    target, item_id, ..
+                    target, item_id, inventory_before, ..
                 } => match block_id(minecraft, *target).await {
                     Ok(Some(id)) if id == *item_id => {
-                        self.complete("Block placed").await;
-                        let _ = look.release_precise(minecraft).await;
+                        let inventory = &minecraft.world_state_snapshot().await.inventory;
+                        if inventory.available && inventory.count_item(item_id) < *inventory_before {
+                            self.complete("Block placed and inventory confirmed").await;
+                            let _ = look.release_precise(minecraft).await;
+                        } else if self.elapsed_exceeded().await {
+                            self.retry_or_fail("world changed but inventory result was not confirmed").await;
+                        }
                     }
                     Ok(_) if self.elapsed_exceeded().await => {
                         self.retry_or_fail("placement verification timed out").await
@@ -655,12 +715,25 @@ impl InteractionController {
                 target, expected, ..
             } => {
                 if self.config.auto_tool_switch {
-                    match minecraft.select_best_tool_in_hotbar(expected).await {
-                        Ok(Some(tool)) => logging::info(format!("Selected {tool} for {expected}")),
-                        Ok(None) => debug!(
-                            block = expected,
-                            "no suitable hotbar tool; breaking with current item"
-                        ),
+                    let policy = ToolSelectionPolicy {
+                        minimum_remaining_durability: self.config.minimum_tool_durability,
+                        fallback: if self.config.allow_hand_fallback {
+                            ToolFallbackPolicy::AllowHand
+                        } else {
+                            ToolFallbackPolicy::RequireSuitableTool
+                        },
+                        held_material_equivalence: self.config.held_tool_equivalence,
+                    };
+                    match minecraft
+                        .select_tool_for_block(
+                            expected,
+                            &policy,
+                            &self.config.protected_tools,
+                            &self.config.reserved_tools,
+                        )
+                        .await
+                    {
+                        Ok(selection) => logging::info(selection.explanation),
                         Err(error) => return self.retry_or_fail(&error.to_string()).await,
                     }
                 }
@@ -668,8 +741,13 @@ impl InteractionController {
             }
             Operation::Place { item_id, .. } => {
                 match minecraft.select_item_in_hotbar(item_id).await {
-                    Ok(true) => minecraft.use_item_at_look_target().await,
-                    Ok(false) => Err(AppError::InteractionItemMissing(item_id.clone())),
+                    Ok(true) => {
+                        let Operation::Place { support, .. } = operation else { unreachable!() };
+                        minecraft.interact_block(*support).await
+                    }
+                    Ok(false) => Err(AppError::CannotPlaceBlock(format!(
+                        "item {item_id} exists but is not accessible in the hotbar"
+                    ))),
                     Err(error) => Err(error),
                 }
             }
@@ -743,6 +821,7 @@ impl InteractionController {
         if inner.snapshot.retries >= self.config.retry_limit {
             inner.snapshot.state = InteractionState::Failed;
             inner.snapshot.failure_reason = Some(reason.into());
+            inner.snapshot.failure = Some(classify_failure(reason));
             inner.operation = None;
             if !inner.failure_logged {
                 inner.failure_logged = true;
@@ -808,6 +887,7 @@ impl InteractionController {
         let mut inner = self.inner.lock().await;
         inner.snapshot.state = InteractionState::Failed;
         inner.snapshot.failure_reason = Some(reason.into());
+        inner.snapshot.failure = Some(classify_failure(reason));
         inner.operation = None;
         if !inner.failure_logged {
             inner.failure_logged = true;
@@ -954,6 +1034,28 @@ pub fn held_item(inventory: &InventorySnapshot) -> Option<&str> {
 pub fn find_placeable_block(inventory: &InventorySnapshot, item_id: &str) -> bool {
     inventory.has_item(item_id, 1)
 }
+
+fn classify_failure(reason: &str) -> ActionFailure {
+    let lower = reason.to_ascii_lowercase();
+    if lower.contains("timed out") || lower.contains("timeout") {
+        ActionFailure::Timeout
+    } else if lower.contains("chunk unloaded") || lower.contains("unavailable") {
+        ActionFailure::Invalidated(Invalidation::WorldUnavailable)
+    } else if lower.contains("target")
+        && (lower.contains("changed") || lower.contains("disappeared"))
+    {
+        ActionFailure::Invalidated(Invalidation::TargetChanged)
+    } else if lower.contains("no safe") || lower.contains("no path") || lower.contains("reachable")
+    {
+        ActionFailure::NoPath
+    } else if lower.contains("reach") || lower.contains("range") {
+        ActionFailure::OutOfRange
+    } else if lower.contains("missing") || lower.contains("inventory does not contain") {
+        ActionFailure::Invalidated(Invalidation::InventoryChanged)
+    } else {
+        ActionFailure::Internal(reason.into())
+    }
+}
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -962,6 +1064,16 @@ mod tests {
         let i = InventorySnapshot::default();
         assert!(!find_placeable_block(&i, "minecraft:stone"));
         assert_eq!(held_item(&i), None);
+    }
+    #[test]
+    fn non_hotbar_stack_is_present_but_not_accessible() {
+        let mut i = InventorySnapshot { available: true, slots: (0..36).map(|slot| crate::minecraft::world_state::InventorySlot {
+            slot, item_id: (slot == 5).then(|| "minecraft:stone".into()), display_name: None,
+            count: u32::from(slot == 5),
+        }).collect(), selected_hotbar_slot: Some(0), ..Default::default() };
+        i.total_counts.insert("minecraft:stone".into(), 1);
+        assert!(find_placeable_block(&i, "minecraft:stone"));
+        assert!(!i.item_is_in_hotbar("minecraft:stone"));
     }
     #[test]
     fn break_recovery_exhausts_each_face_before_repositioning() {
