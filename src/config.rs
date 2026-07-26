@@ -36,6 +36,36 @@ pub struct Config {
     pub interaction: InteractionConfig,
     #[serde(default)]
     pub multitasking: MultitaskingConfig,
+    #[serde(default)]
+    pub ensure_tool: EnsureToolConfig,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+pub struct EnsureToolConfig {
+    #[serde(default = "default_tool_tiers")]
+    pub material_tier_preference: Vec<String>,
+    #[serde(default = "default_tool_reserve")]
+    pub durability_reserve: u32,
+    #[serde(default)]
+    pub allow_smelting: bool,
+}
+fn default_tool_tiers() -> Vec<String> {
+    ["iron", "stone", "wood"]
+        .into_iter()
+        .map(str::to_owned)
+        .collect()
+}
+fn default_tool_reserve() -> u32 {
+    10
+}
+impl Default for EnsureToolConfig {
+    fn default() -> Self {
+        Self {
+            material_tier_preference: default_tool_tiers(),
+            durability_reserve: default_tool_reserve(),
+            allow_smelting: false,
+        }
+    }
 }
 
 #[derive(Clone, Debug, Deserialize)]

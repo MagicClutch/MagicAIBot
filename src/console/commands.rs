@@ -99,6 +99,9 @@ pub enum ConsoleCommand {
     },
     StopInteraction,
     InteractionStatus,
+    EnsureTool {
+        block_id: String,
+    },
     TestOakLog,
     Reconnect,
     Quit,
@@ -233,6 +236,13 @@ pub fn parse_input(input: &str) -> Result<ConsoleInput, AppError> {
         "placeblock" => parse_placeblock(arguments)?,
         "stopinteraction" => no_arguments(command, arguments, ConsoleCommand::StopInteraction)?,
         "interactionstatus" => no_arguments(command, arguments, ConsoleCommand::InteractionStatus)?,
+        "ensure-tool" | "craft-tool" => ConsoleCommand::EnsureTool {
+            block_id: normalize_block_id(single_argument(
+                command,
+                arguments,
+                "/ensure-tool <block_id>",
+            )?)?,
+        },
         "testoaklog" => no_arguments(command, arguments, ConsoleCommand::TestOakLog)?,
         "reconnect" => no_arguments(command, arguments, ConsoleCommand::Reconnect)?,
         "quit" => no_arguments(command, arguments, ConsoleCommand::Quit)?,
