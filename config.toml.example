@@ -17,6 +17,8 @@ show_action_bar_messages = false
 [logging]
 level = "info"
 debug = false
+# Logs stay local and are never relayed to Minecraft chat. Operation correlation
+# IDs are random diagnostics identifiers; account/session secrets are not logged.
 
 [world_state]
 nearby_entity_radius = 64
@@ -99,9 +101,28 @@ auto_navigate = true
 auto_precise_look = true
 # Select the best suitable tool currently in the hotbar before breaking.
 auto_tool_switch = true
+# Preserve at least this many uses; unknown durability remains eligible.
+minimum_tool_durability = 2
+# Only applies to blocks that do not require a correct harvesting tool.
+allow_hand_fallback = true
+# Keep the held tool when it is within 10% of the best candidate's speed.
+held_tool_equivalence = 0.10
+# Exact item IDs that automatic breaking must not select.
+protected_tools = []
+# Exact item IDs temporarily reserved for other tasks.
+reserved_tools = []
+# Intentional breaking uses this interaction controller. Pathfinder mining is a
+# separate, explicit command mode (`/goto-mine` or `mine` on `/gotoblock`).
 
 [interaction.face_targeting]
 face_inset = 0.001
 edge_margin = 0.12
 maximum_face_attempts = 6
 maximum_hit_points_per_face = 5
+[ensure_tool]
+# Highest preference first. Unsupported or insufficient tiers are skipped.
+material_tier_preference = ["iron", "stone", "wood"]
+# A tool at or below this remaining durability is not eligible.
+durability_reserve = 10
+# Uses the existing furnace executor when a recipe dependency requires it.
+allow_smelting = false
