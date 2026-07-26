@@ -1,4 +1,5 @@
 use std::{
+    collections::HashSet,
     path::Path,
     time::{Duration, Instant},
 };
@@ -6,9 +7,9 @@ use std::{
 use crate::{
     blocks::{
         BlockSearchService,
-        mining::{MiningService, OreSelector},
         block_query::BlockSearchQuery,
         block_search::{format_find_results, format_nearest_result},
+        mining::{MiningService, OreSelector},
     },
     collection::{CollectDirective, CollectorConfig, DropCollector},
     config::Config,
@@ -16,9 +17,9 @@ use crate::{
         self,
         commands::{ConsoleCommand, ConsoleInput, plain_chat_message},
     },
-    crafting::RecipeBook,
-    crafting::CraftService,
     container::{model::TransferDirection, service::ContainerService},
+    crafting::CraftService,
+    crafting::RecipeBook,
     error::AppError,
     food::{CollectFoodRequest, FoodCollector, FoodGoal},
     interaction::{InteractionController, interaction_controller::InteractionState},
@@ -27,8 +28,8 @@ use crate::{
     minecraft::client::MinecraftClient,
     movement::{MovementService, NavigationMode},
     navigation::{BlockNavigationService, navigation_state::BlockNavigationState},
-    tree_chopping::TreeChopService,
     tasks::{CancellationReason, GatherRequest, TaskId, TaskService},
+    tree_chopping::TreeChopService,
 };
 use tokio::{sync::mpsc, task::JoinHandle};
 use tokio_util::sync::CancellationToken;
@@ -51,8 +52,28 @@ pub struct App {
     container: ContainerService,
     food_collector: FoodCollector,
     collector: DropCollector,
+    gather: Option<ActiveGather>,
     session_ready: bool,
     started_at: Instant,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum GatherPhase {
+    Searching,
+    WaitingForBreak,
+    WaitingForDrop,
+}
+
+struct ActiveGather {
+    request: crate::tasks::CollectItemsRequest,
+    initial_total: u32,
+    ignored_targets: HashSet<crate::minecraft::world_state::BlockPosition>,
+    target: Option<(crate::minecraft::world_state::BlockPosition, String)>,
+    phase: GatherPhase,
+    started: Instant,
+    failed_targets: u8,
+    drop_wait_started: Option<Instant>,
+    collection_started: bool,
 }
 
 impl App {
@@ -74,8 +95,10 @@ impl App {
 
         let tree_chopping = TreeChopService::new(config.tree_chopping.clone());
         let mining = MiningService::new(BlockSearchService::new(
-            config.block_search.maximum_radius, config.block_search.maximum_result_limit,
-            config.block_search.default_vertical_range));
+            config.block_search.maximum_radius,
+            config.block_search.maximum_result_limit,
+            config.block_search.default_vertical_range,
+        ));
         Ok(Self {
             minecraft: MinecraftClient::new(
                 config.minecraft.clone(),
@@ -115,6 +138,7 @@ impl App {
             container: ContainerService::default(),
             food_collector: FoodCollector::default(),
             collector: DropCollector::new(CollectorConfig::default()),
+            gather: None,
             session_ready: false,
             config,
             shutdown: CancellationToken::new(),
@@ -184,6 +208,7 @@ impl App {
                     // before the next path is selected.
                     self.block_navigation.tick(&self.minecraft, &self.movement).await;
                     self.interaction.tick(&self.minecraft, &self.movement, &self.look).await;
+                    self.tick_gather().await;
                     self.container.tick(&self.minecraft, &self.movement, &self.block_navigation, &self.look).await;
                     self.food_collector.tick(&self.minecraft, &self.movement, &self.interaction, &self.look).await;
                     self.mining.tick(&self.minecraft, &self.movement, &self.look, &self.interaction).await;
@@ -332,6 +357,8 @@ impl App {
                     }
                     self.look.cancel().await;
                     self.tasks.cancel(&self.minecraft).await;
+                    self.gather = None;
+                    self.collector.cancel();
                 }
                 ConsoleCommand::TaskStatus => self.print_task_status().await,
                 ConsoleCommand::GatherStatus => self.print_task_status().await,
@@ -344,6 +371,8 @@ impl App {
                         .await;
                     let _ = self.movement.stop(&self.minecraft).await;
                     self.tasks.cancel(&self.minecraft).await;
+                    self.gather = None;
+                    self.collector.cancel();
                     println!(
                         "Gather cancellation requested; movement and interaction stopped; confirmed partial inventory remains unchanged."
                     );
@@ -377,22 +406,11 @@ impl App {
                             maximum_attempts: 32,
                         }),
                     };
-                    match self
-                        .tasks
-                        .gather_visible_blocks(
-                            &self.minecraft,
-                            &self.movement,
-                            &self.look,
-                            &self.interaction,
-                            request,
-                        )
-                        .await
-                    {
-                        Ok(result) => println!(
-                            "Gathered {}/{} in {} attempts.",
-                            result.collected, result.requested, result.attempts
-                        ),
-                        Err(error) => logging::warning(format!("Gather failed: {error}")),
+                    match request.normalize() {
+                        Ok(request) => self.start_gather(request).await,
+                        Err(error) => {
+                            logging::warning(format!("Gather rejected: {}", error.message))
+                        }
                     }
                 }
                 ConsoleCommand::Follow { player } => {
@@ -544,16 +562,55 @@ impl App {
                         logging::warning(format!("Cannot break block: {error}"));
                     }
                 }
-                ConsoleCommand::MineOre { target, count, radius } => {
-                    self.mining.cancel(&self.minecraft,&self.movement,&self.look,&self.interaction).await;
-                    let selector=if target.starts_with("minecraft:") || target.ends_with("_ore") {OreSelector::Id(target)} else {OreSelector::Group(target)};
-                    if let Err(error)=self.mining.start(&self.minecraft,selector,count,radius.unwrap_or(32)).await { logging::warning(format!("Cannot mine ore: {error}")); }
+                ConsoleCommand::MineOre {
+                    target,
+                    count,
+                    radius,
+                } => {
+                    self.mining
+                        .cancel(
+                            &self.minecraft,
+                            &self.movement,
+                            &self.look,
+                            &self.interaction,
+                        )
+                        .await;
+                    let selector = if target.starts_with("minecraft:") || target.ends_with("_ore") {
+                        OreSelector::Id(target)
+                    } else {
+                        OreSelector::Group(target)
+                    };
+                    if let Err(error) = self
+                        .mining
+                        .start(&self.minecraft, selector, count, radius.unwrap_or(32))
+                        .await
+                    {
+                        logging::warning(format!("Cannot mine ore: {error}"));
+                    }
                 }
                 ConsoleCommand::MineOreStatus => {
-                    let s=self.mining.snapshot().await;
-                    println!("Ore mining: {:?}; collected {}/{}; broken {}; skipped {}; failures {}{}",s.state,s.collected,s.requested,s.blocks_broken,s.skipped,s.failures,s.reason.map(|r|format!("; {r}")).unwrap_or_default());
+                    let s = self.mining.snapshot().await;
+                    println!(
+                        "Ore mining: {:?}; collected {}/{}; broken {}; skipped {}; failures {}{}",
+                        s.state,
+                        s.collected,
+                        s.requested,
+                        s.blocks_broken,
+                        s.skipped,
+                        s.failures,
+                        s.reason.map(|r| format!("; {r}")).unwrap_or_default()
+                    );
                 }
-                ConsoleCommand::MineOreStop => self.mining.cancel(&self.minecraft,&self.movement,&self.look,&self.interaction).await,
+                ConsoleCommand::MineOreStop => {
+                    self.mining
+                        .cancel(
+                            &self.minecraft,
+                            &self.movement,
+                            &self.look,
+                            &self.interaction,
+                        )
+                        .await
+                }
                 ConsoleCommand::Break { x, y, z } => {
                     self.block_navigation
                         .cancel(&self.minecraft, &self.movement)
@@ -821,18 +878,40 @@ impl App {
                     }
                 }
                 ConsoleCommand::ChopTree { request } => {
-                    self.interaction.cancel(&self.minecraft, &self.movement, &self.look).await;
-                    let result = self.tree_chopping.start(request, &self.minecraft, &self.block_search).await;
-                    println!("Tree chopping: {:?} ({} candidate trees inspected)", result.outcome, result.trees_inspected);
+                    self.interaction
+                        .cancel(&self.minecraft, &self.movement, &self.look)
+                        .await;
+                    let result = self
+                        .tree_chopping
+                        .start(request, &self.minecraft, &self.block_search)
+                        .await;
+                    println!(
+                        "Tree chopping: {:?} ({} candidate trees inspected)",
+                        result.outcome, result.trees_inspected
+                    );
                 }
-                ConsoleCommand::ChopTreeStatus => {
-                    match self.tree_chopping.status() {
-                        Some(result) => println!("Tree chopping: {:?}; logs {}/{}; broken {}; unreachable {}; uncertain skipped {}", result.outcome, result.logs_collected, result.requested_logs, result.logs_broken, result.unreachable_logs, result.uncertain_structures_skipped),
-                        None => println!("No tree chopping operation has run."),
-                    }
-                }
+                ConsoleCommand::ChopTreeStatus => match self.tree_chopping.status() {
+                    Some(result) => println!(
+                        "Tree chopping: {:?}; logs {}/{}; broken {}; unreachable {}; uncertain skipped {}",
+                        result.outcome,
+                        result.logs_collected,
+                        result.requested_logs,
+                        result.logs_broken,
+                        result.unreachable_logs,
+                        result.uncertain_structures_skipped
+                    ),
+                    None => println!("No tree chopping operation has run."),
+                },
                 ConsoleCommand::ChopTreeStop => {
-                    let result = self.tree_chopping.stop(&self.minecraft, &self.movement, &self.look, &self.interaction).await;
+                    let result = self
+                        .tree_chopping
+                        .stop(
+                            &self.minecraft,
+                            &self.movement,
+                            &self.look,
+                            &self.interaction,
+                        )
+                        .await;
                     println!("Tree chopping: {:?}", result.outcome);
                 }
                 ConsoleCommand::Reconnect => {
@@ -1100,6 +1179,223 @@ impl App {
         }
     }
 
+    async fn start_gather(&mut self, request: crate::tasks::CollectItemsRequest) {
+        if self.gather.is_some() {
+            logging::warning("Gather already running; cancel it before starting another request");
+            return;
+        }
+        let inventory = self.minecraft.world_state_snapshot().await.inventory;
+        let initial_total = request
+            .item_ids
+            .iter()
+            .map(|id| inventory.count_item(id))
+            .sum();
+        logging::info(format!(
+            "Gather started: {} x{}",
+            request.item_ids.join("|"),
+            request.quantity
+        ));
+        self.gather = Some(ActiveGather {
+            request,
+            initial_total,
+            ignored_targets: HashSet::new(),
+            target: None,
+            phase: GatherPhase::Searching,
+            started: Instant::now(),
+            failed_targets: 0,
+            drop_wait_started: None,
+            collection_started: false,
+        });
+    }
+
+    async fn tick_gather(&mut self) {
+        let Some(mut gather) = self.gather.take() else {
+            return;
+        };
+        const GATHER_TIMEOUT: Duration = Duration::from_secs(300);
+        if gather.started.elapsed() >= GATHER_TIMEOUT {
+            logging::warning("Gather timed out before the requested inventory total was confirmed");
+            return;
+        }
+        let inventory = self.minecraft.world_state_snapshot().await.inventory;
+        let current: u32 = gather
+            .request
+            .item_ids
+            .iter()
+            .map(|id| inventory.count_item(id))
+            .sum();
+        let collected = current.saturating_sub(gather.initial_total);
+        if collected >= gather.request.quantity {
+            logging::success(format!(
+                "Gather completed: {}/{}",
+                collected, gather.request.quantity
+            ));
+            return;
+        }
+
+        match gather.phase {
+            GatherPhase::Searching => {
+                let mut candidates = Vec::new();
+                for block_id in &gather.request.item_ids {
+                    match self
+                        .block_search
+                        .search_raw(
+                            &self.minecraft,
+                            BlockSearchQuery {
+                                block_id: block_id.clone(),
+                                radius: self.config.block_search.default_radius,
+                                maximum_results: self.config.block_search.maximum_result_limit,
+                                vertical_range: self.config.block_search.default_vertical_range,
+                            },
+                        )
+                        .await
+                    {
+                        Ok(found) => candidates.extend(found),
+                        Err(error) => logging::warning(format!(
+                            "Gather search failed for {block_id}: {error}"
+                        )),
+                    }
+                }
+                candidates
+                    .retain(|candidate| !gather.ignored_targets.contains(&candidate.position));
+                candidates.sort_by(|left, right| {
+                    left.position
+                        .y
+                        .cmp(&right.position.y)
+                        .then_with(|| left.distance.total_cmp(&right.distance))
+                });
+                let Some(candidate) = candidates.into_iter().next() else {
+                    logging::warning("No remaining reachable gather candidates");
+                    return;
+                };
+                logging::info(format!(
+                    "Selected gather target: {} {} {} ({})",
+                    candidate.position.x,
+                    candidate.position.y,
+                    candidate.position.z,
+                    candidate.block_id
+                ));
+                match self
+                    .interaction
+                    .break_at(
+                        &self.minecraft,
+                        &self.movement,
+                        &self.look,
+                        candidate.position,
+                    )
+                    .await
+                {
+                    Ok(()) => {
+                        logging::info("Navigating to gather target");
+                        gather.target = Some((candidate.position, candidate.block_id));
+                        gather.phase = GatherPhase::WaitingForBreak;
+                    }
+                    Err(error) => {
+                        logging::warning(format!(
+                            "Target unreachable, ignoring: {} {} {} ({error})",
+                            candidate.position.x, candidate.position.y, candidate.position.z
+                        ));
+                        gather.ignored_targets.insert(candidate.position);
+                        gather.failed_targets = gather.failed_targets.saturating_add(1);
+                    }
+                }
+            }
+            GatherPhase::WaitingForBreak => {
+                let interaction = self.interaction.snapshot().await;
+                match interaction.state {
+                    InteractionState::Completed => {
+                        let Some((_, _item_id)) = gather.target.clone() else {
+                            gather.phase = GatherPhase::Searching;
+                            self.gather = Some(gather);
+                            return;
+                        };
+                        logging::info("Block break completed; waiting for dropped item");
+                        gather.drop_wait_started = Some(Instant::now());
+                        gather.collection_started = false;
+                        gather.phase = GatherPhase::WaitingForDrop;
+                    }
+                    InteractionState::Failed | InteractionState::Cancelled => {
+                        if let Some((position, _)) = gather.target.take() {
+                            let reason = interaction
+                                .failure_reason
+                                .unwrap_or_else(|| "interaction cancelled".into());
+                            logging::warning(format!(
+                                "Target unreachable, ignoring: {} {} {} ({reason})",
+                                position.x, position.y, position.z
+                            ));
+                            gather.ignored_targets.insert(position);
+                            gather.failed_targets = gather.failed_targets.saturating_add(1);
+                        }
+                        gather.phase = GatherPhase::Searching;
+                    }
+                    _ => {}
+                }
+            }
+            GatherPhase::WaitingForDrop => {
+                let Some((position, item_id)) = gather.target.clone() else {
+                    gather.phase = GatherPhase::Searching;
+                    self.gather = Some(gather);
+                    return;
+                };
+                if !gather.collection_started {
+                    let world = self.minecraft.world_state_snapshot().await;
+                    let drop_visible = world.entities.iter().any(|entity| {
+                        entity.entity_type == "minecraft:item"
+                            && entity.item_id.as_deref() == Some(&item_id)
+                    });
+                    if drop_visible {
+                        logging::info(format!("Collecting dropped {item_id}"));
+                        self.collector.start(
+                            crate::collection::CollectRequest::exact(
+                                item_id,
+                                gather.request.quantity.saturating_sub(collected),
+                            ),
+                            Instant::now(),
+                        );
+                        gather.collection_started = true;
+                    } else if gather
+                        .drop_wait_started
+                        .is_some_and(|started| started.elapsed() >= Duration::from_secs(3))
+                    {
+                        logging::warning(format!(
+                            "Dropped item did not appear; ignoring target: {} {} {}",
+                            position.x, position.y, position.z
+                        ));
+                        gather.ignored_targets.insert(position);
+                        gather.target = None;
+                        gather.phase = GatherPhase::Searching;
+                    }
+                } else if !self.collector.running() {
+                    let updated = self.minecraft.world_state_snapshot().await.inventory;
+                    let updated_total: u32 = gather
+                        .request
+                        .item_ids
+                        .iter()
+                        .map(|id| updated.count_item(id))
+                        .sum();
+                    let updated_collected = updated_total.saturating_sub(gather.initial_total);
+                    if updated_collected > collected {
+                        logging::info(format!(
+                            "Inventory confirmed: {}/{}",
+                            updated_collected, gather.request.quantity
+                        ));
+                    } else if let Some((position, _)) = gather.target.take() {
+                        logging::warning(format!(
+                            "Dropped item was not collected; ignoring target: {} {} {}",
+                            position.x, position.y, position.z
+                        ));
+                        gather.ignored_targets.insert(position);
+                    }
+                    gather.target = None;
+                    gather.drop_wait_started = None;
+                    gather.collection_started = false;
+                    gather.phase = GatherPhase::Searching;
+                }
+            }
+        }
+        self.gather = Some(gather);
+    }
+
     async fn print_status(&self) {
         let status = self.minecraft.status();
         let world = self.minecraft.world_state_snapshot().await;
@@ -1209,10 +1505,16 @@ impl App {
 
     async fn print_inventory(&self) {
         let world = self.minecraft.world_state_snapshot().await;
-        println!("Inventory available: {} | revision {}", world.inventory.available, world.inventory.revision);
+        println!(
+            "Inventory available: {} | revision {}",
+            world.inventory.available, world.inventory.revision
+        );
         println!(
             "Selected hotbar slot: {}",
-            world.inventory.selected_hotbar_slot.map_or_else(|| "unknown".into(), |v| v.to_string())
+            world
+                .inventory
+                .selected_hotbar_slot
+                .map_or_else(|| "unknown".into(), |v| v.to_string())
         );
         println!(
             "Selected item: {}",
@@ -1221,8 +1523,17 @@ impl App {
                 |i| format!("{} x{}", i.item_id.as_deref().unwrap_or("unknown"), i.count)
             )
         );
-        let used_slots = world.inventory.slots.iter().filter(|slot| slot.item_id.is_some()).count();
-        println!("Occupied slots: {} / {}", used_slots, world.inventory.slots.len());
+        let used_slots = world
+            .inventory
+            .slots
+            .iter()
+            .filter(|slot| slot.item_id.is_some())
+            .count();
+        println!(
+            "Occupied slots: {} / {}",
+            used_slots,
+            world.inventory.slots.len()
+        );
         println!(
             "Distinct item kinds: {}",
             world.inventory.total_counts.len()
@@ -1467,7 +1778,11 @@ impl App {
         let (result, target) = self.collector.status();
         println!(
             "Collection: {} | collected {}/{} | target {} | lost {}",
-            if self.collector.running() { "running" } else { "idle" },
+            if self.collector.running() {
+                "running"
+            } else {
+                "idle"
+            },
             result.collected,
             result.requested,
             target.map_or_else(|| "none".into(), |id| id.to_string()),

@@ -118,7 +118,11 @@ pub enum ConsoleCommand {
     CollectItem(CollectRequest),
     CollectItemStatus,
     CollectItemStop,
-    MineOre { target: String, count: u32, radius: Option<u32> },
+    MineOre {
+        target: String,
+        count: u32,
+        radius: Option<u32>,
+    },
     MineOreStatus,
     MineOreStop,
     Craft {
@@ -138,7 +142,9 @@ pub enum ConsoleCommand {
         block_id: String,
     },
     TestOakLog,
-    ChopTree { request: crate::tree_chopping::ChopRequest },
+    ChopTree {
+        request: crate::tree_chopping::ChopRequest,
+    },
     ChopTreeStatus,
     ChopTreeStop,
     OpenChest {
@@ -391,15 +397,31 @@ fn parse_chop_tree(arguments: &str) -> Result<ConsoleCommand, AppError> {
     use crate::tree_chopping::ChopRequest;
     let parts: Vec<_> = arguments.split_whitespace().collect();
     let request = match parts.as_slice() {
-        ["nearest"] => return Ok(ConsoleCommand::ChopTree { request: ChopRequest::Nearest }),
+        ["nearest"] => {
+            return Ok(ConsoleCommand::ChopTree {
+                request: ChopRequest::Nearest,
+            });
+        }
         ["status"] => return Ok(ConsoleCommand::ChopTreeStatus),
         ["stop"] => return Ok(ConsoleCommand::ChopTreeStop),
-        ["logs", amount] => ChopRequest::Logs(amount.parse().map_err(|_| AppError::InvalidConsoleSyntax("/chop-tree logs <positive count>".into()))?),
-        ["count", amount] => ChopRequest::Count(amount.parse().map_err(|_| AppError::InvalidConsoleSyntax("/chop-tree count <positive count>".into()))?),
+        ["logs", amount] => ChopRequest::Logs(amount.parse().map_err(|_| {
+            AppError::InvalidConsoleSyntax("/chop-tree logs <positive count>".into())
+        })?),
+        ["count", amount] => ChopRequest::Count(amount.parse().map_err(|_| {
+            AppError::InvalidConsoleSyntax("/chop-tree count <positive count>".into())
+        })?),
         [kind] => ChopRequest::TreeType(kind.to_ascii_lowercase()),
-        _ => return Err(AppError::InvalidConsoleSyntax("/chop-tree nearest|<type>|logs <n>|count <n>|status|stop".into())),
+        _ => {
+            return Err(AppError::InvalidConsoleSyntax(
+                "/chop-tree nearest|<type>|logs <n>|count <n>|status|stop".into(),
+            ));
+        }
     };
-    if matches!(request, ChopRequest::Logs(0) | ChopRequest::Count(0)) { return Err(AppError::InvalidConsoleSyntax("chop count must be positive".into())); }
+    if matches!(request, ChopRequest::Logs(0) | ChopRequest::Count(0)) {
+        return Err(AppError::InvalidConsoleSyntax(
+            "chop count must be positive".into(),
+        ));
+    }
     Ok(ConsoleCommand::ChopTree { request })
 }
 
@@ -409,11 +431,26 @@ fn parse_mine_ore(arguments: &str) -> Result<ConsoleCommand, AppError> {
         ["status"] => Ok(ConsoleCommand::MineOreStatus),
         ["stop"] => Ok(ConsoleCommand::MineOreStop),
         [target, count] | [target, count, _] => {
-            let count=count.parse().map_err(|_|AppError::InvalidConsoleSyntax("/mine-ore <ore|group> <count> [radius]".into()))?;
-            let radius=parts.get(2).map(|v|v.parse().map_err(|_|AppError::InvalidConsoleSyntax("radius must be a positive integer".into()))).transpose()?;
-            Ok(ConsoleCommand::MineOre{target:target.to_ascii_lowercase(),count,radius})
+            let count = count.parse().map_err(|_| {
+                AppError::InvalidConsoleSyntax("/mine-ore <ore|group> <count> [radius]".into())
+            })?;
+            let radius = parts
+                .get(2)
+                .map(|v| {
+                    v.parse().map_err(|_| {
+                        AppError::InvalidConsoleSyntax("radius must be a positive integer".into())
+                    })
+                })
+                .transpose()?;
+            Ok(ConsoleCommand::MineOre {
+                target: target.to_ascii_lowercase(),
+                count,
+                radius,
+            })
         }
-        _ => Err(AppError::InvalidConsoleSyntax("/mine-ore <ore|group> <count> [radius] | status | stop".into())),
+        _ => Err(AppError::InvalidConsoleSyntax(
+            "/mine-ore <ore|group> <count> [radius] | status | stop".into(),
+        )),
     }
 }
 
@@ -989,8 +1026,18 @@ mod tests {
             parse_input("/breakblock").unwrap(),
             ConsoleInput::Command(ConsoleCommand::BreakBlock)
         );
-        assert_eq!(parse_input("/mine-ore diamond 3 24").unwrap(), ConsoleInput::Command(ConsoleCommand::MineOre{target:"diamond".into(),count:3,radius:Some(24)}));
-        assert_eq!(parse_input("/mine-ore status").unwrap(), ConsoleInput::Command(ConsoleCommand::MineOreStatus));
+        assert_eq!(
+            parse_input("/mine-ore diamond 3 24").unwrap(),
+            ConsoleInput::Command(ConsoleCommand::MineOre {
+                target: "diamond".into(),
+                count: 3,
+                radius: Some(24)
+            })
+        );
+        assert_eq!(
+            parse_input("/mine-ore status").unwrap(),
+            ConsoleInput::Command(ConsoleCommand::MineOreStatus)
+        );
         assert_eq!(
             parse_input("/break 1 64 -2").unwrap(),
             ConsoleInput::Command(ConsoleCommand::Break { x: 1, y: 64, z: -2 })
@@ -1047,9 +1094,22 @@ mod tests {
     #[test]
     fn parses_tree_chopping_commands_and_rejects_zero() {
         use crate::tree_chopping::ChopRequest;
-        assert_eq!(parse_input("/chop-tree nearest").unwrap(), ConsoleInput::Command(ConsoleCommand::ChopTree { request: ChopRequest::Nearest }));
-        assert_eq!(parse_input("/choptree logs 12").unwrap(), ConsoleInput::Command(ConsoleCommand::ChopTree { request: ChopRequest::Logs(12) }));
-        assert_eq!(parse_input("/chop-tree status").unwrap(), ConsoleInput::Command(ConsoleCommand::ChopTreeStatus));
+        assert_eq!(
+            parse_input("/chop-tree nearest").unwrap(),
+            ConsoleInput::Command(ConsoleCommand::ChopTree {
+                request: ChopRequest::Nearest
+            })
+        );
+        assert_eq!(
+            parse_input("/choptree logs 12").unwrap(),
+            ConsoleInput::Command(ConsoleCommand::ChopTree {
+                request: ChopRequest::Logs(12)
+            })
+        );
+        assert_eq!(
+            parse_input("/chop-tree status").unwrap(),
+            ConsoleInput::Command(ConsoleCommand::ChopTreeStatus)
+        );
         assert!(parse_input("/chop-tree count 0").is_err());
     }
 

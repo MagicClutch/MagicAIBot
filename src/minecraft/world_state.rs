@@ -7,8 +7,8 @@ use std::{
 
 use uuid::Uuid;
 
-use super::dropped_items::DroppedItemObservation;
 use super::container::{ContainerObserver, ContainerSnapshot, MenuObservation};
+use super::dropped_items::DroppedItemObservation;
 use crate::error::AppError;
 
 pub const DEFAULT_ENTITY_RADIUS: f64 = 64.0;
@@ -115,11 +115,17 @@ impl InventorySnapshot {
             return self.slots.iter().find(|slot| slot.slot == selected);
         }
         let first_hotbar = self.slots.len() - 9;
-        self.slots.iter().find(|slot| slot.slot == first_hotbar + selected)
+        self.slots
+            .iter()
+            .find(|slot| slot.slot == first_hotbar + selected)
     }
     pub fn item_is_in_hotbar(&self, id: &str) -> bool {
-        let Some(first_hotbar) = self.slots.len().checked_sub(9) else { return false };
-        self.slots.iter().any(|slot| slot.slot >= first_hotbar && slot.item_id.as_deref() == Some(id))
+        let Some(first_hotbar) = self.slots.len().checked_sub(9) else {
+            return false;
+        };
+        self.slots
+            .iter()
+            .any(|slot| slot.slot >= first_hotbar && slot.item_id.as_deref() == Some(id))
     }
     fn rebuild_counts(&mut self) {
         self.total_counts.clear();

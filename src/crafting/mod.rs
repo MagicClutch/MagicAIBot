@@ -103,14 +103,21 @@ pub enum Failure {
     UnknownItem(String),
     /// Reserved for a runtime source that has no dataset for its protocol.
     #[allow(dead_code)]
-    DataUnavailable { version: String },
+    DataUnavailable {
+        version: String,
+    },
     UnsupportedIngredient(String),
     /// Returned by future runtime adapters for furnace/smithing displays.
     #[allow(dead_code)]
     UnsupportedRecipeType(String),
     StationUnavailable(Station),
-    Cycle { path: Vec<String> },
-    DepthLimit { item: String, limit: usize },
+    Cycle {
+        path: Vec<String>,
+    },
+    DepthLimit {
+        item: String,
+        limit: usize,
+    },
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]

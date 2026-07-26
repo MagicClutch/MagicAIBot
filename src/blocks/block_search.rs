@@ -120,8 +120,11 @@ pub fn sort_deduplicate_limit(
     // same loaded-world snapshot must produce the same target sequence.
     results.sort_by(|left, right| {
         left.distance.total_cmp(&right.distance).then_with(|| {
-            (left.position.x, left.position.y, left.position.z)
-                .cmp(&(right.position.x, right.position.y, right.position.z))
+            (left.position.x, left.position.y, left.position.z).cmp(&(
+                right.position.x,
+                right.position.y,
+                right.position.z,
+            ))
         })
     });
     results.dedup_by_key(|result| result.position);
