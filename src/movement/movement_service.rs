@@ -372,9 +372,9 @@ impl MovementService {
 }
 
 fn pathfinder_startup_grace_elapsed(snapshot: &MovementSnapshot) -> bool {
-    snapshot.started_at.is_none_or(|started| {
-        started.elapsed().unwrap_or_default() >= PATHFINDER_STARTUP_GRACE
-    })
+    snapshot
+        .started_at
+        .is_none_or(|started| started.elapsed().unwrap_or_default() >= PATHFINDER_STARTUP_GRACE)
 }
 
 #[cfg(test)]

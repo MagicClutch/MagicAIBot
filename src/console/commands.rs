@@ -2,11 +2,12 @@
 
 use crate::{
     blocks::block_query::normalize_block_id,
+    collection::{CollectRequest, ItemFilter, ItemGroup},
     error::AppError,
     movement::commands::{parse_coordinates, parse_follow_name},
 };
 
-#[derive(Debug, Eq, PartialEq)]
+#[derive(Debug, PartialEq)]
 pub enum ConsoleCommand {
     Help,
     Status,
@@ -15,7 +16,38 @@ pub enum ConsoleCommand {
     },
     Players,
     Inventory,
+    SelectHotbar {
+        slot: u8,
+    },
+    EnsureHotbar {
+        item_id: String,
+        slot: Option<u8>,
+    Smelt { target: String, count: u32 },
+    SmeltRecipe { recipe_id: String, count: u32 },
+    SmeltStatus,
+    SmeltStop,
+    CleanupInventory {
+        operation: CleanupOperation,
+    FurnaceStatus,
+    SmeltCheck {
+        output: String,
+        count: u32,
+    },
+    FuelInfo {
+        item: String,
+    ContainerStatus,
+    Recipe {
+        id: String,
+    },
+    CraftCheck {
+        item: String,
+        count: u32,
+        depth: usize,
+    },
     Entities {
+        radius: Option<u32>,
+    },
+    Drops {
         radius: Option<u32>,
     },
     Goto {
@@ -77,6 +109,10 @@ pub enum ConsoleCommand {
     BreakNearest {
         block_id: String,
     },
+    /// Debug-only: score the hotbar and select the policy winner for a block.
+    SelectTool {
+        block_id: String,
+    },
     PlaceLooked {
         block_id: String,
     },
@@ -88,7 +124,20 @@ pub enum ConsoleCommand {
     },
     StopInteraction,
     InteractionStatus,
+    CollectFood {
+        item: Option<String>,
+        count: u32,
+        food_value: bool,
+    },
+    CollectFoodStatus,
+    CollectFoodStop,
+    EnsureTool {
+        block_id: String,
+    },
     TestOakLog,
+    ChopTree { request: crate::tree_chopping::ChopRequest },
+    ChopTreeStatus,
+    ChopTreeStop,
     OpenChest {
         x: i32,
         y: i32,
@@ -108,11 +157,19 @@ pub enum ConsoleCommand {
     Quit,
 }
 
-#[derive(Debug, Eq, PartialEq)]
+#[derive(Debug, PartialEq)]
 pub enum ConsoleInput {
     Command(ConsoleCommand),
     ChatMessage(String),
     Empty,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum CleanupOperation {
+    DryRun,
+    Execute,
+    Status,
+    Stop,
 }
 
 #[must_use]
@@ -144,6 +201,78 @@ pub fn parse_input(input: &str) -> Result<ConsoleInput, AppError> {
         "status" => no_arguments(command, arguments, ConsoleCommand::Status)?,
         "players" => no_arguments(command, arguments, ConsoleCommand::Players)?,
         "inventory" => no_arguments(command, arguments, ConsoleCommand::Inventory)?,
+        "select-hotbar" => ConsoleCommand::SelectHotbar {
+            slot: arguments.parse().map_err(|_| {
+                AppError::InvalidConsoleSyntax("usage: /select-hotbar SLOT (0-8)".into())
+            })?,
+        },
+        "ensure-hotbar" => {
+            let mut parts = arguments.split_whitespace();
+            let item_id = parts
+                .next()
+                .ok_or_else(|| {
+                    AppError::InvalidConsoleSyntax("usage: /ensure-hotbar ITEM [SLOT]".into())
+                })?
+                .to_owned();
+            let slot =
+                parts.next().map(str::parse).transpose().map_err(|_| {
+                    AppError::InvalidConsoleSyntax("hotbar slot must be 0-8".into())
+                })?;
+            if parts.next().is_some() {
+                return Err(AppError::InvalidConsoleSyntax(
+                    "usage: /ensure-hotbar ITEM [SLOT]".into(),
+                ));
+            }
+            ConsoleCommand::EnsureHotbar { item_id, slot }
+        "smelt" => parse_smelt(arguments)?,
+        "smeltstatus" => no_arguments(command, arguments, ConsoleCommand::SmeltStatus)?,
+        "smeltstop" => no_arguments(command, arguments, ConsoleCommand::SmeltStop)?,
+        "cleanup-inventory" => {
+            let operation = match arguments {
+                "dry-run" => CleanupOperation::DryRun,
+                "execute" => CleanupOperation::Execute,
+                "status" => CleanupOperation::Status,
+                "stop" => CleanupOperation::Stop,
+                _ => {
+                    return Err(AppError::InvalidConsoleSyntax(
+                        "/cleanup-inventory dry-run|execute|status|stop".into(),
+                    ));
+                }
+            };
+            ConsoleCommand::CleanupInventory { operation }
+        }
+        "furnace-status" => no_arguments(command, arguments, ConsoleCommand::FurnaceStatus)?,
+        "smelt-check" => {
+            let mut parts = arguments.split_whitespace();
+            let output = minecraft_id(parts.next().ok_or_else(|| {
+                AppError::MissingConsoleArgument("/smelt-check <output> <count>".into())
+            })?);
+            let count = parts
+                .next()
+                .ok_or_else(|| {
+                    AppError::MissingConsoleArgument("/smelt-check <output> <count>".into())
+                })?
+                .parse()
+                .map_err(|_| {
+                    AppError::InvalidConsoleSyntax("count must be a positive integer".into())
+                })?;
+            if count == 0 || parts.next().is_some() {
+                return Err(AppError::InvalidConsoleSyntax(
+                    "/smelt-check <output> <count>".into(),
+                ));
+            }
+            ConsoleCommand::SmeltCheck { output, count }
+        }
+        "fuel-info" => ConsoleCommand::FuelInfo {
+            item: minecraft_id(single_argument(command, arguments, "/fuel-info <item>")?),
+        },
+        "containerstatus" | "container-status" => {
+            no_arguments(command, arguments, ConsoleCommand::ContainerStatus)?
+        }
+        "recipe" => ConsoleCommand::Recipe {
+            id: normalize_item_id(single_argument(command, arguments, "/recipe <recipe_id>")?)?,
+        },
+        "craft-check" => parse_craft_check(arguments)?,
         "entities" => {
             let radius = if arguments.is_empty() {
                 None
@@ -160,6 +289,10 @@ pub fn parse_input(input: &str) -> Result<ConsoleInput, AppError> {
                 ));
             }
             ConsoleCommand::Entities { radius }
+        }
+        "drops" | "dropstatus" => {
+            let radius = optional_radius(arguments)?;
+            ConsoleCommand::Drops { radius }
         }
         "goto" => {
             let destination = parse_coordinates(arguments)?;
@@ -230,11 +363,31 @@ pub fn parse_input(input: &str) -> Result<ConsoleInput, AppError> {
                 "/breaknearest <block_id>",
             )?)?,
         },
+        "select-tool" => ConsoleCommand::SelectTool {
+            block_id: normalize_block_id(single_argument(
+                command,
+                arguments,
+                "/select-tool <block_id>",
+            )?)?,
+        },
         "place" => parse_place(arguments)?,
         "placeblock" => parse_placeblock(arguments)?,
         "stopinteraction" => no_arguments(command, arguments, ConsoleCommand::StopInteraction)?,
         "interactionstatus" => no_arguments(command, arguments, ConsoleCommand::InteractionStatus)?,
+        "collect-food" => parse_collect_food(arguments)?,
+        "collect-food-status" => {
+            no_arguments(command, arguments, ConsoleCommand::CollectFoodStatus)?
+        }
+        "collect-food-stop" => no_arguments(command, arguments, ConsoleCommand::CollectFoodStop)?,
+        "ensure-tool" | "craft-tool" => ConsoleCommand::EnsureTool {
+            block_id: normalize_block_id(single_argument(
+                command,
+                arguments,
+                "/ensure-tool <block_id>",
+            )?)?,
+        },
         "testoaklog" => no_arguments(command, arguments, ConsoleCommand::TestOakLog)?,
+        "chop-tree" | "choptree" => parse_chop_tree(arguments)?,
         "open-chest" => {
             let p = parse_coordinates(arguments)?;
             ConsoleCommand::OpenChest {
@@ -265,6 +418,57 @@ pub fn parse_input(input: &str) -> Result<ConsoleInput, AppError> {
     Ok(ConsoleInput::Command(parsed))
 }
 
+fn normalize_item_id(value: &str) -> Result<String, AppError> {
+    let id = if value.contains(':') {
+        value.to_ascii_lowercase()
+    } else {
+        format!("minecraft:{}", value.to_ascii_lowercase())
+    };
+    if id.split_once(':').is_some_and(|(namespace, path)| {
+        !namespace.is_empty()
+            && !path.is_empty()
+            && namespace.chars().all(|c| {
+                c.is_ascii_lowercase() || c.is_ascii_digit() || matches!(c, '_' | '-' | '.')
+            })
+            && path.chars().all(|c| {
+                c.is_ascii_lowercase() || c.is_ascii_digit() || matches!(c, '_' | '-' | '.' | '/')
+            })
+    }) {
+        Ok(id)
+    } else {
+        Err(AppError::InvalidConsoleSyntax(
+            "invalid item identifier".into(),
+        ))
+    }
+}
+
+fn parse_container_transfer(arguments: &str, take: bool) -> Result<ConsoleCommand, AppError> {
+    let mut parts = arguments.split_whitespace();
+    let item = normalize_item_id(
+        parts
+            .next()
+            .ok_or_else(|| AppError::MissingConsoleArgument("<item> <count>".into()))?,
+    )?;
+    let count: u32 = parts
+        .next()
+        .ok_or_else(|| AppError::MissingConsoleArgument("<item> <count>".into()))?
+        .parse()
+        .map_err(|_| AppError::InvalidConsoleSyntax("count must be positive".into()))?;
+    if count == 0 || parts.next().is_some() {
+        return Err(AppError::InvalidConsoleSyntax(
+            "<item> <positive-count>".into(),
+        ));
+    }
+    Ok(if take {
+        ConsoleCommand::TakeItem {
+            item_id: item,
+            count,
+        }
+    } else {
+        ConsoleCommand::StoreItem {
+            item_id: item,
+            count,
+        }
 fn parse_collect_food(arguments: &str) -> Result<ConsoleCommand, AppError> {
     let parts: Vec<_> = arguments.split_whitespace().collect();
     let parsed = match parts.as_slice() {
@@ -534,6 +738,25 @@ mod tests {
     use super::*;
 
     #[test]
+    fn parses_read_only_crafting_commands() {
+        assert_eq!(
+            parse_input("/recipe stick").unwrap(),
+            ConsoleInput::Command(ConsoleCommand::Recipe {
+                id: "minecraft:stick".into()
+            })
+        );
+        assert_eq!(
+            parse_input("/craft-check minecraft:torch 5 4").unwrap(),
+            ConsoleInput::Command(ConsoleCommand::CraftCheck {
+                item: "minecraft:torch".into(),
+                count: 5,
+                depth: 4
+            })
+        );
+        assert!(parse_input("/craft-check torch 0").is_err());
+    }
+
+    #[test]
     fn parses_empty_input() {
         assert_eq!(parse_input(" \t ").unwrap(), ConsoleInput::Empty);
     }
@@ -565,11 +788,70 @@ mod tests {
             ConsoleInput::Command(ConsoleCommand::Status)
         );
         assert_eq!(
+            parse_input("/drops 32").unwrap(),
+            ConsoleInput::Command(ConsoleCommand::Drops { radius: Some(32) })
+            parse_input("/containerstatus").unwrap(),
+            ConsoleInput::Command(ConsoleCommand::ContainerStatus)
+        );
+        assert_eq!(
             parse_input("/chat hello").unwrap(),
             ConsoleInput::Command(ConsoleCommand::Chat {
                 message: "hello".to_owned()
             })
         );
+    }
+
+    #[test]
+    fn parses_cleanup_inventory_commands_strictly() {
+        for (text, operation) in [
+            ("/cleanup-inventory dry-run", CleanupOperation::DryRun),
+            ("/cleanup-inventory execute", CleanupOperation::Execute),
+            ("/cleanup-inventory status", CleanupOperation::Status),
+            ("/cleanup-inventory stop", CleanupOperation::Stop),
+        ] {
+            assert_eq!(
+                parse_input(text).unwrap(),
+                ConsoleInput::Command(ConsoleCommand::CleanupInventory { operation })
+            );
+        }
+        assert!(parse_input("/cleanup-inventory").is_err());
+        assert!(parse_input("/cleanup-inventory run").is_err());
+    fn parses_processing_debug_commands() {
+        assert_eq!(
+            parse_input("/furnace-status").unwrap(),
+            ConsoleInput::Command(ConsoleCommand::FurnaceStatus)
+        );
+        assert_eq!(
+            parse_input("/smelt-check iron_ingot 3").unwrap(),
+            ConsoleInput::Command(ConsoleCommand::SmeltCheck {
+                output: "minecraft:iron_ingot".into(),
+                count: 3
+            })
+        );
+        assert_eq!(
+            parse_input("/fuel-info coal").unwrap(),
+            ConsoleInput::Command(ConsoleCommand::FuelInfo {
+                item: "minecraft:coal".into()
+            })
+        );
+        assert!(parse_input("/smelt-check iron_ingot 0").is_err());
+    fn parses_crafting_debug_commands() {
+        assert_eq!(
+            parse_input("/craft stick 4").unwrap(),
+            ConsoleInput::Command(ConsoleCommand::Craft {
+                target: "minecraft:stick".into(),
+                count: 4
+            })
+        );
+        assert_eq!(
+            parse_input("/craft status").unwrap(),
+            ConsoleInput::Command(ConsoleCommand::CraftStatus)
+        );
+        assert_eq!(
+            parse_input("/craft stop").unwrap(),
+            ConsoleInput::Command(ConsoleCommand::CraftStop)
+        );
+        assert!(parse_input("/craft stick 0").is_err());
     }
 
     #[test]
@@ -695,6 +977,8 @@ mod tests {
             parse_input("/breakblock").unwrap(),
             ConsoleInput::Command(ConsoleCommand::BreakBlock)
         );
+        assert_eq!(parse_input("/mine-ore diamond 3 24").unwrap(), ConsoleInput::Command(ConsoleCommand::MineOre{target:"diamond".into(),count:3,radius:Some(24)}));
+        assert_eq!(parse_input("/mine-ore status").unwrap(), ConsoleInput::Command(ConsoleCommand::MineOreStatus));
         assert_eq!(
             parse_input("/break 1 64 -2").unwrap(),
             ConsoleInput::Command(ConsoleCommand::Break { x: 1, y: 64, z: -2 })
@@ -703,6 +987,12 @@ mod tests {
             parse_input("/breaknearest oak_log").unwrap(),
             ConsoleInput::Command(ConsoleCommand::BreakNearest {
                 block_id: "minecraft:oak_log".into()
+            })
+        );
+        assert_eq!(
+            parse_input("/select-tool diamond_ore").unwrap(),
+            ConsoleInput::Command(ConsoleCommand::SelectTool {
+                block_id: "minecraft:diamond_ore".into()
             })
         );
         assert_eq!(
@@ -741,6 +1031,27 @@ mod tests {
             ConsoleInput::Command(ConsoleCommand::TestOakLog)
         );
     }
+    #[test]
+    fn parses_container_debug_commands() {
+        assert_eq!(
+            parse_input("/open-chest 1 64 -2").unwrap(),
+            ConsoleInput::Command(ConsoleCommand::OpenChest { x: 1, y: 64, z: -2 })
+        );
+        assert_eq!(
+            parse_input("/take-item diamond 3").unwrap(),
+            ConsoleInput::Command(ConsoleCommand::TakeItem {
+                item_id: "minecraft:diamond".into(),
+                count: 3
+            })
+        );
+        assert_eq!(
+            parse_input("/store-item cobblestone 64").unwrap(),
+            ConsoleInput::Command(ConsoleCommand::StoreItem {
+                item_id: "minecraft:cobblestone".into(),
+                count: 64
+            })
+        );
+        assert!(parse_input("/take-item diamond 0").is_err());
 
     #[test]
     fn parses_food_collection_and_controls() {
