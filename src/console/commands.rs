@@ -15,6 +15,14 @@ pub enum ConsoleCommand {
     },
     Players,
     Inventory,
+    Recipe {
+        id: String,
+    },
+    CraftCheck {
+        item: String,
+        count: u32,
+        depth: usize,
+    },
     Entities {
         radius: Option<u32>,
     },
@@ -182,6 +190,10 @@ pub fn parse_input(input: &str) -> Result<ConsoleInput, AppError> {
         "status" => no_arguments(command, arguments, ConsoleCommand::Status)?,
         "players" => no_arguments(command, arguments, ConsoleCommand::Players)?,
         "inventory" => no_arguments(command, arguments, ConsoleCommand::Inventory)?,
+        "recipe" => ConsoleCommand::Recipe {
+            id: normalize_item_id(single_argument(command, arguments, "/recipe <recipe_id>")?)?,
+        },
+        "craft-check" => parse_craft_check(arguments)?,
         "entities" => {
             let radius = if arguments.is_empty() {
                 None
@@ -330,6 +342,45 @@ pub fn parse_input(input: &str) -> Result<ConsoleInput, AppError> {
 }
 
 fn normalize_item_id(value: &str) -> Result<String, AppError> {
+    if value.is_empty() || value.chars().any(char::is_whitespace) || value.matches(':').count() > 1
+    {
+        return Err(AppError::InvalidConsoleSyntax(
+            "invalid namespaced identifier".into(),
+        ));
+    }
+    Ok(if value.contains(':') {
+        value.to_ascii_lowercase()
+    } else {
+        format!("minecraft:{}", value.to_ascii_lowercase())
+    })
+}
+
+fn parse_craft_check(arguments: &str) -> Result<ConsoleCommand, AppError> {
+    let parts: Vec<_> = arguments.split_whitespace().collect();
+    if !(1..=3).contains(&parts.len()) {
+        return Err(AppError::InvalidConsoleSyntax(
+            "/craft-check <item> [count] [depth]".into(),
+        ));
+    }
+    let count = parts
+        .get(1)
+        .map_or(Ok(1), |v| v.parse::<u32>())
+        .map_err(|_| {
+            AppError::InvalidConsoleSyntax("craft count must be a positive integer".into())
+        })?;
+    let depth = parts
+        .get(2)
+        .map_or(Ok(8), |v| v.parse::<usize>())
+        .map_err(|_| AppError::InvalidConsoleSyntax("depth must be an integer".into()))?;
+    if count == 0 || depth == 0 || depth > 64 {
+        return Err(AppError::InvalidConsoleSyntax(
+            "count must be positive and depth must be 1..=64".into(),
+        ));
+    }
+    Ok(ConsoleCommand::CraftCheck {
+        item: normalize_item_id(parts[0])?,
+        count,
+        depth,
     let value = if value.contains(':') {
         value.to_owned()
     } else {
@@ -711,6 +762,25 @@ fn single_argument<'a>(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn parses_read_only_crafting_commands() {
+        assert_eq!(
+            parse_input("/recipe stick").unwrap(),
+            ConsoleInput::Command(ConsoleCommand::Recipe {
+                id: "minecraft:stick".into()
+            })
+        );
+        assert_eq!(
+            parse_input("/craft-check minecraft:torch 5 4").unwrap(),
+            ConsoleInput::Command(ConsoleCommand::CraftCheck {
+                item: "minecraft:torch".into(),
+                count: 5,
+                depth: 4
+            })
+        );
+        assert!(parse_input("/craft-check torch 0").is_err());
+    }
 
     #[test]
     fn parses_empty_input() {
