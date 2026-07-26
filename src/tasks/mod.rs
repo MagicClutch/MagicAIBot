@@ -33,6 +33,8 @@ use crate::{
     navigation::BlockNavigationService,
 };
 
+#[allow(dead_code)] // Lifecycle API lands before composed production tasks use it.
+pub mod runtime;
 pub mod gather;
 pub const DEFAULT_HISTORY_LIMIT: usize = 64;
 pub const DEFAULT_LEASE_TIMEOUT: Duration = Duration::from_secs(10);
