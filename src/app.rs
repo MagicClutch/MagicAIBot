@@ -266,6 +266,7 @@ impl App {
                 }
                 ConsoleCommand::Players => self.print_players().await,
                 ConsoleCommand::Inventory => self.print_inventory().await,
+                ConsoleCommand::ContainerStatus => self.print_container_status().await,
                 ConsoleCommand::Recipe { id } => self.print_recipe(&id),
                 ConsoleCommand::CraftCheck { item, count, depth } => {
                     self.print_craft_check(&item, count, depth).await
@@ -856,6 +857,54 @@ impl App {
             ConsoleInput::Empty => {}
         }
         Ok(false)
+    }
+
+    async fn print_container_status(&self) {
+        let snapshot = self.minecraft.world_state_snapshot().await.container;
+        println!("Container observer (read-only):");
+        println!("  session generation: {}", snapshot.session_generation);
+        println!(
+            "  open: {}  synced: {}  state: {:?}",
+            snapshot.is_open, snapshot.is_synced, snapshot.sync_state
+        );
+        if let Some(identity) = snapshot.identity {
+            println!(
+                "  window: {}  type: {}  title: {}",
+                identity.window_id,
+                identity.menu_type,
+                identity.title.as_deref().unwrap_or("unknown")
+            );
+            println!(
+                "  position: {}",
+                identity
+                    .world_position
+                    .map_or_else(|| "unknown".into(), |p| format!("{} {} {}", p.x, p.y, p.z))
+            );
+        }
+        println!(
+            "  revision: {}  container slots: {}  player slots: {}",
+            snapshot
+                .revision
+                .map_or_else(|| "unknown".into(), |revision| revision.to_string()),
+            snapshot.container_slots.len(),
+            snapshot.player_slots.len()
+        );
+        println!(
+            "  cursor: {}",
+            snapshot
+                .cursor
+                .as_ref()
+                .and_then(|slot| slot.item_id.as_deref())
+                .map_or("empty".into(), |id| format!(
+                    "{} x{}",
+                    id,
+                    snapshot.cursor.as_ref().map_or(0, |slot| slot.count)
+                ))
+        );
+        println!(
+            "  opened: {:?}  observed: {:?}  closed: {:?}",
+            snapshot.opened_at, snapshot.observed_at, snapshot.closed_at
+        );
     }
 
     async fn find_blocks(&self, block_id: String, radius: Option<u32>, limit: Option<usize>) {
@@ -1500,6 +1549,7 @@ fn print_help() {
     println!("/chat TEXT  Send TEXT to Minecraft chat");
     println!("/players    Show known online players");
     println!("/inventory  Show inventory summary");
+    println!("/containerstatus  Show read-only active-container debug state");
     println!("/recipe ID  Show a versioned read-only recipe");
     println!("/craft-check ITEM [COUNT] [DEPTH]  Plan with a virtual inventory");
     println!("/collect-food [ITEM COUNT|value POINTS]  Collect safe observable food");
