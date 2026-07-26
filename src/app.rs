@@ -26,7 +26,6 @@ use crate::{
     minecraft::client::MinecraftClient,
     movement::{MovementService, NavigationMode},
     navigation::{BlockNavigationService, navigation_state::BlockNavigationState},
-    tasks::TaskService,
     tree_chopping::TreeChopService,
     tasks::{CancellationReason, GatherRequest, TaskId, TaskService},
 };
@@ -180,9 +179,6 @@ impl App {
                     self.container.tick(&self.minecraft, &self.movement, &self.block_navigation, &self.look).await;
                     self.food_collector.tick(&self.minecraft, &self.movement, &self.interaction, &self.look).await;
                     self.mining.tick(&self.minecraft, &self.movement, &self.look, &self.interaction).await;
-                },
-                _ = interaction_tick.tick() => {
-                    self.interaction.tick(&self.minecraft, &self.movement, &self.look).await;
                     self.tree_chopping.tick(&self.minecraft, &self.movement, &self.look, &self.interaction).await;
                 },
                 input = input_rx.recv() => match input {

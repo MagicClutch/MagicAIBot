@@ -357,6 +357,8 @@ fn parse_chop_tree(arguments: &str) -> Result<ConsoleCommand, AppError> {
     };
     if matches!(request, ChopRequest::Logs(0) | ChopRequest::Count(0)) { return Err(AppError::InvalidConsoleSyntax("chop count must be positive".into())); }
     Ok(ConsoleCommand::ChopTree { request })
+}
+
 fn parse_mine_ore(arguments: &str) -> Result<ConsoleCommand, AppError> {
     let parts: Vec<_> = arguments.split_whitespace().collect();
     match parts.as_slice() {
@@ -1001,6 +1003,8 @@ mod tests {
         assert_eq!(parse_input("/choptree logs 12").unwrap(), ConsoleInput::Command(ConsoleCommand::ChopTree { request: ChopRequest::Logs(12) }));
         assert_eq!(parse_input("/chop-tree status").unwrap(), ConsoleInput::Command(ConsoleCommand::ChopTreeStatus));
         assert!(parse_input("/chop-tree count 0").is_err());
+    }
+
     #[test]
     fn parses_container_debug_commands() {
         assert_eq!(
