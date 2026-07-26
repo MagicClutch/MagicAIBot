@@ -356,6 +356,9 @@ fn parse_container_transfer(arguments: &str, take: bool) -> Result<ConsoleComman
             item_id: item,
             count,
         }
+    })
+}
+
 fn parse_collect_food(arguments: &str) -> Result<ConsoleCommand, AppError> {
     let parts: Vec<_> = arguments.split_whitespace().collect();
     let parsed = match parts.as_slice() {
@@ -392,29 +395,6 @@ fn parse_collect_food(arguments: &str) -> Result<ConsoleCommand, AppError> {
         ));
     }
     Ok(parsed)
-}
-
-fn normalize_item_id(input: &str) -> Result<String, AppError> {
-    let id = if input.contains(':') {
-        input.to_ascii_lowercase()
-    } else {
-        format!("minecraft:{}", input.to_ascii_lowercase())
-    };
-    if id.split_once(':').is_none_or(|(namespace, path)| {
-        namespace.is_empty()
-            || path.is_empty()
-            || !namespace.chars().all(|c| {
-                c.is_ascii_lowercase() || c.is_ascii_digit() || matches!(c, '_' | '-' | '.')
-            })
-            || !path.chars().all(|c| {
-                c.is_ascii_lowercase() || c.is_ascii_digit() || matches!(c, '_' | '-' | '.' | '/')
-            })
-    }) {
-        return Err(AppError::InvalidConsoleSyntax(
-            "invalid item identifier".into(),
-        ));
-    }
-    Ok(id)
 }
 
 fn parse_task(arguments: &str) -> Result<ConsoleCommand, AppError> {
@@ -879,6 +859,7 @@ mod tests {
             })
         );
         assert!(parse_input("/take-item diamond 0").is_err());
+    }
 
     #[test]
     fn parses_food_collection_and_controls() {
