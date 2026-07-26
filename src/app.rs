@@ -284,6 +284,14 @@ impl App {
                         }
                 ConsoleCommand::Players => self.print_players().await,
                 ConsoleCommand::Inventory => self.print_inventory().await,
+                ConsoleCommand::Smelt { target, count } => println!(
+                    "Smelting request queued for {count} {target}; no live furnace container adapter is available in this build."
+                ),
+                ConsoleCommand::SmeltRecipe { recipe_id, count } => println!(
+                    "Smelting recipe request queued for {count} operations of {recipe_id}; no live furnace container adapter is available in this build."
+                ),
+                ConsoleCommand::SmeltStatus => println!("Smelting: idle"),
+                ConsoleCommand::SmeltStop => println!("Smelting: no active execution"),
                 ConsoleCommand::CleanupInventory { operation } => match operation {
                     CleanupOperation::DryRun => {
                         let world = self.minecraft.world_state_snapshot().await;
@@ -1820,6 +1828,10 @@ fn print_help() {
     println!("/chat TEXT  Send TEXT to Minecraft chat");
     println!("/players    Show known online players");
     println!("/inventory  Show inventory summary");
+    println!("/smelt ID COUNT  Execute a standard-furnace recipe");
+    println!("/smelt recipe ID COUNT  Execute a recipe by identifier");
+    println!("/smelt status (or /smeltstatus)  Show furnace execution status");
+    println!("/smelt stop (or /smeltstop)  Cancel furnace execution");
     println!("/cleanup-inventory dry-run|execute|status|stop  Safely plan or control cleanup");
     println!("/furnace-status  Show the currently observed station snapshot only");
     println!("/smelt-check OUTPUT COUNT  Calculate read-only furnace requirements");
