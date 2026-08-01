@@ -24,7 +24,10 @@ pub fn handle_chat(
         ChatPacket::System(system) if system.overlay => (ChatMessageKind::ActionBar, None),
         ChatPacket::System(_) => (ChatMessageKind::System, None),
     };
-    let text = packet.message().to_string();
+    // `message()` is the rendered chat component (for example
+    // `<5cat> !follow me`). `content()` is the raw player body and must be
+    // used for command/prefix handling.
+    let text = packet.content();
 
     // The server echoes a bot's own chat back as a normal player chat event.
     // It was already rendered by send_chat, so do not render that echo again.
@@ -42,7 +45,7 @@ pub fn handle_chat(
         return;
     }
 
-    if !world.record_received(kind, sender.clone(), text.clone()) {
+    if !world.record_received_from(kind, packet.sender_uuid(), sender.clone(), text.clone()) {
         debug!("duplicate chat event suppressed");
         return;
     }

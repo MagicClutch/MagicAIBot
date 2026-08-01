@@ -157,7 +157,6 @@ dependencies = [
 [[package]]
 name = "azalea"
 version = "0.16.0+mc26.2"
-source = "git+https://github.com/azalea-rs/azalea#6249c295d353b9b3ef68f665b311cba39211fd19"
 dependencies = [
  "azalea-auth",
  "azalea-block",
@@ -195,14 +194,13 @@ dependencies = [
 [[package]]
 name = "azalea-auth"
 version = "0.16.0+mc26.2"
-source = "git+https://github.com/azalea-rs/azalea#6249c295d353b9b3ef68f665b311cba39211fd19"
 dependencies = [
  "azalea-buf",
  "azalea-crypto",
  "base64",
  "chrono",
  "indexmap",
- "reqwest",
+ "reqwest 0.13.4",
  "rsa",
  "serde",
  "serde_json",
@@ -215,7 +213,6 @@ dependencies = [
 [[package]]
 name = "azalea-block"
 version = "0.16.0+mc26.2"
-source = "git+https://github.com/azalea-rs/azalea#6249c295d353b9b3ef68f665b311cba39211fd19"
 dependencies = [
  "azalea-block-macros",
  "azalea-buf",
@@ -225,7 +222,6 @@ dependencies = [
 [[package]]
 name = "azalea-block-macros"
 version = "0.16.0+mc26.2"
-source = "git+https://github.com/azalea-rs/azalea#6249c295d353b9b3ef68f665b311cba39211fd19"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -235,7 +231,6 @@ dependencies = [
 [[package]]
 name = "azalea-brigadier"
 version = "0.16.0+mc26.2"
-source = "git+https://github.com/azalea-rs/azalea#6249c295d353b9b3ef68f665b311cba39211fd19"
 dependencies = [
  "azalea-buf",
  "azalea-chat",
@@ -245,7 +240,6 @@ dependencies = [
 [[package]]
 name = "azalea-buf"
 version = "0.16.0+mc26.2"
-source = "git+https://github.com/azalea-rs/azalea#6249c295d353b9b3ef68f665b311cba39211fd19"
 dependencies = [
  "azalea-buf-macros",
  "byteorder",
@@ -260,7 +254,6 @@ dependencies = [
 [[package]]
 name = "azalea-buf-macros"
 version = "0.16.0+mc26.2"
-source = "git+https://github.com/azalea-rs/azalea#6249c295d353b9b3ef68f665b311cba39211fd19"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -270,7 +263,6 @@ dependencies = [
 [[package]]
 name = "azalea-chat"
 version = "0.16.0+mc26.2"
-source = "git+https://github.com/azalea-rs/azalea#6249c295d353b9b3ef68f665b311cba39211fd19"
 dependencies = [
  "azalea-buf",
  "azalea-language",
@@ -284,7 +276,6 @@ dependencies = [
 [[package]]
 name = "azalea-client"
 version = "0.16.0+mc26.2"
-source = "git+https://github.com/azalea-rs/azalea#6249c295d353b9b3ef68f665b311cba39211fd19"
 dependencies = [
  "async-compat",
  "azalea-auth",
@@ -311,7 +302,7 @@ dependencies = [
  "minecraft_folder_path",
  "parking_lot",
  "regex",
- "reqwest",
+ "reqwest 0.13.4",
  "simdnbt",
  "thiserror 2.0.19",
  "tokio",
@@ -322,7 +313,6 @@ dependencies = [
 [[package]]
 name = "azalea-core"
 version = "0.16.0+mc26.2"
-source = "git+https://github.com/azalea-rs/azalea#6249c295d353b9b3ef68f665b311cba39211fd19"
 dependencies = [
  "azalea-buf",
  "azalea-chat",
@@ -343,7 +333,6 @@ dependencies = [
 [[package]]
 name = "azalea-crypto"
 version = "0.16.0+mc26.2"
-source = "git+https://github.com/azalea-rs/azalea#6249c295d353b9b3ef68f665b311cba39211fd19"
 dependencies = [
  "aes",
  "azalea-buf",
@@ -362,7 +351,6 @@ dependencies = [
 [[package]]
 name = "azalea-entity"
 version = "0.16.0+mc26.2"
-source = "git+https://github.com/azalea-rs/azalea#6249c295d353b9b3ef68f665b311cba39211fd19"
 dependencies = [
  "azalea-block",
  "azalea-buf",
@@ -385,7 +373,6 @@ dependencies = [
 [[package]]
 name = "azalea-inventory"
 version = "0.16.0+mc26.2"
-source = "git+https://github.com/azalea-rs/azalea#6249c295d353b9b3ef68f665b311cba39211fd19"
 dependencies = [
  "azalea-auth",
  "azalea-buf",
@@ -403,7 +390,6 @@ dependencies = [
 [[package]]
 name = "azalea-inventory-macros"
 version = "0.16.0+mc26.2"
-source = "git+https://github.com/azalea-rs/azalea#6249c295d353b9b3ef68f665b311cba39211fd19"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -413,7 +399,6 @@ dependencies = [
 [[package]]
 name = "azalea-language"
 version = "0.16.0+mc26.2"
-source = "git+https://github.com/azalea-rs/azalea#6249c295d353b9b3ef68f665b311cba39211fd19"
 dependencies = [
  "compact_str",
  "serde_json",
@@ -422,7 +407,6 @@ dependencies = [
 [[package]]
 name = "azalea-physics"
 version = "0.16.0+mc26.2"
-source = "git+https://github.com/azalea-rs/azalea#6249c295d353b9b3ef68f665b311cba39211fd19"
 dependencies = [
  "azalea-block",
  "azalea-core",
@@ -439,7 +423,6 @@ dependencies = [
 [[package]]
 name = "azalea-protocol"
 version = "0.16.0+mc26.2"
-source = "git+https://github.com/azalea-rs/azalea#6249c295d353b9b3ef68f665b311cba39211fd19"
 dependencies = [
  "azalea-auth",
  "azalea-block",
@@ -459,7 +442,7 @@ dependencies = [
  "futures-lite",
  "hickory-resolver",
  "indexmap",
- "reqwest",
+ "reqwest 0.13.4",
  "serde",
  "serde_json",
  "simdnbt",
@@ -474,7 +457,6 @@ dependencies = [
 [[package]]
 name = "azalea-protocol-macros"
 version = "0.16.0+mc26.2"
-source = "git+https://github.com/azalea-rs/azalea#6249c295d353b9b3ef68f665b311cba39211fd19"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -484,7 +466,6 @@ dependencies = [
 [[package]]
 name = "azalea-registry"
 version = "0.16.0+mc26.2"
-source = "git+https://github.com/azalea-rs/azalea#6249c295d353b9b3ef68f665b311cba39211fd19"
 dependencies = [
  "azalea-buf",
  "azalea-registry-macros",
@@ -495,7 +476,6 @@ dependencies = [
 [[package]]
 name = "azalea-registry-macros"
 version = "0.16.0+mc26.2"
-source = "git+https://github.com/azalea-rs/azalea#6249c295d353b9b3ef68f665b311cba39211fd19"
 dependencies = [
  "quote",
  "syn 2.0.119",
@@ -504,7 +484,6 @@ dependencies = [
 [[package]]
 name = "azalea-world"
 version = "0.16.0+mc26.2"
-source = "git+https://github.com/azalea-rs/azalea#6249c295d353b9b3ef68f665b311cba39211fd19"
 dependencies = [
  "azalea-block",
  "azalea-buf",
@@ -1717,6 +1696,7 @@ dependencies = [
  "tokio",
  "tokio-rustls",
  "tower-service",
+ "webpki-roots",
 ]
 
 [[package]]
@@ -2011,6 +1991,7 @@ dependencies = [
  "azalea-client",
  "azalea-inventory",
  "dotenvy",
+ "reqwest 0.12.28",
  "serde",
  "serde_json",
  "thiserror 2.0.19",
@@ -2572,6 +2553,44 @@ checksum = "d6f6ff9a378485b298a5286656da665ba74413d36db0979633275d2e708145d4"
 
 [[package]]
 name = "reqwest"
+version = "0.12.28"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "eddd3ca559203180a307f12d114c268abf583f59b03cb906fd0b3ff8646c1147"
+dependencies = [
+ "base64",
+ "bytes",
+ "futures-core",
+ "http",
+ "http-body",
+ "http-body-util",
+ "hyper",
+ "hyper-rustls",
+ "hyper-util",
+ "js-sys",
+ "log",
+ "percent-encoding",
+ "pin-project-lite",
+ "quinn",
+ "rustls",
+ "rustls-pki-types",
+ "serde",
+ "serde_json",
+ "serde_urlencoded",
+ "sync_wrapper",
+ "tokio",
+ "tokio-rustls",
+ "tower",
+ "tower-http",
+ "tower-service",
+ "url",
+ "wasm-bindgen",
+ "wasm-bindgen-futures",
+ "web-sys",
+ "webpki-roots",
+]
+
+[[package]]
+name = "reqwest"
 version = "0.13.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "219c5811de6525e5416c7d5d53bb656d3afdbc6c5af816e0802bcfa42dbdc1c3"
@@ -2681,6 +2700,7 @@ checksum = "3c54fcab019b409d04215d3a17cb438fd7fbf192ee61461f20f4fe18704bc138"
 dependencies = [
  "aws-lc-rs",
  "once_cell",
+ "ring",
  "rustls-pki-types",
  "rustls-webpki",
  "subtle",
@@ -3702,6 +3722,15 @@ name = "webpki-root-certs"
 version = "1.0.9"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "b96554aa2acc8ccdb7e1c9a58a7a68dd5d13bccc69cd124cb09406db612a1c9b"
+dependencies = [
+ "rustls-pki-types",
+]
+
+[[package]]
+name = "webpki-roots"
+version = "1.0.9"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "7dcd9d09a39985f5344844e66b0c530a33843579125f23e21e9f0f220850f22a"
 dependencies = [
  "rustls-pki-types",
 ]

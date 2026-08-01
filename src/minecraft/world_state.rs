@@ -1,7 +1,7 @@
 //! Application-owned, bounded Minecraft state.
 
 use std::{
-    collections::HashMap,
+    collections::{HashMap, VecDeque},
     time::{Duration, Instant, SystemTime},
 };
 
@@ -273,6 +273,8 @@ pub struct WorldState {
     entities: HashMap<u32, EntitySnapshot>,
     dropped_items: HashMap<u32, DroppedItemObservation>,
     last_received_chat: Option<ChatRecord>,
+    incoming_player_chat: VecDeque<ChatRecord>,
+    incoming_player_chat_capacity: usize,
     last_sent_chat: Option<ChatRecord>,
     current_task: Option<TaskSnapshot>,
     movement: MovementSnapshot,
@@ -310,6 +312,8 @@ impl WorldState {
             entities: HashMap::new(),
             dropped_items: HashMap::new(),
             last_received_chat: None,
+            incoming_player_chat: VecDeque::new(),
+            incoming_player_chat_capacity: 64,
             last_sent_chat: None,
             current_task: None,
             movement: MovementSnapshot::default(),
@@ -394,6 +398,8 @@ impl WorldState {
         self.inventory = InventorySnapshot::default();
         self.movement = MovementSnapshot::default();
         self.current_task = None;
+        self.last_received_chat = None;
+        self.incoming_player_chat.clear();
         self.touch();
     }
     pub fn upsert_player(&mut self, mut player: PlayerSnapshot) {
@@ -522,6 +528,20 @@ impl WorldState {
             text: text.clone(),
             timestamp: now,
         });
+        if kind == ChatMessageKind::Player {
+            // Keep event handling bounded and non-blocking. AI consumes this
+            // queue; last_received_chat remains a diagnostic snapshot.
+            self.incoming_player_chat.push_back(ChatRecord {
+                kind,
+                sender_uuid,
+                sender: sender.clone(),
+                text: text.clone(),
+                timestamp: now,
+            });
+            if self.incoming_player_chat.len() > self.incoming_player_chat_capacity {
+                self.incoming_player_chat.pop_front();
+            }
+        }
         let signature = format!("{kind:?}|{sender:?}|{text}");
         let duplicate = self
             .last_displayed_signature
@@ -551,6 +571,15 @@ impl WorldState {
             self.touch();
         }
         !duplicate
+    }
+    pub fn pop_incoming_player_chat(&mut self) -> Option<ChatRecord> {
+        self.incoming_player_chat.pop_front()
+    }
+    pub fn set_incoming_player_chat_capacity(&mut self, capacity: usize) {
+        self.incoming_player_chat_capacity = capacity.max(1);
+        while self.incoming_player_chat.len() > self.incoming_player_chat_capacity {
+            self.incoming_player_chat.pop_front();
+        }
     }
     pub fn find_player_by_name(&self, name: &str) -> Option<&PlayerSnapshot> {
         self.players
@@ -890,5 +919,24 @@ mod tests {
         assert!(validate_limits(1., 0, 1).is_err());
         assert!(validate_limits(1., 1, 0).is_err());
         assert!(validate_limits(64., 256, 30).is_ok());
+    }
+
+    #[test]
+    fn incoming_player_chat_is_ordered_and_bounded() {
+        let mut state = WorldState::default();
+        state.set_incoming_player_chat_capacity(2);
+        for text in ["!one", "!two", "!three"] {
+            state.record_received_from(
+                ChatMessageKind::Player,
+                None,
+                Some("Alex".into()),
+                text.into(),
+            );
+        }
+        assert_eq!(state.pop_incoming_player_chat().unwrap().text, "!two");
+        assert_eq!(state.pop_incoming_player_chat().unwrap().text, "!three");
+        assert!(state.pop_incoming_player_chat().is_none());
+        state.record_received(ChatMessageKind::System, None, "system".into());
+        assert!(state.pop_incoming_player_chat().is_none());
     }
 }

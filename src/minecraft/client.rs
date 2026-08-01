@@ -83,7 +83,7 @@ pub(crate) enum RaycastFace {
 }
 
 const CONNECTION_TIMEOUT: Duration = Duration::from_secs(30);
-const MAX_CHAT_MESSAGE_LENGTH: usize = 256;
+pub const MAX_CHAT_MESSAGE_LENGTH: usize = 256;
 
 enum DisconnectReason {
     Kicked(String),
@@ -344,6 +344,19 @@ impl MinecraftClient {
     #[must_use]
     pub async fn world_state_snapshot(&self) -> WorldStateSnapshot {
         self.world_state.lock().await.snapshot()
+    }
+
+    pub async fn pop_incoming_player_chat(
+        &self,
+    ) -> Option<crate::minecraft::world_state::ChatRecord> {
+        self.world_state.lock().await.pop_incoming_player_chat()
+    }
+
+    pub async fn set_incoming_player_chat_capacity(&self, capacity: usize) {
+        self.world_state
+            .lock()
+            .await
+            .set_incoming_player_chat_capacity(capacity);
     }
 
     pub(crate) async fn block_id_at(
@@ -763,6 +776,54 @@ impl MinecraftClient {
         }))
     }
 
+    /// Maps whichever menu is currently active (the always-open player
+    /// inventory, or an external crafting-table window) into slots usable by
+    /// live crafting execution. Unlike [`Self::chest_menu_snapshot`], this
+    /// never returns `None` for the player's own inventory -- window id 0
+    /// with no `container_menu` is exactly the "player menu is active" state.
+    pub(crate) async fn crafting_menu_snapshot(
+        &self,
+    ) -> Result<crate::crafting::CraftingMenuSnapshot, AppError> {
+        use azalea::inventory::item::MaxStackSizeExt;
+        let client = self
+            .current_client
+            .lock()
+            .await
+            .clone()
+            .ok_or(AppError::InventoryUnavailable)?;
+        let inventory = client
+            .component::<Inventory>()
+            .map_err(|_| AppError::InventoryUnavailable)?;
+        let menu = client.menu().map_err(|_| AppError::InventoryUnavailable)?;
+        let (result_slot, inventory_slots): (usize, Vec<usize>) = match &menu {
+            azalea::inventory::Menu::Player(_) => (0, (9..45).collect()),
+            azalea::inventory::Menu::Crafting { .. } => (0, (10..46).collect()),
+            _ => return Err(AppError::InventoryUnavailable),
+        };
+        let map = |item: &azalea::inventory::ItemStack| {
+            item.as_present()
+                .map(|item| crate::container::model::StackSnapshot {
+                    item_id: item.kind.to_string(),
+                    count: item.count.max(0) as u32,
+                    max_count: item.kind.max_stack_size().max(1) as u32,
+                })
+        };
+        let slots: Vec<_> = menu.slots().iter().map(map).collect();
+        let result = slots
+            .get(result_slot)
+            .cloned()
+            .flatten()
+            .map(|s| (s.item_id, s.count));
+        Ok(crate::crafting::CraftingMenuSnapshot {
+            window_id: inventory.id,
+            revision: inventory.state_id,
+            result_slot,
+            inventory_slots,
+            slots,
+            result,
+        })
+    }
+
     pub(crate) async fn container_click(
         &self,
         window_id: i32,
@@ -779,7 +840,16 @@ impl MinecraftClient {
         let inventory = client
             .component::<Inventory>()
             .map_err(|_| AppError::InventoryUnavailable)?;
-        if inventory.id != window_id || inventory.container_menu.is_none() {
+        // Window id 0 means "no external container is open, this is the
+        // player's own inventory" (Azalea's own doc comment on `Inventory::id`)
+        // -- `container_menu` is correctly `None` in exactly that state, so
+        // requiring it to be `Some` unconditionally made every click with
+        // window_id 0 fail. Only a non-zero (real container) window id needs
+        // an open container menu to guard against a stale/desynced id.
+        if inventory.id != window_id {
+            return Err(AppError::InventoryUnavailable);
+        }
+        if window_id != 0 && inventory.container_menu.is_none() {
             return Err(AppError::InventoryUnavailable);
         }
         let handle = client
@@ -794,6 +864,31 @@ impl MinecraftClient {
             },
         });
         Ok(())
+    }
+
+    /// Reads whatever the inventory cursor is currently "holding" between
+    /// clicks (`Inventory::carried`). A left-click pickup/place can leave
+    /// this non-empty if the destination couldn't take the full stack (e.g.
+    /// hit its max stack size) -- callers doing multi-click sequences (like
+    /// `move_inventory_item`) use this to detect and recover a stuck item
+    /// rather than silently leaving it invisible on the cursor.
+    pub(crate) async fn carried_item(&self) -> Result<Option<(String, u32)>, AppError> {
+        let client = self
+            .current_client
+            .lock()
+            .await
+            .clone()
+            .ok_or(AppError::InventoryUnavailable)?;
+        let inventory = client
+            .component::<Inventory>()
+            .map_err(|_| AppError::InventoryUnavailable)?;
+        if inventory.carried.is_empty() {
+            return Ok(None);
+        }
+        Ok(Some((
+            inventory.carried.kind().to_string(),
+            inventory.carried.count().max(0) as u32,
+        )))
     }
 
     pub(crate) async fn close_container(&self) -> Result<(), AppError> {
@@ -815,6 +910,21 @@ impl MinecraftClient {
         Ok(())
     }
 
+    /// Queues a single jump for the next tick. Used by vertical-construction
+    /// maneuvers (pillaring) that need to briefly vacate the bot's own block
+    /// before placing into it; ordinary pathfinding never needs this since
+    /// Azalea's own executor handles jumping during normal movement.
+    pub(crate) async fn jump(&self) -> Result<(), AppError> {
+        let client = self
+            .current_client
+            .lock()
+            .await
+            .clone()
+            .ok_or(AppError::MovementUnavailable)?;
+        client.jump();
+        Ok(())
+    }
+
     pub(crate) async fn use_item_at_look_target(&self) -> Result<(), AppError> {
         let client = self
             .current_client
@@ -824,6 +934,87 @@ impl MinecraftClient {
             .ok_or(AppError::MovementUnavailable)?;
         client.start_use_item();
         Ok(())
+    }
+
+    pub(crate) async fn attack_entity(&self, entity_id: i32) -> Result<(), AppError> {
+        use azalea::core::entity_id::MinecraftEntityId;
+        let client = self
+            .current_client
+            .lock()
+            .await
+            .clone()
+            .ok_or(AppError::MovementUnavailable)?;
+        if let Some(entity) = client
+            .entity_id_by_minecraft_id(MinecraftEntityId(entity_id))
+            .map_err(|_| AppError::MovementUnavailable)?
+        {
+            client.attack(entity);
+            Ok(())
+        } else {
+            Err(AppError::MovementUnavailable)
+        }
+    }
+
+    pub(crate) async fn interact_with_entity(&self, entity_id: i32) -> Result<(), AppError> {
+        use azalea::core::entity_id::MinecraftEntityId;
+        let client = self
+            .current_client
+            .lock()
+            .await
+            .clone()
+            .ok_or(AppError::MovementUnavailable)?;
+        if let Some(entity) = client
+            .entity_id_by_minecraft_id(MinecraftEntityId(entity_id))
+            .map_err(|_| AppError::MovementUnavailable)?
+        {
+            client.entity_interact(entity);
+            Ok(())
+        } else {
+            Err(AppError::MovementUnavailable)
+        }
+    }
+
+    /// Drops `count` of `item_id`, or the entire stack when `count` is 0
+    /// (an omitted `count` argument from the AI also normalizes to 0 --
+    /// see `tool_call_to_action`). Returns how many were actually dropped.
+    pub(crate) async fn drop_item(&self, item_id: &str, count: u16) -> Result<u16, AppError> {
+        use azalea::inventory::operations::ThrowClick;
+        self.inventory_actions
+            .mutate(|| async {
+                let client = self
+                    .current_client
+                    .lock()
+                    .await
+                    .clone()
+                    .ok_or(AppError::InventoryUnavailable)?;
+                let menu = client.menu().map_err(|_| AppError::InventoryUnavailable)?;
+                let slots = menu.slots();
+                let slot = slots
+                    .iter()
+                    .position(|item| !item.is_empty() && item.kind().to_string() == item_id)
+                    .ok_or(AppError::InventoryUnavailable)?;
+                let available = slots[slot].count().max(0) as u16;
+                let handle = client
+                    .get_inventory()
+                    .map_err(|_| AppError::InventoryUnavailable)?;
+                // `ThrowClick::All` drops the whole stack in one packet;
+                // `Single` drops exactly one. There is no "drop exactly N"
+                // click, so a specific count below the full stack means
+                // clicking `Single` that many times -- previously any
+                // `count > 1` dropped the *entire* stack regardless of how
+                // many were actually requested.
+                let dropped = if count == 0 || count >= available {
+                    handle.click(ThrowClick::All { slot: slot as u16 });
+                    available
+                } else {
+                    for _ in 0..count {
+                        handle.click(ThrowClick::Single { slot: slot as u16 });
+                    }
+                    count
+                };
+                Ok(dropped)
+            })
+            .await
     }
 
     pub(crate) async fn select_item_in_hotbar(&self, item_id: &str) -> Result<bool, AppError> {
@@ -1013,14 +1204,6 @@ impl MinecraftClient {
                 .allow_mining(mode.allows_mining())
                 .retry_on_no_path(true),
         );
-        logging::info(format!(
-            "Pathfinding goal submitted at ({:.1}, {:.1}, {:.1}), radius {:.2}, mining={}",
-            destination.x,
-            destination.y,
-            destination.z,
-            radius,
-            mode.allows_mining()
-        ));
         Ok(())
     }
 

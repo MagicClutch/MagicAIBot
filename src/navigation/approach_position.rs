@@ -3,7 +3,7 @@ use std::collections::HashMap;
 use crate::minecraft::world_state::BlockPosition;
 
 pub fn approach_positions(target: BlockPosition) -> Vec<BlockPosition> {
-    let mut positions = Vec::with_capacity(10);
+    let mut positions = Vec::with_capacity(11);
     for (x, z) in [
         (target.x - 1, target.z),
         (target.x + 1, target.z),
@@ -27,6 +27,13 @@ pub fn approach_positions(target: BlockPosition) -> Vec<BlockPosition> {
     positions.push(BlockPosition {
         x: target.x,
         y: target.y - 1,
+        z: target.z,
+    });
+    // A player whose feet are two blocks below the target has clear headroom
+    // and can strike the underside of an overhead log at normal reach.
+    positions.push(BlockPosition {
+        x: target.x,
+        y: target.y - 2,
         z: target.z,
     });
     positions
@@ -125,11 +132,10 @@ mod tests {
     }
 
     #[test]
-    fn generates_cardinal_and_diagonal_approaches() {
-        assert_eq!(
-            approach_positions(BlockPosition { x: 0, y: 64, z: 0 }).len(),
-            10
-        );
+    fn generates_cardinal_diagonal_and_overhead_approaches() {
+        let target = BlockPosition { x: 0, y: 64, z: 0 };
+        assert_eq!(approach_positions(target).len(), 11);
+        assert!(approach_positions(target).contains(&BlockPosition { x: 0, y: 62, z: 0 }));
     }
 
     #[test]

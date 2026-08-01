@@ -5,13 +5,14 @@ edition = "2024"
 
 [dependencies]
 anyhow = "1"
-azalea = { git = "https://github.com/azalea-rs/azalea", default-features = false, features = ["serde", "packet-event", "online-mode"] }
-azalea-client = { git = "https://github.com/azalea-rs/azalea" }
-azalea-inventory = { git = "https://github.com/azalea-rs/azalea" }
+azalea = { path = "vendor/azalea/azalea", default-features = false, features = ["serde", "packet-event", "online-mode"] }
+azalea-client = { path = "vendor/azalea/azalea-client" }
+azalea-inventory = { path = "vendor/azalea/azalea-inventory" }
 async-trait = "0.1"
 dotenvy = "0.15"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
 thiserror = "2"
 tokio = { version = "1", features = ["io-std", "io-util", "macros", "rt", "signal", "time"] }
 tokio-util = { version = "0.7", features = ["rt"] }

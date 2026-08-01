@@ -9,8 +9,15 @@ use crate::{
 
 #[derive(Debug, PartialEq)]
 pub enum ConsoleCommand {
+    Ai {
+        request: String,
+    },
+    AiCancel,
+    AiStatus,
     Help,
     Status,
+    Where,
+    Health,
     Chat {
         message: String,
     },
@@ -131,6 +138,9 @@ pub enum ConsoleCommand {
     },
     CraftStatus,
     CraftStop,
+    Equip {
+        item: String,
+    },
     CollectFood {
         item: Option<String>,
         count: u32,
@@ -198,8 +208,22 @@ pub fn parse_input(input: &str) -> Result<ConsoleInput, AppError> {
         });
 
     let parsed = match command.to_ascii_lowercase().as_str() {
+        "ai" => {
+            if arguments.is_empty() {
+                return Err(AppError::MissingConsoleArgument(
+                    "/ai <natural-language request>".into(),
+                ));
+            }
+            ConsoleCommand::Ai {
+                request: arguments.to_owned(),
+            }
+        }
+        "aicancel" => no_arguments(command, arguments, ConsoleCommand::AiCancel)?,
+        "aistatus" => no_arguments(command, arguments, ConsoleCommand::AiStatus)?,
         "help" => no_arguments(command, arguments, ConsoleCommand::Help)?,
         "status" => no_arguments(command, arguments, ConsoleCommand::Status)?,
+        "where" => no_arguments(command, arguments, ConsoleCommand::Where)?,
+        "health" => no_arguments(command, arguments, ConsoleCommand::Health)?,
         "players" => no_arguments(command, arguments, ConsoleCommand::Players)?,
         "inventory" => no_arguments(command, arguments, ConsoleCommand::Inventory)?,
         "containerstatus" => {
@@ -255,7 +279,7 @@ pub fn parse_input(input: &str) -> Result<ConsoleInput, AppError> {
             player: parse_follow_name(arguments)?,
         },
         "movement" => no_arguments(command, arguments, ConsoleCommand::Movement)?,
-        "findblock" => parse_find_block(arguments)?,
+        "find" | "findblock" => parse_find_block(arguments)?,
         "nearestblock" => parse_nearest_block(arguments)?,
         "gotoblock" | "navigate-to-block" => parse_goto_block(arguments)?,
         "gotoblockstatus" => no_arguments(command, arguments, ConsoleCommand::GotoBlockStatus)?,
@@ -314,6 +338,9 @@ pub fn parse_input(input: &str) -> Result<ConsoleInput, AppError> {
         "collect-item" | "collectdrop" => parse_collect_item(arguments)?,
         "mine-ore" | "mineore" => parse_mine_ore(arguments)?,
         "craft" => parse_craft(arguments)?,
+        "equip" => ConsoleCommand::Equip {
+            item: normalize_item_id(single_argument(command, arguments, "/equip <item>")?)?,
+        },
         "collect-food" => parse_collect_food(arguments)?,
         "collect-food-status" => {
             no_arguments(command, arguments, ConsoleCommand::CollectFoodStatus)?
@@ -502,14 +529,18 @@ fn parse_craft(arguments: &str) -> Result<ConsoleCommand, AppError> {
     match parts.as_slice() {
         ["status"] => Ok(ConsoleCommand::CraftStatus),
         ["stop"] => Ok(ConsoleCommand::CraftStop),
+        [target] => Ok(ConsoleCommand::Craft {
+            target: normalize_item_id(target)?,
+            count: 1,
+        }),
         [target, count] => Ok(ConsoleCommand::Craft {
             target: normalize_item_id(target)?,
             count: count.parse().map_err(|_| {
-                AppError::InvalidConsoleSyntax("/craft <item> <positive-count>".into())
+                AppError::InvalidConsoleSyntax("/craft <item> [positive-count]".into())
             })?,
         }),
         _ => Err(AppError::InvalidConsoleSyntax(
-            "/craft <item> <count>, /craft status, or /craft stop".into(),
+            "/craft <item> [count], /craft status, or /craft stop".into(),
         )),
     }
     .and_then(|command| match command {
@@ -591,6 +622,7 @@ fn parse_collect_food(arguments: &str) -> Result<ConsoleCommand, AppError> {
 fn parse_task(arguments: &str) -> Result<ConsoleCommand, AppError> {
     let parts: Vec<_> = arguments.split_whitespace().collect();
     match parts.as_slice() {
+        [] => Ok(ConsoleCommand::TaskStatus),
         ["status", id] => Ok(ConsoleCommand::TaskStatusById {
             id: id
                 .parse()
@@ -605,7 +637,7 @@ fn parse_task(arguments: &str) -> Result<ConsoleCommand, AppError> {
         }),
         ["recent"] | ["history"] => Ok(ConsoleCommand::TaskRecent),
         _ => Err(AppError::InvalidConsoleSyntax(
-            "/task status <id> | /task cancel <id|all> | /task recent".into(),
+            "/task | /task status <id> | /task cancel <id|all> | /task recent".into(),
         )),
     }
 }
@@ -637,7 +669,26 @@ fn parse_place(arguments: &str) -> Result<ConsoleCommand, AppError> {
         [block_id] => Ok(ConsoleCommand::PlaceLooked {
             block_id: normalize_block_id(block_id)?,
         }),
-        [x, y, z, block_id] => Ok(ConsoleCommand::PlaceAt {
+        // Block-first order (`/place <block> <x> <y> <z>`) is the documented
+        // console syntax; coordinate-first is kept for backward compatibility
+        // with existing callers/tests. The two are unambiguous because block
+        // identifiers never parse as integers, so whichever end holds the
+        // integer triple decides the order.
+        [first, second, third, fourth] if first.parse::<i32>().is_ok() => {
+            Ok(ConsoleCommand::PlaceAt {
+                x: first
+                    .parse()
+                    .map_err(|_| AppError::InvalidCoordinates("x must be an integer".into()))?,
+                y: second
+                    .parse()
+                    .map_err(|_| AppError::InvalidCoordinates("y must be an integer".into()))?,
+                z: third
+                    .parse()
+                    .map_err(|_| AppError::InvalidCoordinates("z must be an integer".into()))?,
+                block_id: normalize_block_id(fourth)?,
+            })
+        }
+        [block_id, x, y, z] => Ok(ConsoleCommand::PlaceAt {
             x: x.parse()
                 .map_err(|_| AppError::InvalidCoordinates("x must be an integer".into()))?,
             y: y.parse()
@@ -647,7 +698,7 @@ fn parse_place(arguments: &str) -> Result<ConsoleCommand, AppError> {
             block_id: normalize_block_id(block_id)?,
         }),
         _ => Err(AppError::InvalidConsoleSyntax(
-            "/place <block_id> or /place <x> <y> <z> <block_id>".into(),
+            "/place <block_id> or /place <block_id> <x> <y> <z>".into(),
         )),
     }
 }
@@ -1163,5 +1214,114 @@ mod tests {
             ConsoleInput::Command(ConsoleCommand::CollectFoodStop)
         );
         assert!(parse_input("/collect-food carrot 0").is_err());
+    }
+
+    #[test]
+    fn parses_status_query_commands() {
+        assert_eq!(
+            parse_input("/where").unwrap(),
+            ConsoleInput::Command(ConsoleCommand::Where)
+        );
+        assert_eq!(
+            parse_input("/health").unwrap(),
+            ConsoleInput::Command(ConsoleCommand::Health)
+        );
+        assert_eq!(
+            parse_input("/task").unwrap(),
+            ConsoleInput::Command(ConsoleCommand::TaskStatus)
+        );
+        assert!(matches!(
+            parse_input("/where now"),
+            Err(AppError::InvalidConsoleSyntax(_))
+        ));
+    }
+
+    #[test]
+    fn parses_equip_command() {
+        assert_eq!(
+            parse_input("/equip diamond_pickaxe").unwrap(),
+            ConsoleInput::Command(ConsoleCommand::Equip {
+                item: "minecraft:diamond_pickaxe".into()
+            })
+        );
+        assert!(matches!(
+            parse_input("/equip"),
+            Err(AppError::MissingConsoleArgument(_))
+        ));
+        assert!(matches!(
+            parse_input("/equip diamond_pickaxe extra"),
+            Err(AppError::InvalidConsoleSyntax(_))
+        ));
+    }
+
+    #[test]
+    fn parses_find_as_findblock_alias() {
+        assert_eq!(
+            parse_input("/find stone 64").unwrap(),
+            ConsoleInput::Command(ConsoleCommand::FindBlock {
+                block_id: "minecraft:stone".into(),
+                radius: Some(64),
+                limit: None,
+            })
+        );
+        assert!(parse_input("/find").is_err());
+    }
+
+    #[test]
+    fn parses_place_in_block_first_and_coordinate_first_order() {
+        assert_eq!(
+            parse_input("/place minecraft:cobblestone 915 91 1005").unwrap(),
+            ConsoleInput::Command(ConsoleCommand::PlaceAt {
+                x: 915,
+                y: 91,
+                z: 1005,
+                block_id: "minecraft:cobblestone".into()
+            })
+        );
+        assert_eq!(
+            parse_input("/place 915 91 1005 minecraft:cobblestone").unwrap(),
+            ConsoleInput::Command(ConsoleCommand::PlaceAt {
+                x: 915,
+                y: 91,
+                z: 1005,
+                block_id: "minecraft:cobblestone".into()
+            })
+        );
+    }
+
+    #[test]
+    fn craft_count_defaults_to_one() {
+        assert_eq!(
+            parse_input("/craft minecraft:furnace").unwrap(),
+            ConsoleInput::Command(ConsoleCommand::Craft {
+                target: "minecraft:furnace".into(),
+                count: 1
+            })
+        );
+        assert_eq!(
+            parse_input("/craft minecraft:furnace 2").unwrap(),
+            ConsoleInput::Command(ConsoleCommand::Craft {
+                target: "minecraft:furnace".into(),
+                count: 2
+            })
+        );
+    }
+
+    #[test]
+    fn help_and_ai_commands_parse() {
+        assert_eq!(
+            parse_input("/help").unwrap(),
+            ConsoleInput::Command(ConsoleCommand::Help)
+        );
+        assert_eq!(
+            parse_input("/ai go get some wood").unwrap(),
+            ConsoleInput::Command(ConsoleCommand::Ai {
+                request: "go get some wood".into()
+            })
+        );
+        assert!(matches!(
+            parse_input("/ai"),
+            Err(AppError::MissingConsoleArgument(_))
+        ));
     }
 }

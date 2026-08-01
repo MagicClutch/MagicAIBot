@@ -447,6 +447,107 @@ fn terminal_driver_results_are_structured() {
     }
 }
 #[test]
+fn resolve_grid_places_shaped_ingredients_by_recipe_shape() {
+    let book = RecipeBook::fallback().unwrap();
+    let inv = inventory(&[("minecraft:oak_planks", 4)]);
+    let plan = book.resolve_grid("stick", 4, &inv).unwrap();
+    assert_eq!(plan.recipe_id, "minecraft:stick");
+    assert_eq!(plan.output_item, "minecraft:stick");
+    assert_eq!(plan.requested_output, 4);
+    assert_eq!(plan.grid_size(), 2);
+    assert_eq!(plan.placements.len(), 2);
+    assert!(
+        plan.placements
+            .iter()
+            .all(|p| p.item == "minecraft:oak_planks" && p.column == 0)
+    );
+    let rows: Vec<u8> = plan.placements.iter().map(|p| p.row).collect();
+    assert!(rows.contains(&0) && rows.contains(&1));
+}
+
+#[test]
+fn resolve_grid_reports_table_sized_recipes() {
+    let book = RecipeBook::fallback().unwrap();
+    let inv = inventory(&[("minecraft:cobblestone", 3), ("minecraft:stick", 2)]);
+    let plan = book.resolve_grid("stone_pickaxe", 1, &inv).unwrap();
+    assert_eq!(plan.grid_size(), 3);
+}
+
+#[test]
+fn resolve_grid_prefers_ingredients_already_in_stock() {
+    let book = RecipeBook::fallback().unwrap();
+    // oak_planks is shapeless over a log-family tag; give the bot spruce
+    // logs specifically and confirm the resolver picks that concrete item
+    // instead of an arbitrary alternative it doesn't actually have.
+    let inv = inventory(&[("minecraft:spruce_log", 4)]);
+    let plan = book.resolve_grid("oak_planks", 4, &inv).unwrap();
+    assert!(
+        plan.placements
+            .iter()
+            .all(|p| p.item == "minecraft:spruce_log")
+    );
+}
+
+#[test]
+fn resolve_grid_fails_for_unknown_item() {
+    let book = RecipeBook::fallback().unwrap();
+    assert_eq!(
+        book.resolve_grid("not_real", 1, &inventory(&[]))
+            .unwrap_err(),
+        Failure::UnknownItem("minecraft:not_real".into())
+    );
+}
+
+fn disconnected_client() -> crate::minecraft::client::MinecraftClient {
+    crate::minecraft::client::MinecraftClient::new(
+        crate::config::MinecraftConfig {
+            server: "localhost:25565".to_owned(),
+            username: "MagicBot".to_owned(),
+            account_mode: crate::config::AccountMode::Offline,
+        },
+        crate::config::ReconnectConfig {
+            enabled: false,
+            delay_seconds: 10,
+            maximum_attempts: 5,
+        },
+        crate::config::ConsoleConfig::default(),
+        crate::config::WorldStateConfig::default(),
+    )
+}
+
+#[tokio::test]
+async fn craft_reports_missing_materials_without_a_live_connection() {
+    let service = CraftService::default();
+    let recipes = RecipeBook::fallback().unwrap();
+    let client = disconnected_client();
+    let error = service
+        .craft(&client, &recipes, "minecraft:stick", 4)
+        .await
+        .unwrap_err();
+    assert!(error.to_string().contains("missing"));
+    // The failed attempt must leave the service idle for the next command.
+    assert!(!service.status().active);
+}
+
+#[tokio::test]
+async fn craft_rejects_recipes_that_need_a_crafting_table() {
+    let service = CraftService::default();
+    let recipes = RecipeBook::fallback().unwrap();
+    let client = disconnected_client();
+    let error = service
+        .craft(&client, &recipes, "minecraft:stone_pickaxe", 1)
+        .await
+        .unwrap_err();
+    assert!(error.to_string().contains("crafting table"));
+}
+
+#[test]
+fn stop_on_an_idle_craft_service_is_a_no_op() {
+    let service = CraftService::default();
+    assert!(!service.stop());
+}
+
+#[test]
 fn no_space_is_reported_before_mutation() {
     let mut m = Mock::new(&[("minecraft:plank", 2)]);
     m.state.free_inventory_slots = 0;

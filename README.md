@@ -42,8 +42,8 @@ Dependency upgrades are deliberate compatibility work, not routine updates.
 | Source | Supported | Constraints |
 |---|---:|---|
 | Local console | Yes | Trusted local operator; bounded parser; plain text chat forwarding is off by default. |
-| Minecraft chat commands | No | Incoming chat is display/state input only. |
-| AI/provider plans | No | No provider, classifier, planner, or autonomous goals exist. |
+| Minecraft chat commands | Yes | `!`-prefixed messages routed to Groq; access control, rate limiting. |
+| AI/provider plans | Yes | Groq (OpenAI-compatible) via tool calling; 14 registered commands. |
 
 | Tool/action | Supported | Confirmation / cancellation |
 |---|---:|---|
@@ -54,7 +54,7 @@ Dependency upgrades are deliberate compatibility work, not routine updates.
 | Break/place one block | Yes | Exact block-state change; `/stopinteraction`. |
 | Inventory summary/tool hotbar selection | Read / limited | No menu clicks or inventory transaction service exists. |
 | Craft/eat/container/deposit | No | Commands are intentionally absent. |
-| Gather logs/stone/visible ore/food | No | Lifecycle mocks exist, but no production gathering action exists. |
+| Gather logs/stone/visible ore/food | Yes (console) / Yes (AI via Groq) | Production gather action exists. |
 
 | Container | Inspect | Transfer/click | Notes |
 |---|---:|---:|---|
@@ -133,15 +133,32 @@ types remain explicit integration work; no execution behavior is included here.
 ```text
 src/
 ├── main.rs       # Tokio entry point
-├── app.rs        # Application composition and lifecycle
+├── app.rs        # Application composition, lifecycle, AI dispatch
 ├── config.rs     # TOML configuration and logging setup
 ├── error.rs      # Unified application errors
+├── logging.rs    # Logging helpers
 ├── minecraft/    # Azalea connection and lifecycle integration
-├── console/      # Future operator commands
-├── movement/     # Future movement service
-├── skills/       # Future skill services
-├── tasks/        # Future task orchestration
-└── ai/           # Future AI decision-making
+├── console/      # Operator commands and parser
+├── movement/     # Movement service and controls
+├── navigation/   # Safe block approach and navigation
+├── look/         # Rotation and look controllers
+├── interaction/  # Block break/place, tool selection
+├── blocks/       # Loaded-block search and ore safety
+├── collection/   # Dropped-item collector
+├── food/         # Food collection
+├── tree_chopping.rs  # Tree detection and chopping
+├── tasks/        # Task orchestration and lifecycle
+├── inventory/    # Inventory service
+├── container/    # Chest interaction
+├── crafting/     # Recipe and crafting execution
+├── smelting/     # Furnace/smelting state machines
+├── processing/   # Processing-station knowledge
+├── inventory_cleanup.rs  # Policy-driven cleanup
+└── ai/           # AI provider, registry, sessions, tool calling
+    ├── mod.rs    # AI session, action types, validation
+    ├── provider.rs  # AiProvider trait and types
+    ├── groq.rs   # Groq HTTP implementation
+    └── registry.rs  # Command registry and tool definitions
 ```
 
 ## Processing-station knowledge (Task 13 handoff)

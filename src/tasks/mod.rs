@@ -23,15 +23,15 @@ use crate::{
         block_snapshot::BlockSnapshot,
     },
     error::AppError,
-    interaction::InteractionController,
+    interaction::{InteractionController, interaction_controller::InteractionState},
     logging,
-    look::{LookController, LookTarget},
+    look::{LookController, LookTarget, look_controller::LookState},
     minecraft::{
         client::MinecraftClient,
-        world_state::{BlockPosition, PositionSnapshot, TaskSnapshot},
+        world_state::{BlockPosition, MovementStatus, PositionSnapshot, TaskSnapshot},
     },
     movement::{MovementService, NavigationMode},
-    navigation::BlockNavigationService,
+    navigation::{BlockNavigationService, navigation_state::BlockNavigationState},
 };
 
 pub mod gather;
@@ -611,6 +611,117 @@ fn failure(category: TaskErrorCategory, message: impl Into<String>) -> TaskFailu
     }
 }
 
+// ---- Completion polling ------------------------------------------------------
+//
+// Movement, block navigation, interaction, and look are all tick-driven state
+// machines: submitting a goal (`goto`, `start`, `break_at`, `look_at`, ...)
+// only enqueues work and returns as soon as the state transitions away from
+// idle -- it does not wait for a terminal state. The application's own tick
+// loop normally drives these forward, but a console/task caller that awaits
+// the submission alone would report success (or failure) before the bot has
+// actually done anything. These helpers drive the same `tick()` methods the
+// application loop uses, in a private loop, so a caller that awaits one of
+// them genuinely blocks until Completed/Reached, Failed, or Cancelled.
+
+async fn await_movement_terminal(
+    movement: &MovementService,
+    minecraft: &MinecraftClient,
+) -> Result<(), AppError> {
+    loop {
+        movement.tick(minecraft, false).await;
+        let snapshot = movement.snapshot().await;
+        match snapshot.status {
+            MovementStatus::Completed | MovementStatus::Idle => return Ok(()),
+            MovementStatus::Cancelled => return Err(AppError::MovementCancelled),
+            MovementStatus::Failed => {
+                return Err(AppError::PathfindingFailure(
+                    snapshot
+                        .failure_reason
+                        .unwrap_or_else(|| "unknown reason".into()),
+                ));
+            }
+            MovementStatus::MovingToPosition | MovementStatus::FollowingPlayer => {
+                tokio::time::sleep(Duration::from_millis(200)).await;
+            }
+        }
+    }
+}
+
+async fn await_block_navigation_terminal(
+    navigation: &BlockNavigationService,
+    minecraft: &MinecraftClient,
+    movement: &MovementService,
+) -> Result<(), AppError> {
+    loop {
+        navigation.tick(minecraft, movement).await;
+        let snapshot = navigation.snapshot().await;
+        match snapshot.state {
+            BlockNavigationState::Reached | BlockNavigationState::Idle => return Ok(()),
+            BlockNavigationState::Cancelled => return Err(AppError::MovementCancelled),
+            BlockNavigationState::Failed => {
+                return Err(AppError::TaskRuntime(
+                    snapshot
+                        .failure_reason
+                        .unwrap_or_else(|| "block navigation failed".into()),
+                ));
+            }
+            _ => tokio::time::sleep(Duration::from_millis(200)).await,
+        }
+    }
+}
+
+async fn await_look_terminal(
+    look: &LookController,
+    minecraft: &MinecraftClient,
+) -> Result<(), AppError> {
+    loop {
+        look.tick(minecraft).await;
+        let snapshot = look.snapshot().await;
+        match snapshot.state {
+            LookState::Completed | LookState::Idle => return Ok(()),
+            LookState::Cancelled => return Err(AppError::LookCancelled),
+            LookState::Failed => {
+                return Err(AppError::LookUnavailableWithReason(
+                    snapshot
+                        .failure_reason
+                        .unwrap_or_else(|| "look failed".into()),
+                ));
+            }
+            LookState::Looking => tokio::time::sleep(Duration::from_millis(75)).await,
+        }
+    }
+}
+
+/// Interaction can internally hand off to block navigation (to get in range)
+/// and to look (for precise aiming), so both must be driven alongside it or
+/// the interaction state machine stalls waiting on a tick that never comes.
+async fn await_interaction_terminal(
+    interaction: &InteractionController,
+    minecraft: &MinecraftClient,
+    movement: &MovementService,
+    block_navigation: &BlockNavigationService,
+    look: &LookController,
+) -> Result<(), AppError> {
+    loop {
+        block_navigation.tick(minecraft, movement).await;
+        look.tick(minecraft).await;
+        interaction.tick(minecraft, movement, look).await;
+        let snapshot = interaction.snapshot().await;
+        match snapshot.state {
+            InteractionState::Completed | InteractionState::Idle => return Ok(()),
+            InteractionState::Cancelled => return Err(AppError::InteractionCancelled),
+            InteractionState::Failed => {
+                return Err(AppError::TaskRuntime(
+                    snapshot
+                        .failure_reason
+                        .unwrap_or_else(|| "interaction failed".into()),
+                ));
+            }
+            _ => tokio::time::sleep(Duration::from_millis(75)).await,
+        }
+    }
+}
+
 // ---- Reusable, deliberately bounded orchestration requests/results ----------
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -893,6 +1004,7 @@ impl TaskService {
             &[TaskResource::Movement],
             || async {
                 s.goto(m, p, mode).await?;
+                await_movement_terminal(s, m).await?;
                 Ok(TaskResult::Unit)
             },
         )
@@ -914,6 +1026,7 @@ impl TaskService {
             &[TaskResource::Movement],
             || async {
                 n.start(m, mv, b, r, mode).await?;
+                await_block_navigation_terminal(n, m, mv).await?;
                 Ok(TaskResult::Unit)
             },
         )
@@ -932,6 +1045,7 @@ impl TaskService {
             &[TaskResource::Rotation],
             || async {
                 l.look_at(m, t).await?;
+                await_look_terminal(l, m).await?;
                 Ok(TaskResult::Unit)
             },
         )
@@ -950,6 +1064,7 @@ impl TaskService {
             &[TaskResource::Rotation],
             || async {
                 l.look_at_block_id(m, b).await?;
+                await_look_terminal(l, m).await?;
                 Ok(TaskResult::Unit)
             },
         )
@@ -962,6 +1077,7 @@ impl TaskService {
         mv: &MovementService,
         l: &LookController,
         i: &InteractionController,
+        n: &BlockNavigationService,
         t: BlockPosition,
     ) -> Result<(), AppError> {
         self.tracked(
@@ -975,6 +1091,7 @@ impl TaskService {
             ],
             || async {
                 i.break_at(m, mv, l, t).await?;
+                await_interaction_terminal(i, m, mv, n, l).await?;
                 Ok(TaskResult::Unit)
             },
         )
@@ -987,6 +1104,7 @@ impl TaskService {
         mv: &MovementService,
         l: &LookController,
         i: &InteractionController,
+        n: &BlockNavigationService,
     ) -> Result<(), AppError> {
         self.tracked(
             m,
@@ -999,6 +1117,7 @@ impl TaskService {
             ],
             || async {
                 i.break_looked(m, mv, l).await?;
+                await_interaction_terminal(i, m, mv, n, l).await?;
                 Ok(TaskResult::Unit)
             },
         )
@@ -1011,6 +1130,7 @@ impl TaskService {
         mv: &MovementService,
         l: &LookController,
         i: &InteractionController,
+        n: &BlockNavigationService,
         b: String,
     ) -> Result<(), AppError> {
         self.tracked(
@@ -1024,18 +1144,21 @@ impl TaskService {
             ],
             || async {
                 i.break_nearest(m, mv, l, b).await?;
+                await_interaction_terminal(i, m, mv, n, l).await?;
                 Ok(TaskResult::Unit)
             },
         )
         .await
         .map(|_| ())
     }
+    #[allow(clippy::too_many_arguments)]
     pub async fn place_block(
         &self,
         m: &MinecraftClient,
         mv: &MovementService,
         l: &LookController,
         i: &InteractionController,
+        n: &BlockNavigationService,
         t: BlockPosition,
         item: String,
     ) -> Result<(), AppError> {
@@ -1050,6 +1173,7 @@ impl TaskService {
             ],
             || async {
                 i.place_at(m, mv, l, t, item).await?;
+                await_interaction_terminal(i, m, mv, n, l).await?;
                 Ok(TaskResult::Unit)
             },
         )
@@ -1062,6 +1186,7 @@ impl TaskService {
         mv: &MovementService,
         l: &LookController,
         i: &InteractionController,
+        n: &BlockNavigationService,
         item: String,
     ) -> Result<(), AppError> {
         self.tracked(
@@ -1075,6 +1200,7 @@ impl TaskService {
             ],
             || async {
                 i.place_looked(m, mv, l, item).await?;
+                await_interaction_terminal(i, m, mv, n, l).await?;
                 Ok(TaskResult::Unit)
             },
         )
@@ -1271,5 +1397,119 @@ mod tests {
         assert_eq!(r.quantity, 3);
         assert_eq!(r.maximum_attempts, 32);
         assert!(r.item_ids.contains(&"minecraft:diamond_ore".into()));
+    }
+
+    // ---- Completion polling: regression guards -----------------------------
+    //
+    // A disconnected client fails at submission (before either poll loop is
+    // ever entered), so these do not exercise the tick-driven loop bodies
+    // themselves -- doing that needs a live connection, which isn't available
+    // here. What they do verify is that `goto_position`/`break_block` (and
+    // friends) still resolve promptly instead of hanging now that they await
+    // a polling helper rather than returning right after submission -- the
+    // exact regression a bug in the loop's terminal-state matching would
+    // cause.
+    fn disconnected_client() -> MinecraftClient {
+        MinecraftClient::new(
+            crate::config::MinecraftConfig {
+                server: "localhost:25565".to_owned(),
+                username: "MagicBot".to_owned(),
+                account_mode: crate::config::AccountMode::Offline,
+            },
+            crate::config::ReconnectConfig {
+                enabled: false,
+                delay_seconds: 10,
+                maximum_attempts: 5,
+            },
+            crate::config::ConsoleConfig::default(),
+            crate::config::WorldStateConfig::default(),
+        )
+    }
+    fn search() -> BlockSearchService {
+        BlockSearchService::new(64, 32, 8)
+    }
+
+    #[tokio::test]
+    async fn goto_position_fails_promptly_when_disconnected() {
+        let tasks = TaskService::default();
+        let client = disconnected_client();
+        let movement = MovementService::new(Default::default(), Default::default());
+        let result = tokio::time::timeout(
+            Duration::from_secs(2),
+            tasks.goto_position(
+                &client,
+                &movement,
+                PositionSnapshot::default(),
+                NavigationMode::MovementOnly,
+            ),
+        )
+        .await
+        .expect("goto_position must not hang when disconnected");
+        assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn break_block_fails_promptly_when_disconnected() {
+        let tasks = TaskService::default();
+        let client = disconnected_client();
+        let movement = MovementService::new(Default::default(), Default::default());
+        let look = LookController::new(Default::default(), search());
+        let navigation = BlockNavigationService::new(Default::default(), search());
+        let interaction =
+            InteractionController::new(Default::default(), search(), navigation.clone());
+        let result = tokio::time::timeout(
+            Duration::from_secs(2),
+            tasks.break_block(
+                &client,
+                &movement,
+                &look,
+                &interaction,
+                &navigation,
+                BlockPosition { x: 0, y: 64, z: 0 },
+            ),
+        )
+        .await
+        .expect("break_block must not hang when disconnected");
+        assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn look_at_fails_promptly_when_disconnected() {
+        let tasks = TaskService::default();
+        let client = disconnected_client();
+        let look = LookController::new(Default::default(), search());
+        let result = tokio::time::timeout(
+            Duration::from_secs(2),
+            tasks.look_at(
+                &client,
+                &look,
+                LookTarget::World(PositionSnapshot::default()),
+            ),
+        )
+        .await
+        .expect("look_at must not hang when disconnected");
+        assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn goto_block_fails_promptly_when_disconnected() {
+        let tasks = TaskService::default();
+        let client = disconnected_client();
+        let movement = MovementService::new(Default::default(), Default::default());
+        let navigation = BlockNavigationService::new(Default::default(), search());
+        let result = tokio::time::timeout(
+            Duration::from_secs(2),
+            tasks.goto_block(
+                &client,
+                &movement,
+                &navigation,
+                "minecraft:stone".into(),
+                8,
+                NavigationMode::MovementOnly,
+            ),
+        )
+        .await
+        .expect("goto_block must not hang when disconnected");
+        assert!(result.is_err());
     }
 }

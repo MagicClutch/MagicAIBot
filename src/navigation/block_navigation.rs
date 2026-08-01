@@ -166,7 +166,11 @@ impl BlockNavigationService {
                 last_progress_time: Some(SystemTime::now()),
                 maximum_attempts: self.config.maximum_target_attempts,
                 generation,
-                mode: NavigationMode::MovementOnly,
+                // Interaction targets such as tree logs can be enclosed by
+                // leaves or a lower trunk. Let Azalea mine only when its
+                // route requires it; the interaction controller still owns
+                // the requested target block.
+                mode: NavigationMode::AllowMining,
                 ..BlockNavigationSnapshot::default()
             };
             inner.candidates = vec![BlockSnapshot {
@@ -277,23 +281,6 @@ impl BlockNavigationService {
             .await;
             return;
         };
-        if !cells
-            .get(&target)
-            .and_then(Option::as_ref)
-            .is_some_and(|id| id == &block_id)
-        {
-            logging::info("Target block changed, selecting another target");
-            self.mark_target_failed(snapshot.generation, target).await;
-            self.retry_or_fail(
-                minecraft,
-                movement,
-                snapshot.generation,
-                &block_id,
-                "no reachable approach position",
-            )
-            .await;
-            return;
-        }
         if !is_valid_approach(
             target,
             approach,
@@ -357,7 +344,6 @@ impl BlockNavigationService {
                 "no reachable approach position",
             )
             .await;
-            return;
         }
         // Do not restart Azalea on an application timer. Its executor owns
         // mining, waits for block updates, stuck recovery and replanning; a
@@ -417,6 +403,9 @@ impl BlockNavigationService {
                     inner.snapshot.current_attempt
                 };
                 let mode = self.inner.lock().await.snapshot.mode;
+                if mode == NavigationMode::AllowMining {
+                    logging::info("Pathfinding with mining enabled");
+                }
                 if movement
                     .goto_for_block_navigation(minecraft, center(approach), mode)
                     .await
@@ -438,6 +427,10 @@ impl BlockNavigationService {
                     candidate.position.x,
                     candidate.position.y,
                     candidate.position.z
+                ));
+                logging::info(format!(
+                    "Selected interaction position: {} {} {}",
+                    approach.x, approach.y, approach.z
                 ));
                 let _ = attempt;
                 return Ok(true);

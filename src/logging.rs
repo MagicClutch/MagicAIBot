@@ -9,6 +9,9 @@ pub fn success(message: impl Display) {
 pub fn warning(message: impl Display) {
     println!("[WARNING] {message}");
 }
+pub fn error(message: impl Display) {
+    println!("[ERROR] {message}");
+}
 pub fn chat_incoming(sender: &str, message: &str) {
     println!("[CHAT] {sender}: {message}");
 }

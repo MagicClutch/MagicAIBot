@@ -425,6 +425,93 @@ impl RecipeBook {
     }
 }
 
+impl RecipeBook {
+    /// Resolves a recipe into concrete grid placements for live execution.
+    /// Each `IngredientSlot` becomes one [`IngredientPlacement`] per unit it
+    /// needs, at the grid cell implied by the recipe's own shape (shaped) or
+    /// packed row-major starting at (0, 0) (shapeless, where cell choice is
+    /// cosmetic -- the game only checks the resulting multiset of items).
+    pub fn resolve_grid(
+        &self,
+        output: &str,
+        count: u32,
+        inventory: &InventorySnapshot,
+    ) -> Result<ResolvedCraftPlan, Failure> {
+        let recipe = self.preferred(output)?;
+        let stock: BTreeMap<String, u32> = inventory
+            .total_counts
+            .iter()
+            .map(|(k, v)| (k.clone(), *v))
+            .collect();
+        let mut placements = Vec::new();
+        match &recipe.layout {
+            RecipeLayout::Shaped {
+                width, ingredients, ..
+            } => {
+                let width = *width;
+                for (index, slot) in ingredients.iter().enumerate() {
+                    if matches!(slot.ingredient, Ingredient::Empty) {
+                        continue;
+                    }
+                    let row = (index as u8) / width;
+                    let column = (index as u8) % width;
+                    let item = self.pick_ingredient(&slot.ingredient, &stock)?;
+                    for _ in 0..slot.count {
+                        placements.push(IngredientPlacement {
+                            item: item.clone(),
+                            row,
+                            column,
+                        });
+                    }
+                }
+            }
+            RecipeLayout::Shapeless { ingredients } => {
+                let cells: Vec<_> = ingredients
+                    .iter()
+                    .filter(|slot| !matches!(slot.ingredient, Ingredient::Empty))
+                    .collect();
+                let width: u8 = if cells.len() <= 4 { 2 } else { 3 };
+                for (index, slot) in cells.into_iter().enumerate() {
+                    let row = (index as u8) / width;
+                    let column = (index as u8) % width;
+                    let item = self.pick_ingredient(&slot.ingredient, &stock)?;
+                    for _ in 0..slot.count {
+                        placements.push(IngredientPlacement {
+                            item: item.clone(),
+                            row,
+                            column,
+                        });
+                    }
+                }
+            }
+        }
+        Ok(ResolvedCraftPlan {
+            recipe_id: recipe.id.clone(),
+            output_item: recipe.output.clone(),
+            output_per_craft: recipe.output_count,
+            requested_output: count,
+            shaped: matches!(recipe.layout, RecipeLayout::Shaped { .. }),
+            placements,
+        })
+    }
+
+    /// Picks a concrete item for an ingredient slot, preferring whatever the
+    /// bot already holds so plans don't demand an arbitrary alternative it
+    /// happens not to have.
+    fn pick_ingredient(
+        &self,
+        ingredient: &Ingredient,
+        stock: &BTreeMap<String, u32>,
+    ) -> Result<String, Failure> {
+        let choices = self.choices(ingredient)?;
+        choices
+            .iter()
+            .max_by_key(|id| stock.get(*id).copied().unwrap_or(0))
+            .cloned()
+            .ok_or_else(|| Failure::UnsupportedIngredient("empty alternatives".into()))
+    }
+}
+
 fn ingredients(layout: &RecipeLayout) -> &[IngredientSlot] {
     match layout {
         RecipeLayout::Shaped { ingredients, .. } | RecipeLayout::Shapeless { ingredients } => {
@@ -643,6 +730,9 @@ impl CraftCancellation {
     }
     pub fn is_cancelled(&self) -> bool {
         self.0.load(std::sync::atomic::Ordering::Acquire)
+    }
+    pub fn reset(&self) {
+        self.0.store(false, std::sync::atomic::Ordering::Release);
     }
 }
 
@@ -874,6 +964,238 @@ impl CraftService {
             self.cancellation.cancel();
         }
         active
+    }
+
+    /// Crafts `target` `count` times over using the always-open player 2x2
+    /// grid. Recipes whose resolved grid needs a crafting table (3x3) are
+    /// rejected up front -- opening/using a crafting-table window is not
+    /// implemented yet, see module docs.
+    pub async fn craft(
+        &self,
+        client: &crate::minecraft::client::MinecraftClient,
+        recipes: &RecipeBook,
+        target: &str,
+        count: u32,
+    ) -> Result<u32, crate::error::AppError> {
+        use crate::error::AppError;
+        if self.status().active {
+            return Err(AppError::TaskRuntime("a craft is already active".into()));
+        }
+        {
+            let mut status = self.status.lock().expect("craft status poisoned");
+            *status = CraftServiceStatus {
+                active: true,
+                ..Default::default()
+            };
+        }
+        self.cancellation.reset();
+        let result = self.craft_inner(client, recipes, target, count).await;
+        self.status.lock().expect("craft status poisoned").active = false;
+        result
+    }
+
+    async fn craft_inner(
+        &self,
+        client: &crate::minecraft::client::MinecraftClient,
+        recipes: &RecipeBook,
+        target: &str,
+        count: u32,
+    ) -> Result<u32, crate::error::AppError> {
+        use crate::error::AppError;
+        if count == 0 {
+            return Err(AppError::TaskRuntime("craft count must be positive".into()));
+        }
+        let world = client.world_state_snapshot().await;
+        let plan = recipes
+            .resolve_grid(target, count, &world.inventory)
+            .map_err(|error| AppError::TaskRuntime(format!("{error:?}")))?;
+        if plan.placements.is_empty() {
+            return Err(AppError::TaskRuntime(format!(
+                "{target} has no known crafting ingredients"
+            )));
+        }
+        if plan.grid_size() > 2 {
+            return Err(AppError::TaskRuntime(format!(
+                "{target} requires a crafting table; automated crafting-table execution is not implemented yet"
+            )));
+        }
+        let operations = plan.operations().min(64);
+        for (item, needed) in plan.requirements(operations) {
+            let have = world.inventory.count_item(&item);
+            if have < needed {
+                return Err(AppError::TaskRuntime(format!(
+                    "missing {} {item} (have {have})",
+                    needed - have
+                )));
+            }
+        }
+        self.status.lock().expect("craft status poisoned").recipe_id = Some(plan.recipe_id.clone());
+        let mut crafted = 0;
+        for _ in 0..operations {
+            if self.cancellation.is_cancelled() {
+                return Err(AppError::TaskRuntime("craft cancelled".into()));
+            }
+            for placement in &plan.placements {
+                let grid_slot = 1 + usize::from(placement.row) * 2 + usize::from(placement.column);
+                place_one_unit(client, &placement.item, grid_slot).await?;
+            }
+            take_craft_output(client, &plan.output_item).await?;
+            crafted += plan.output_per_craft;
+            let mut status = self.status.lock().expect("craft status poisoned");
+            status.completed_operations += 1;
+            status.crafted = crafted;
+        }
+        Ok(crafted)
+    }
+}
+
+/// Grid cell for the player's always-open 2x2 crafting grid: slot 0 is the
+/// output, slots 1-4 are the grid (row-major), matching azalea's `Player`
+/// menu layout (`craft_result`, then `craft`).
+async fn place_one_unit(
+    client: &crate::minecraft::client::MinecraftClient,
+    item: &str,
+    grid_slot: usize,
+) -> Result<(), crate::error::AppError> {
+    use crate::{
+        container::model::{ClickButton, InventoryClick},
+        error::AppError,
+    };
+    let snapshot = client.crafting_menu_snapshot().await?;
+    let source = snapshot
+        .find_item_slot(item)
+        .ok_or_else(|| AppError::InteractionItemMissing(item.to_owned()))?;
+    let before = snapshot.revision;
+    client
+        .container_click(
+            snapshot.window_id,
+            InventoryClick {
+                slot: source,
+                button: ClickButton::Left,
+            },
+        )
+        .await?;
+    client
+        .container_click(
+            snapshot.window_id,
+            InventoryClick {
+                slot: grid_slot,
+                button: ClickButton::Right,
+            },
+        )
+        .await?;
+    if let Ok(Some((_, held))) = client.carried_item().await
+        && held > 0
+    {
+        client
+            .container_click(
+                snapshot.window_id,
+                InventoryClick {
+                    slot: source,
+                    button: ClickButton::Left,
+                },
+            )
+            .await?;
+    }
+    wait_for_revision(client, before).await
+}
+
+async fn take_craft_output(
+    client: &crate::minecraft::client::MinecraftClient,
+    output_item: &str,
+) -> Result<(), crate::error::AppError> {
+    use crate::{
+        container::model::{ClickButton, InventoryClick},
+        error::AppError,
+    };
+    let snapshot = client.crafting_menu_snapshot().await?;
+    if snapshot
+        .result
+        .as_ref()
+        .is_none_or(|(id, _)| id != output_item)
+    {
+        return Err(AppError::TaskRuntime(
+            "crafting grid did not produce the expected item".into(),
+        ));
+    }
+    let destination = snapshot
+        .find_destination_slot(output_item)
+        .ok_or_else(|| AppError::TaskRuntime("no inventory space for crafted item".into()))?;
+    let before = snapshot.revision;
+    client
+        .container_click(
+            snapshot.window_id,
+            InventoryClick {
+                slot: snapshot.result_slot,
+                button: ClickButton::Left,
+            },
+        )
+        .await?;
+    client
+        .container_click(
+            snapshot.window_id,
+            InventoryClick {
+                slot: destination,
+                button: ClickButton::Left,
+            },
+        )
+        .await?;
+    wait_for_revision(client, before).await
+}
+
+async fn wait_for_revision(
+    client: &crate::minecraft::client::MinecraftClient,
+    before: u32,
+) -> Result<(), crate::error::AppError> {
+    for _ in 0..40 {
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        if let Ok(snapshot) = client.crafting_menu_snapshot().await
+            && snapshot.revision != before
+        {
+            return Ok(());
+        }
+    }
+    Err(crate::error::AppError::TaskRuntime(
+        "crafting click was not confirmed by the server".into(),
+    ))
+}
+
+/// Live view of whichever menu is currently active (player inventory or an
+/// external crafting-table window), translated to protocol slot numbers so
+/// [`CraftService::craft`] can click through [`MinecraftClient::container_click`]
+/// without depending on Azalea types directly.
+#[derive(Clone, Debug)]
+pub struct CraftingMenuSnapshot {
+    pub window_id: i32,
+    pub revision: u32,
+    pub result_slot: usize,
+    pub inventory_slots: Vec<usize>,
+    pub slots: Vec<Option<crate::container::model::StackSnapshot>>,
+    pub result: Option<(String, u32)>,
+}
+impl CraftingMenuSnapshot {
+    fn find_item_slot(&self, item: &str) -> Option<usize> {
+        self.inventory_slots.iter().copied().find(|&index| {
+            self.slots[index]
+                .as_ref()
+                .is_some_and(|slot| slot.item_id == item && slot.count > 0)
+        })
+    }
+    fn find_destination_slot(&self, item: &str) -> Option<usize> {
+        self.inventory_slots
+            .iter()
+            .copied()
+            .find(|&index| {
+                self.slots[index]
+                    .as_ref()
+                    .is_some_and(|slot| slot.item_id == item && slot.count < slot.max_count)
+            })
+            .or_else(|| {
+                self.inventory_slots
+                    .iter()
+                    .copied()
+                    .find(|&index| self.slots[index].is_none())
+            })
     }
 }
 

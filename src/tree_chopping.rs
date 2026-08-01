@@ -217,9 +217,11 @@ pub fn detect_tree(
     } else {
         StructureUncertainty::None
     };
-    // Eye-level reach is conservative. Interaction/navigation revalidates actual reach for every block.
-    let reachable_logs = logs.iter().copied().filter(|p| p.y <= base.y + 5).collect();
-    let unreachable_logs = logs.iter().copied().filter(|p| p.y > base.y + 5).collect();
+    // Height alone is not an interaction failure: the navigation controller
+    // can select a nearby standing point, look upward, and mine through a
+    // tree canopy when needed. Each log is revalidated at execution time.
+    let reachable_logs = logs.clone();
+    let unreachable_logs = Vec::new();
     Some(TreeModel {
         id: position_id(base),
         estimated_log_count: logs.len(),
@@ -485,12 +487,10 @@ impl TreeChopService {
                     a.result.logs_broken += 1;
                     a.waiting = false
                 }
-                InteractionState::Failed => {
-                    a.result.outcome = ChopOutcome::Partial;
-                    a.result.detail =
-                        Some("a log was unreachable or changed before server confirmation".into());
-                    self.finish(a.result);
-                    return;
+                InteractionState::Failed | InteractionState::Cancelled => {
+                    a.result.unreachable_logs += 1;
+                    a.waiting = false;
+                    logging::warning("Tree log unreachable; skipping it and continuing");
                 }
                 _ => {
                     self.active = Some(a);
@@ -504,10 +504,8 @@ impl TreeChopService {
                     match interaction.break_at(m, movement, look, p).await {
                         Ok(()) => a.waiting = true,
                         Err(e) => {
-                            a.result.outcome = ChopOutcome::Partial;
-                            a.result.detail = Some(e.to_string());
-                            self.finish(a.result);
-                            return;
+                            a.result.unreachable_logs += 1;
+                            logging::warning(format!("Tree log unreachable; skipping it: {e}"));
                         }
                     }
                 }
@@ -593,10 +591,12 @@ mod tests {
         assert!(detect_tree(p(0, 0, 0), &big, &c).unwrap().exceeds_limits);
     }
     #[test]
-    fn tall_logs_are_reported_unreachable() {
+    fn tall_logs_remain_chopping_candidates() {
         let mut o = (0..8).map(|y| b(0, y, 0, "spruce_log")).collect::<Vec<_>>();
         o.push(b(0, 8, 0, "spruce_leaves"));
         let t = detect_tree(p(0, 0, 0), &o, &cfg()).unwrap();
-        assert_eq!(t.unreachable_logs.len(), 2);
+        assert!(t.unreachable_logs.is_empty());
+        assert_eq!(chopping_order(&t).len(), 8);
+        assert_eq!(chopping_order(&t).last(), Some(&p(0, 7, 0)));
     }
 }
