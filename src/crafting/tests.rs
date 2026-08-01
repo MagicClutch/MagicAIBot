@@ -512,6 +512,7 @@ fn disconnected_client() -> crate::minecraft::client::MinecraftClient {
         },
         crate::config::ConsoleConfig::default(),
         crate::config::WorldStateConfig::default(),
+        crate::config::VerticalNavigationConfig::default(),
     )
 }
 

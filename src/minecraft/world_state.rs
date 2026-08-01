@@ -185,11 +185,13 @@ pub struct ChatRecord {
     pub text: String,
     pub timestamp: SystemTime,
 }
+/// Lightweight "what is the bot doing right now" display used by `/status`.
+/// There is no task registry behind this -- callers set it before starting a
+/// direct service call and clear it when the call finishes (see the
+/// `*_and_wait` helpers in `src/app.rs`).
 #[derive(Clone, Debug)]
 pub struct TaskSnapshot {
     pub name: String,
-    pub id: String,
-    pub status: String,
     pub started_at: SystemTime,
 }
 
@@ -872,8 +874,6 @@ mod tests {
         let mut state = WorldState::default();
         state.set_current_task(TaskSnapshot {
             name: "test".into(),
-            id: "1".into(),
-            status: "queued".into(),
             started_at: SystemTime::now(),
         });
         assert_eq!(state.snapshot().current_task.unwrap().name, "test");
@@ -895,8 +895,6 @@ mod tests {
         });
         state.set_current_task(TaskSnapshot {
             name: "old".into(),
-            id: "1".into(),
-            status: "running".into(),
             started_at: SystemTime::now(),
         });
         state.clear_session_state();

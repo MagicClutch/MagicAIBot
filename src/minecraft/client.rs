@@ -25,7 +25,11 @@ use azalea::{
         inventory::Inventory,
         metadata::{Health, Item, ItemItem},
     },
-    pathfinder::{PathfinderClientExt, PathfinderOpts, goals::RadiusGoal},
+    pathfinder::{
+        PathfinderClientExt, PathfinderOpts, custom_state::CustomPathfinderState,
+        goals::RadiusGoal, moves::combined_move, policy::PathfindingPolicy,
+        vertical::ScaffoldPolicy,
+    },
     player::GameProfileComponent,
     registry::builtin::BlockKind,
     world::WorldName,
@@ -44,7 +48,10 @@ use crate::{
         block_query::{BlockSearchQuery, chunk_coordinate},
         block_snapshot::LoadedBlockCandidate,
     },
-    config::{AccountMode, ConsoleConfig, MinecraftConfig, ReconnectConfig, WorldStateConfig},
+    config::{
+        AccountMode, ConsoleConfig, MinecraftConfig, ReconnectConfig, VerticalNavigationConfig,
+        WorldStateConfig,
+    },
     error::AppError,
     logging,
     minecraft::{
@@ -106,6 +113,7 @@ pub struct MinecraftClient {
     minecraft: MinecraftConfig,
     reconnect: ReconnectConfig,
     console: ConsoleConfig,
+    vertical_navigation: VerticalNavigationConfig,
     state: watch::Receiver<ConnectionState>,
     state_tx: watch::Sender<ConnectionState>,
     current_client: Arc<Mutex<Option<Client>>>,
@@ -182,6 +190,7 @@ impl MinecraftClient {
         reconnect: ReconnectConfig,
         console: ConsoleConfig,
         world_config: WorldStateConfig,
+        vertical_navigation: VerticalNavigationConfig,
     ) -> Self {
         let (state_tx, state) = watch::channel(ConnectionState::Disconnected);
         let mut world = WorldState::with_limits(
@@ -202,6 +211,7 @@ impl MinecraftClient {
             minecraft,
             reconnect,
             console,
+            vertical_navigation,
             state,
             state_tx,
             current_client: Arc::new(Mutex::new(None)),
@@ -1189,6 +1199,48 @@ impl MinecraftClient {
             .await
             .clone()
             .ok_or(AppError::MovementUnavailable)?;
+        let allow_build = self.vertical_navigation.enabled && mode.allows_mining();
+        let mut policy = PathfindingPolicy {
+            allow_pillaring: allow_build && self.vertical_navigation.allow_pillaring,
+            allow_bridging: allow_build && self.vertical_navigation.allow_bridging,
+            allow_staircase_building: allow_build && self.vertical_navigation.allow_digging_down,
+            scaffold: ScaffoldPolicy {
+                allowed: self.vertical_navigation.allowed_building_blocks.clone(),
+                denied: self.vertical_navigation.denied_building_blocks.clone(),
+                minimum_held: self.vertical_navigation.minimum_building_blocks,
+            },
+            ..Default::default()
+        };
+
+        // `MovementService::tick_goto` resubmits the goal (calling this
+        // function again) every `repath_interval_ms` -- as often as every
+        // 150ms by default -- for the entire duration of a single `/goto`.
+        // Blindly inserting a brand new `CustomPathfinderState` on every one
+        // of those calls would wipe `scaffold_item`/`scaffold_available`
+        // back to their `Default` (`None`/`0`) each time, undoing
+        // `PathfindingPolicy::refresh_scaffold`'s "keep using an
+        // already-selected item down to the last one held" behavior every
+        // ~150ms during an in-progress build route -- reintroducing the
+        // "stops after 1 block" failure this was meant to fix, just on a
+        // repath cadence instead of a per-tick one. Preserve the live half
+        // of the previous policy (if any) across this resubmission; only the
+        // static `allow_*`/`scaffold` preferences above are meant to be
+        // refreshed per call.
+        let mut ecs = client.ecs.write();
+        let existing_state = ecs.get::<CustomPathfinderState>(client.entity).cloned();
+        if let Some(existing_state) = existing_state {
+            if let Some(previous) = existing_state.0.read().get::<PathfindingPolicy>() {
+                policy.scaffold_item = previous.scaffold_item.clone();
+                policy.scaffold_available = previous.scaffold_available;
+            }
+            existing_state.0.write().insert(policy);
+        } else {
+            let custom_state = CustomPathfinderState::default();
+            custom_state.0.write().insert(policy);
+            ecs.entity_mut(client.entity).insert(custom_state);
+        }
+        drop(ecs);
+
         // Use the same radius-based goal for direct movement, following, and
         // task-owned navigation. BlockPosGoal can report the target as reached
         // before Azalea begins executing when the requested Y coordinate is a
@@ -1202,6 +1254,7 @@ impl MinecraftClient {
             ),
             PathfinderOpts::new()
                 .allow_mining(mode.allows_mining())
+                .successors_fn(combined_move)
                 .retry_on_no_path(true),
         );
         Ok(())
@@ -1861,6 +1914,7 @@ mod tests {
             },
             ConsoleConfig::default(),
             WorldStateConfig::default(),
+            VerticalNavigationConfig::default(),
         )
     }
 

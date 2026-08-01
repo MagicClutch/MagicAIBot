@@ -50,6 +50,12 @@ impl MovementService {
         self.state.lock().await.clone()
     }
 
+    /// Hard ceiling for how long a caller awaiting movement completion
+    /// should wait before giving up (see `MovementConfig::maximum_navigation_seconds`).
+    pub(crate) fn maximum_navigation_seconds(&self) -> u64 {
+        self.config.maximum_navigation_seconds
+    }
+
     /// The latest camera-relative movement recommendation. Azalea's
     /// pathfinder remains the sole writer of live movement controls; exposing
     /// this bounded adapter lets navigation and tests share human-like
@@ -139,10 +145,10 @@ impl MovementService {
             .start_navigation_to(
                 destination,
                 Some(self.config.follow_distance),
-                NavigationMode::MovementOnly,
+                NavigationMode::AllowMining,
             )
             .await?;
-        *self.navigation_mode.lock().await = NavigationMode::MovementOnly;
+        *self.navigation_mode.lock().await = NavigationMode::AllowMining;
         *self.last_goal_submission.lock().await = Some(SystemTime::now());
         logger::following(&player.username);
         self.replace_and_publish(
@@ -237,6 +243,26 @@ impl MovementService {
         if !self.goal_resubmission_due().await {
             return Ok(());
         }
+        // A new goto event replaces (and cancels) Azalea's in-flight
+        // background path computation -- see `goto_listener`'s `ComputePath`
+        // component replacement in the vendored pathfinder. Resubmitting on
+        // this fixed `repath_interval_ms` timer (as short as 150ms by
+        // default) while a longer search is still running -- a distant
+        // target, or one that needs the more expensive build-move successors
+        // (pillar/bridge/staircase) -- would keep restarting that search
+        // forever without ever letting it finish, so the bot never gets a
+        // new route and appears stuck. Skip resubmission while a
+        // calculation is already in progress; it always resolves within
+        // Azalea's own `max_timeout` (5s by default) even in the worst case,
+        // so this can't itself introduce a stall, and the very next repath
+        // tick after it finishes resubmits with the latest destination.
+        if minecraft
+            .navigation_status()
+            .await
+            .is_ok_and(|status| status.calculating)
+        {
+            return Ok(());
+        }
         minecraft
             .start_navigation_to(destination, follow_distance, mode)
             .await?;
@@ -304,7 +330,7 @@ impl MovementService {
                 minecraft,
                 destination,
                 Some(self.config.follow_distance),
-                NavigationMode::MovementOnly,
+                NavigationMode::AllowMining,
             )
             .await
         {

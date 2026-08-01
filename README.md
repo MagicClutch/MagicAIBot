@@ -42,8 +42,7 @@ Dependency upgrades are deliberate compatibility work, not routine updates.
 | Source | Supported | Constraints |
 |---|---:|---|
 | Local console | Yes | Trusted local operator; bounded parser; plain text chat forwarding is off by default. |
-| Minecraft chat commands | Yes | `!`-prefixed messages routed to Groq; access control, rate limiting. |
-| AI/provider plans | Yes | Groq (OpenAI-compatible) via tool calling; 14 registered commands. |
+| Minecraft chat commands | Yes | `#`-prefixed messages run the same parser as the local console; access control, rate limiting. |
 
 | Tool/action | Supported | Confirmation / cancellation |
 |---|---:|---|
@@ -54,7 +53,7 @@ Dependency upgrades are deliberate compatibility work, not routine updates.
 | Break/place one block | Yes | Exact block-state change; `/stopinteraction`. |
 | Inventory summary/tool hotbar selection | Read / limited | No menu clicks or inventory transaction service exists. |
 | Craft/eat/container/deposit | No | Commands are intentionally absent. |
-| Gather logs/stone/visible ore/food | Yes (console) / Yes (AI via Groq) | Production gather action exists. |
+| Gather logs/stone/visible ore/food | No | Removed. |
 
 | Container | Inspect | Transfer/click | Notes |
 |---|---:|---:|---|
@@ -66,13 +65,14 @@ Dependency upgrades are deliberate compatibility work, not routine updates.
 Run `/help` for the complete list. Commands are local-console-only and therefore require access to
 the bot process. World-changing commands have explicit names; `/goto` never mines, while
 `/goto-mine` opts into Azalea pathfinder mining. `/break` is intentional interaction and is not a
-pathfinder mode. Use `/stopinteraction`, `/stop`, or `/stopall` to cancel at the documented scope.
+pathfinder mode. Use `/stopinteraction` or `/stop` to cancel at the documented scope.
 Success means an authoritative observed state transition, not merely a packet send.
 
 Search radii, retry counts, timeouts, and look variation are bounded in `config.toml.example`.
 Disconnect/reconnect and shutdown stop movement, navigation, look, and interaction; work is not
-automatically resumed. Logs are local and are never forwarded to Minecraft chat. Correlation IDs in
-the task ownership layer are safe random identifiers and contain no account/session secret.
+automatically resumed. Logs are local and are never forwarded to Minecraft chat. There is no task
+orchestration layer -- console/chat commands call the owning service (movement, block navigation,
+look, interaction) directly and wait for it to finish.
 
 ## Architecture and tests
 
@@ -133,7 +133,7 @@ types remain explicit integration work; no execution behavior is included here.
 ```text
 src/
 ├── main.rs       # Tokio entry point
-├── app.rs        # Application composition, lifecycle, AI dispatch
+├── app.rs        # Application composition and lifecycle
 ├── config.rs     # TOML configuration and logging setup
 ├── error.rs      # Unified application errors
 ├── logging.rs    # Logging helpers
@@ -147,18 +147,13 @@ src/
 ├── collection/   # Dropped-item collector
 ├── food/         # Food collection
 ├── tree_chopping.rs  # Tree detection and chopping
-├── tasks/        # Task orchestration and lifecycle
+├── tasks/        # Shared action-failure/identity types used by interaction
 ├── inventory/    # Inventory service
 ├── container/    # Chest interaction
 ├── crafting/     # Recipe and crafting execution
 ├── smelting/     # Furnace/smelting state machines
 ├── processing/   # Processing-station knowledge
-├── inventory_cleanup.rs  # Policy-driven cleanup
-└── ai/           # AI provider, registry, sessions, tool calling
-    ├── mod.rs    # AI session, action types, validation
-    ├── provider.rs  # AiProvider trait and types
-    ├── groq.rs   # Groq HTTP implementation
-    └── registry.rs  # Command registry and tool definitions
+└── inventory_cleanup.rs  # Policy-driven cleanup
 ```
 
 ## Processing-station knowledge (Task 13 handoff)

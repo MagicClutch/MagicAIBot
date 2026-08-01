@@ -197,7 +197,15 @@ impl BlockNavigationService {
     }
 
     pub async fn cancel(&self, minecraft: &MinecraftClient, movement: &MovementService) {
-        let _ = movement.stop(minecraft).await;
+        // An idle controller must be a no-op, the same contract
+        // `InteractionController::cancel` follows -- console movement/look
+        // commands call this defensively before starting something new, and
+        // unconditionally stopping movement here races with an
+        // immediately-following `/goto` submission: Azalea processes the
+        // stale `StopPathfindingEvent` and the fresh `GotoEvent` on the same
+        // tick, and if the stop handler happens to run after `goto_listener`
+        // it silently drops the just-spawned path computation before its
+        // result is ever collected, permanently stalling navigation.
         let mut inner = self.inner.lock().await;
         let was_active = matches!(
             inner.snapshot.state,
@@ -216,6 +224,10 @@ impl BlockNavigationService {
         inner.candidates.clear();
         inner.failed_blocks.clear();
         inner.failed_approaches.clear();
+        drop(inner);
+        if was_active {
+            let _ = movement.stop(minecraft).await;
+        }
     }
 
     /// Reuse the existing bounded approach selection after a caller discovers

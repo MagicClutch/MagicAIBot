@@ -1,15 +1,10 @@
 use std::{
     collections::{HashMap, VecDeque},
     path::Path,
-    time::{Duration, Instant},
+    time::{Duration, Instant, SystemTime},
 };
 
 use crate::{
-    ai::{
-        self, AiAction, AiSession, AiSessionStatus, CapabilityResult, CapabilityStatus,
-        InventoryItemSummary, InventorySummary,
-        provider::{AiProviderError, AiRequest as AiProviderRequest, ChatMessage},
-    },
     blocks::{
         block_query::BlockSearchQuery,
         block_search::{BlockSearchService, format_find_results, format_nearest_result},
@@ -28,46 +23,146 @@ use crate::{
     look::{LookController, LookTarget, look_controller::LookState},
     minecraft::{
         client::MinecraftClient,
-        world_state::{BlockPosition, MovementStatus, PlayerSnapshot, WorldStateSnapshot},
+        world_state::{MovementStatus, TaskSnapshot},
     },
     movement::{MovementService, NavigationMode},
     navigation::BlockNavigationService,
     navigation::navigation_state::BlockNavigationState,
-    tasks::{CancellationReason, TaskId, TaskService},
 };
 use tokio::{sync::mpsc, task::JoinHandle};
 use tokio_util::sync::CancellationToken;
 
-/// How a dispatched AI action's real-world completion should be detected.
-/// `WalkTo`/`BreakBlock`/`PlaceBlock` start an azalea/interaction state
-/// machine that only advances on later ticks, so their result cannot be
-/// known at dispatch time; everything else already completes synchronously.
-#[derive(Clone)]
-enum PendingAction {
-    Instant(CapabilityResult),
-    Movement,
-    Interaction,
-    /// Waits for the look controller to finish (or give up on) turning
-    /// toward a player -- submitted via a fire-and-forget `look_at` -- then
-    /// performs the actual drop. A blocking `sleep` here would freeze the
-    /// same tick loop that drives `LookController::tick`, so it would never
-    /// observe any progress; this defers the drop to `tick_ai_action_completion`
-    /// instead, same as `Movement`/`Interaction`.
-    LookThenDrop {
-        item_id: String,
-        count: u16,
-    },
-    /// Waits for `LookAt`'s fire-and-forget `look_at` submission to actually
-    /// finish turning (or fail/time out) before reporting a result -- same
-    /// fake-instant-completion problem `LookThenDrop` was built for.
-    Look,
-    /// Waits for the container state machine (driven by `ContainerService::tick`,
-    /// called every interaction tick) to reach a terminal phase before
-    /// reporting open/take/store/close as done.
-    Container,
+// ---- Completion polling ------------------------------------------------------
+//
+// Movement, block navigation, interaction, and look are all tick-driven state
+// machines: submitting a goal (`goto`, `start`, `break_at`, `look_at`, ...)
+// only enqueues work and returns as soon as the state transitions away from
+// idle -- it does not wait for a terminal state. The application's own tick
+// loop normally drives these forward, but a console/chat caller that awaits
+// the submission alone would report success (or failure) before the bot has
+// actually done anything. These helpers drive the same `tick()` methods the
+// application loop uses, in a private loop, so a caller that awaits one of
+// them genuinely blocks until Completed/Reached, Failed, or Cancelled.
+
+/// Bounded by `MovementConfig::maximum_navigation_seconds`. Azalea's
+/// pathfinder is submitted with `retry_on_no_path(true)` (see
+/// `MinecraftClient::start_navigation_to`), so a genuinely unreachable goal
+/// (not enough scaffold material to finish a route, a destination behind
+/// terrain the current policy can't cross) retries forever inside Azalea
+/// without ever surfacing as a failure -- `MovementStatus` would just stay
+/// `MovingToPosition` indefinitely. Without a deadline here, that would hang
+/// this function forever, which hangs the single-threaded console/chat
+/// command loop that calls it -- freezing the whole app (including `/stop`)
+/// until the process is killed.
+async fn await_movement_terminal(
+    movement: &MovementService,
+    minecraft: &MinecraftClient,
+) -> Result<(), AppError> {
+    let deadline = Duration::from_secs(movement.maximum_navigation_seconds());
+    let started = Instant::now();
+    loop {
+        movement.tick(minecraft, false).await;
+        let snapshot = movement.snapshot().await;
+        match snapshot.status {
+            MovementStatus::Completed | MovementStatus::Idle => return Ok(()),
+            MovementStatus::Cancelled => return Err(AppError::MovementCancelled),
+            MovementStatus::Failed => {
+                return Err(AppError::PathfindingFailure(
+                    snapshot
+                        .failure_reason
+                        .unwrap_or_else(|| "unknown reason".into()),
+                ));
+            }
+            MovementStatus::MovingToPosition | MovementStatus::FollowingPlayer => {
+                if started.elapsed() >= deadline {
+                    let _ = movement.stop(minecraft).await;
+                    return Err(AppError::PathfindingFailure(format!(
+                        "movement timed out after {}s without reaching the destination or failing",
+                        deadline.as_secs()
+                    )));
+                }
+                tokio::time::sleep(Duration::from_millis(200)).await;
+            }
+        }
+    }
 }
 
-/// Application composition root. Exposes primitive capabilities to the AI.
+async fn await_block_navigation_terminal(
+    navigation: &BlockNavigationService,
+    minecraft: &MinecraftClient,
+    movement: &MovementService,
+) -> Result<(), AppError> {
+    loop {
+        navigation.tick(minecraft, movement).await;
+        let snapshot = navigation.snapshot().await;
+        match snapshot.state {
+            BlockNavigationState::Reached | BlockNavigationState::Idle => return Ok(()),
+            BlockNavigationState::Cancelled => return Err(AppError::MovementCancelled),
+            BlockNavigationState::Failed => {
+                return Err(AppError::TaskRuntime(
+                    snapshot
+                        .failure_reason
+                        .unwrap_or_else(|| "block navigation failed".into()),
+                ));
+            }
+            _ => tokio::time::sleep(Duration::from_millis(200)).await,
+        }
+    }
+}
+
+async fn await_look_terminal(
+    look: &LookController,
+    minecraft: &MinecraftClient,
+) -> Result<(), AppError> {
+    loop {
+        look.tick(minecraft).await;
+        let snapshot = look.snapshot().await;
+        match snapshot.state {
+            LookState::Completed | LookState::Idle => return Ok(()),
+            LookState::Cancelled => return Err(AppError::LookCancelled),
+            LookState::Failed => {
+                return Err(AppError::LookUnavailableWithReason(
+                    snapshot
+                        .failure_reason
+                        .unwrap_or_else(|| "look failed".into()),
+                ));
+            }
+            LookState::Looking => tokio::time::sleep(Duration::from_millis(75)).await,
+        }
+    }
+}
+
+/// Interaction can internally hand off to block navigation (to get in range)
+/// and to look (for precise aiming), so both must be driven alongside it or
+/// the interaction state machine stalls waiting on a tick that never comes.
+async fn await_interaction_terminal(
+    interaction: &InteractionController,
+    minecraft: &MinecraftClient,
+    movement: &MovementService,
+    block_navigation: &BlockNavigationService,
+    look: &LookController,
+) -> Result<(), AppError> {
+    loop {
+        block_navigation.tick(minecraft, movement).await;
+        look.tick(minecraft).await;
+        interaction.tick(minecraft, movement, look).await;
+        let snapshot = interaction.snapshot().await;
+        match snapshot.state {
+            InteractionState::Completed | InteractionState::Idle => return Ok(()),
+            InteractionState::Cancelled => return Err(AppError::InteractionCancelled),
+            InteractionState::Failed => {
+                return Err(AppError::TaskRuntime(
+                    snapshot
+                        .failure_reason
+                        .unwrap_or_else(|| "interaction failed".into()),
+                ));
+            }
+            _ => tokio::time::sleep(Duration::from_millis(75)).await,
+        }
+    }
+}
+
+/// Application composition root.
 pub struct App {
     config: Config,
     shutdown: CancellationToken,
@@ -76,19 +171,12 @@ pub struct App {
     block_navigation: BlockNavigationService,
     look: LookController,
     interaction: InteractionController,
-    vertical_construction: crate::navigation::VerticalConstructionService,
-    tasks: TaskService,
     recipes: RecipeBook,
     crafting: CraftService,
     container: ContainerService,
-    ai_session: Option<AiSession>,
     chat_rate_limits: HashMap<String, VecDeque<Instant>>,
     session_ready: bool,
     started_at: Instant,
-    ai_request_in_flight: bool,
-    player_was_dead: bool,
-    physical_action_active: bool,
-    pending_action: Option<PendingAction>,
 }
 
 impl App {
@@ -113,10 +201,12 @@ impl App {
             config.reconnect.clone(),
             config.console.clone(),
             config.world_state.clone(),
+            config.vertical_navigation.clone(),
         );
-        minecraft
-            .set_incoming_player_chat_capacity(config.ai.chat.incoming_queue_capacity)
-            .await;
+        // Bounded buffer for incoming player chat messages (currently only
+        // consumed by the `#`-prefixed direct console command feature, see
+        // `App::handle_chat_console_command`); not user-configurable.
+        minecraft.set_incoming_player_chat_capacity(64).await;
         Ok(Self {
             minecraft,
             movement: MovementService::new(config.movement.clone(), config.multitasking.clone()),
@@ -138,25 +228,20 @@ impl App {
                 ),
                 block_navigation,
             ),
-            vertical_construction: crate::navigation::VerticalConstructionService::default(),
-            tasks: TaskService::default(),
             recipes: crate::crafting::RecipeBook::fallback().map_err(AppError::RecipeData)?,
             crafting: CraftService::default(),
             container: ContainerService::default(),
-            ai_session: None,
             chat_rate_limits: HashMap::new(),
             session_ready: false,
-            ai_request_in_flight: false,
-            physical_action_active: false,
-            pending_action: None,
-            player_was_dead: false,
             config,
             shutdown: CancellationToken::new(),
             started_at: Instant::now(),
         })
     }
 
-    /// Waits for Ctrl+C and performs the application's graceful shutdown.
+    /// Waits for Ctrl+C (or, on Unix, SIGTERM -- what Docker/Pelican Panel
+    /// send to stop a container) and performs the application's graceful
+    /// shutdown.
     pub async fn run(mut self) -> Result<(), AppError> {
         logging::info(format!("Connecting to {}", self.config.minecraft.server));
         if let Err(error) = self.minecraft.connect().await {
@@ -184,6 +269,11 @@ impl App {
                     result?;
                     break Ok(());
                 }
+                result = wait_for_terminate_signal() => {
+                    result?;
+                    logging::info("Received SIGTERM, shutting down");
+                    break Ok(());
+                }
                 _ = movement_tick.tick() => {
                     if self.minecraft.connection_state() != crate::minecraft::client::ConnectionState::Connected {
                         if self.session_ready {
@@ -192,22 +282,12 @@ impl App {
                             self.block_navigation.cancel(&self.minecraft, &self.movement).await;
                             self.look.cancel().await;
                             let _ = self.movement.stop(&self.minecraft).await;
-                            self.tasks.disconnected();
                             self.minecraft.clear_current_task().await;
                         }
                         continue;
                     }
                     self.session_ready = true;
-                    self.enforce_ai_limits().await;
-                    self.tick_ai_provider().await;
-                    self.tick_ai_chat().await;
-                    let currently_dead = self.minecraft.world_state_snapshot().await.bot.alive == Some(false);
-                    if currently_dead && !self.player_was_dead {
-                        self.player_was_dead = true;
-                        self.tasks.player_died();
-                    } else if !currently_dead {
-                        self.player_was_dead = false;
-                    }
+                    self.tick_chat_commands().await;
                     let explicit_look = self.look.snapshot().await.state == LookState::Looking;
                     self.movement.tick(&self.minecraft, explicit_look).await;
                 },
@@ -224,7 +304,6 @@ impl App {
                     // before the next path is selected.
                     self.block_navigation.tick(&self.minecraft, &self.movement).await;
                     self.interaction.tick(&self.minecraft, &self.movement, &self.look).await;
-                    self.tick_ai_action_completion().await;
                     self.container.tick(&self.minecraft, &self.movement, &self.block_navigation, &self.look).await;
                 },
                 input = input_rx.recv() => match input {
@@ -241,7 +320,6 @@ impl App {
         };
 
         self.shutdown.cancel();
-        self.vertical_construction.cancel();
         self.container
             .cancel(
                 &self.minecraft,
@@ -250,7 +328,6 @@ impl App {
                 &self.look,
             )
             .await;
-        self.tasks.shutdown();
         self.block_navigation
             .cancel(&self.minecraft, &self.movement)
             .await;
@@ -281,9 +358,6 @@ impl App {
                 }
             }
             ConsoleInput::Command(command) => match command {
-                ConsoleCommand::Ai { request } => self.start_ai(request).await,
-                ConsoleCommand::AiCancel => self.cancel_ai().await,
-                ConsoleCommand::AiStatus => self.print_ai_status(),
                 ConsoleCommand::Help => print_help(),
                 ConsoleCommand::Status => self.print_status().await,
                 ConsoleCommand::Where => self.print_where().await,
@@ -314,7 +388,10 @@ impl App {
                         y: f64::from(y),
                         z: f64::from(z),
                     };
-                    match self.goto_with_terrain_assist(destination).await {
+                    match self
+                        .goto_and_wait("Go to position", destination, NavigationMode::AllowMining)
+                        .await
+                    {
                         Ok(()) => logging::success("Destination reached"),
                         Err(error) => logging::error(error),
                     }
@@ -326,18 +403,13 @@ impl App {
                     self.block_navigation
                         .cancel(&self.minecraft, &self.movement)
                         .await;
+                    let destination = crate::minecraft::world_state::PositionSnapshot {
+                        x: f64::from(x),
+                        y: f64::from(y),
+                        z: f64::from(z),
+                    };
                     if let Err(error) = self
-                        .tasks
-                        .goto_position(
-                            &self.minecraft,
-                            &self.movement,
-                            crate::minecraft::world_state::PositionSnapshot {
-                                x: f64::from(x),
-                                y: f64::from(y),
-                                z: f64::from(z),
-                            },
-                            NavigationMode::AllowMining,
-                        )
+                        .goto_and_wait("Go to position", destination, NavigationMode::AllowMining)
                         .await
                     {
                         println!("Movement error: {error}");
@@ -348,38 +420,19 @@ impl App {
                     // `/stop` is the movement channel's stop command. A
                     // separate look task remains active, even when it is
                     // tracking a target while the bot walks.
-                    self.vertical_construction.cancel();
+                    let description = self.active_stop_description().await;
                     self.block_navigation
                         .cancel(&self.minecraft, &self.movement)
                         .await;
                     match self.movement.stop(&self.minecraft).await {
-                        Ok(()) => logging::success("Movement stopped"),
+                        Ok(()) => match description {
+                            Some(description) => {
+                                logging::success(format!("Bot stopped ({description})"))
+                            }
+                            None => logging::info("Bot has no task to stop"),
+                        },
                         Err(error) => logging::error(error),
                     }
-                }
-                ConsoleCommand::StopAll => {
-                    println!("This command is no longer available; use AI capabilities instead.");
-                }
-                ConsoleCommand::TaskStatus => self.print_task_status().await,
-                ConsoleCommand::GatherStatus => self.print_task_status().await,
-                ConsoleCommand::GatherCancel => {
-                    println!("This command is no longer available; use AI capabilities instead.");
-                }
-                ConsoleCommand::TaskStatusById { id } => self.print_task_by_id(TaskId(id)),
-                ConsoleCommand::TaskCancel { id } => {
-                    if let Some(id) = id {
-                        println!(
-                            "Cancellation requested: {}",
-                            self.tasks.cancel_task(TaskId(id), CancellationReason::User)
-                        );
-                    } else {
-                        self.tasks.cancel_all(CancellationReason::User);
-                        println!("Cancellation requested for all active tasks.");
-                    }
-                }
-                ConsoleCommand::TaskRecent => self.print_recent_tasks(),
-                ConsoleCommand::Gather { .. } => {
-                    println!("This command is no longer available; use AI capabilities instead.");
                 }
                 ConsoleCommand::Follow { player } => {
                     self.interaction
@@ -388,7 +441,6 @@ impl App {
                     self.block_navigation
                         .cancel(&self.minecraft, &self.movement)
                         .await;
-                    self.close_initial_gap_to_player(&player).await;
                     match self.movement.follow(&self.minecraft, &player).await {
                         Ok(()) => logging::info(format!("Following player {player}")),
                         Err(AppError::UnknownPlayer(_)) => logging::error("Player not found"),
@@ -417,11 +469,7 @@ impl App {
                     let radius =
                         search_radius.unwrap_or(self.config.block_navigation.default_search_radius);
                     if let Err(error) = self
-                        .tasks
-                        .goto_block(
-                            &self.minecraft,
-                            &self.movement,
-                            &self.block_navigation,
+                        .goto_block_and_wait(
                             block_id,
                             radius,
                             if allow_mining {
@@ -447,10 +495,8 @@ impl App {
                         .await;
                     logging::info(format!("Looking at ({x}, {y}, {z})"));
                     match self
-                        .tasks
-                        .look_at(
-                            &self.minecraft,
-                            &self.look,
+                        .look_and_wait(
+                            "Look at target",
                             LookTarget::World(crate::minecraft::world_state::PositionSnapshot {
                                 x: f64::from(x),
                                 y: f64::from(y),
@@ -467,11 +513,7 @@ impl App {
                     self.interaction
                         .cancel(&self.minecraft, &self.movement, &self.look)
                         .await;
-                    if let Err(error) = self
-                        .tasks
-                        .look_at_block(&self.minecraft, &self.look, block_id)
-                        .await
-                    {
+                    if let Err(error) = self.look_block_and_wait(block_id).await {
                         logging::warning(format!("Look failed: {error}"));
                     }
                 }
@@ -480,8 +522,7 @@ impl App {
                         .cancel(&self.minecraft, &self.movement, &self.look)
                         .await;
                     if let Err(error) = self
-                        .tasks
-                        .look_at(&self.minecraft, &self.look, LookTarget::Player(player))
+                        .look_and_wait("Look at player", LookTarget::Player(player))
                         .await
                     {
                         logging::warning(format!("Look failed: {error}"));
@@ -502,10 +543,8 @@ impl App {
                     match entity {
                         Some(entity) => {
                             if let Err(error) = self
-                                .tasks
-                                .look_at(
-                                    &self.minecraft,
-                                    &self.look,
+                                .look_and_wait(
+                                    "Look at entity",
                                     LookTarget::Entity(entity.entity_id),
                                 )
                                 .await
@@ -522,28 +561,9 @@ impl App {
                     self.block_navigation
                         .cancel(&self.minecraft, &self.movement)
                         .await;
-                    if let Err(error) = self
-                        .tasks
-                        .break_looked_block(
-                            &self.minecraft,
-                            &self.movement,
-                            &self.look,
-                            &self.interaction,
-                            &self.block_navigation,
-                        )
-                        .await
-                    {
+                    if let Err(error) = self.break_looked_and_wait().await {
                         logging::warning(format!("Cannot break block: {error}"));
                     }
-                }
-                ConsoleCommand::MineOre { .. } => {
-                    println!("This command is no longer available; use AI capabilities instead.");
-                }
-                ConsoleCommand::MineOreStatus => {
-                    println!("This command is no longer available; use AI capabilities instead.");
-                }
-                ConsoleCommand::MineOreStop => {
-                    println!("This command is no longer available; use AI capabilities instead.");
                 }
                 ConsoleCommand::Break { x, y, z } => {
                     self.block_navigation
@@ -551,15 +571,7 @@ impl App {
                         .await;
                     logging::info(format!("Breaking block at ({x}, {y}, {z})"));
                     match self
-                        .tasks
-                        .break_block(
-                            &self.minecraft,
-                            &self.movement,
-                            &self.look,
-                            &self.interaction,
-                            &self.block_navigation,
-                            crate::minecraft::world_state::BlockPosition { x, y, z },
-                        )
+                        .break_at_and_wait(crate::minecraft::world_state::BlockPosition { x, y, z })
                         .await
                     {
                         Ok(()) => logging::success("Block broken"),
@@ -570,18 +582,7 @@ impl App {
                     self.block_navigation
                         .cancel(&self.minecraft, &self.movement)
                         .await;
-                    if let Err(error) = self
-                        .tasks
-                        .break_nearest_block(
-                            &self.minecraft,
-                            &self.movement,
-                            &self.look,
-                            &self.interaction,
-                            &self.block_navigation,
-                            block_id,
-                        )
-                        .await
-                    {
+                    if let Err(error) = self.break_nearest_and_wait(block_id).await {
                         logging::warning(format!("Cannot break block: {error}"));
                     }
                 }
@@ -617,18 +618,7 @@ impl App {
                         .cancel(&self.minecraft, &self.movement)
                         .await;
                     logging::info(format!("Placing {block_id}"));
-                    match self
-                        .tasks
-                        .place_looked_block(
-                            &self.minecraft,
-                            &self.movement,
-                            &self.look,
-                            &self.interaction,
-                            &self.block_navigation,
-                            block_id,
-                        )
-                        .await
-                    {
+                    match self.place_looked_and_wait(block_id).await {
                         Ok(()) => logging::success("Block placed"),
                         Err(error) => logging::error(error),
                     }
@@ -639,13 +629,7 @@ impl App {
                         .await;
                     logging::info(format!("Placing {block_id} at ({x}, {y}, {z})"));
                     match self
-                        .tasks
-                        .place_block(
-                            &self.minecraft,
-                            &self.movement,
-                            &self.look,
-                            &self.interaction,
-                            &self.block_navigation,
+                        .place_at_and_wait(
                             crate::minecraft::world_state::BlockPosition { x, y, z },
                             block_id,
                         )
@@ -661,15 +645,6 @@ impl App {
                         .await
                 }
                 ConsoleCommand::InteractionStatus => self.print_interaction_status().await,
-                ConsoleCommand::CollectItem(_) => {
-                    println!("This command is no longer available; use AI capabilities instead.");
-                }
-                ConsoleCommand::CollectItemStatus => {
-                    println!("This command is no longer available; use AI capabilities instead.");
-                }
-                ConsoleCommand::CollectItemStop => {
-                    println!("This command is no longer available; use AI capabilities instead.");
-                }
                 ConsoleCommand::Craft { target, count } => self.craft_item(target, count).await,
                 ConsoleCommand::Equip { item } => self.equip_item(item).await,
                 ConsoleCommand::CraftStatus => {
@@ -737,15 +712,6 @@ impl App {
                     );
                 }
                 ConsoleCommand::CloseContainer => self.container.close(&self.minecraft).await,
-                ConsoleCommand::CollectFood { .. } => {
-                    println!("This command is no longer available; use AI capabilities instead.");
-                }
-                ConsoleCommand::CollectFoodStatus => {
-                    println!("This command is no longer available; use AI capabilities instead.");
-                }
-                ConsoleCommand::CollectFoodStop => {
-                    println!("This command is no longer available; use AI capabilities instead.");
-                }
                 ConsoleCommand::EnsureTool { block_id } => {
                     println!(
                         "Ensure-tool planning is available, but no live crafting adapter is wired for {block_id}."
@@ -762,15 +728,6 @@ impl App {
                     {
                         logging::warning(format!("Oak-log test failed: {error}"));
                     }
-                }
-                ConsoleCommand::ChopTree { .. } => {
-                    println!("This command is no longer available; use AI capabilities instead.");
-                }
-                ConsoleCommand::ChopTreeStatus => {
-                    println!("This command is no longer available; use AI capabilities instead.");
-                }
-                ConsoleCommand::ChopTreeStop => {
-                    println!("This command is no longer available; use AI capabilities instead.");
                 }
                 ConsoleCommand::Reconnect => {
                     let _ = self.movement.stop(&self.minecraft).await;
@@ -793,107 +750,42 @@ impl App {
         Ok(false)
     }
 
-    /// Walks to `destination`, escalating through movement strategies in
-    /// order of cost/risk when the previous one fails: (1) a plain walk/jump
-    /// path -- Azalea's own pathfinder, unmodified; (2) the same pathfinder
-    /// with mining enabled, so obstructing blocks are broken automatically
-    /// (real, tested upstream Azalea capability); (3) terrain construction
-    /// (staircasing, bridging, pillaring, or digging) to prepare ground
-    /// Azalea can't cross on its own, then retrying with mining enabled.
-    /// Bounded so a route that genuinely cannot be completed still fails
-    /// instead of looping forever.
-    async fn goto_with_terrain_assist(
-        &self,
-        destination: crate::minecraft::world_state::PositionSnapshot,
-    ) -> Result<(), AppError> {
-        const MAX_ATTEMPTS: u32 = 8;
-        let target = crate::minecraft::world_state::BlockPosition {
-            x: destination.x.round() as i32,
-            y: destination.y.round() as i32,
-            z: destination.z.round() as i32,
-        };
-        let mut last_error = None;
-        let mut tried_mining = false;
-        for attempt in 0..MAX_ATTEMPTS {
-            let mode = if tried_mining {
-                NavigationMode::AllowMining
-            } else {
-                NavigationMode::MovementOnly
-            };
-            match self
-                .tasks
-                .goto_position(&self.minecraft, &self.movement, destination, mode)
-                .await
-            {
-                Ok(()) => return Ok(()),
-                Err(error) => {
-                    last_error = Some(error);
-                    if !tried_mining {
-                        // Retry immediately with mining enabled before
-                        // reaching for terrain construction -- cheap and
-                        // already fully implemented by Azalea.
-                        tried_mining = true;
-                        continue;
-                    }
-                    if !self.config.vertical_navigation.enabled || attempt + 1 == MAX_ATTEMPTS {
-                        break;
-                    }
-                    if self
-                        .vertical_construction
-                        .assist_toward(
-                            &self.minecraft,
-                            &self.movement,
-                            &self.look,
-                            &self.interaction,
-                            &self.block_navigation,
-                            &self.config.vertical_navigation,
-                            target,
-                        )
-                        .await
-                        .is_err()
-                    {
-                        break;
-                    }
-                }
+    /// Human-readable description of whatever `/stop` is about to cancel, or
+    /// `None` if there's genuinely nothing active -- read *before* cancelling
+    /// so the message reflects what was actually running rather than always
+    /// claiming success. `/goto`/`/goto-mine`/`/goto-block` await their
+    /// `*_and_wait` helper directly, which blocks the console loop until they
+    /// finish, so `/stop` can never race one of those; this mainly covers
+    /// `/follow` (which returns immediately after submitting its goal) and
+    /// an in-progress `/goto-block` search.
+    async fn active_stop_description(&self) -> Option<String> {
+        let movement = self.movement.snapshot().await;
+        match movement.status {
+            MovementStatus::FollowingPlayer => {
+                return Some(match movement.target_player {
+                    Some(player) => format!("following {player}"),
+                    None => "following a player".to_owned(),
+                });
             }
+            MovementStatus::MovingToPosition => return Some("moving to position".to_owned()),
+            _ => {}
         }
-        Err(last_error.unwrap_or(AppError::PathfindingFailure("unknown reason".into())))
-    }
 
-    /// Best-effort: prepare terrain toward a followed player once before
-    /// starting the continuous follow, so following onto a tower, across a
-    /// gap, or into a pit does not immediately stall on the first repath.
-    /// Mid-follow terrain changes (the player climbing further while already
-    /// being followed) are not handled -- see the limitation in the final
-    /// report.
-    async fn close_initial_gap_to_player(&self, player: &str) {
-        if !self.config.vertical_navigation.enabled {
-            return;
+        let block_navigation = self.block_navigation.snapshot().await;
+        if matches!(
+            block_navigation.state,
+            BlockNavigationState::Searching
+                | BlockNavigationState::SelectingTarget
+                | BlockNavigationState::Moving
+                | BlockNavigationState::Repathing
+        ) {
+            return Some(match block_navigation.requested_block_id {
+                Some(block_id) => format!("navigating to {block_id}"),
+                None => "block navigation".to_owned(),
+            });
         }
-        let world = self.minecraft.world_state_snapshot().await;
-        let Some(target) = world
-            .find_player_by_name(player)
-            .and_then(|player| player.position)
-        else {
-            return;
-        };
-        let target = crate::minecraft::world_state::BlockPosition {
-            x: target.x.round() as i32,
-            y: target.y.round() as i32,
-            z: target.z.round() as i32,
-        };
-        let _ = self
-            .vertical_construction
-            .assist_toward(
-                &self.minecraft,
-                &self.movement,
-                &self.look,
-                &self.interaction,
-                &self.block_navigation,
-                &self.config.vertical_navigation,
-                target,
-            )
-            .await;
+
+        None
     }
 
     async fn print_container_status(&self) {
@@ -959,9 +851,8 @@ impl App {
             self.config.block_search.maximum_result_limit,
             self.config.block_search.default_vertical_range,
         );
-        match self
-            .tasks
-            .find_block(&self.minecraft, &block_search, query.clone())
+        match block_search
+            .search_nearby(&self.minecraft, query.clone())
             .await
         {
             Ok(results) if nearest_only => {
@@ -1359,39 +1250,65 @@ impl App {
         }
     }
 
-    async fn start_ai(&mut self, request: String) {
-        if !self.config.ai.chat.accept_console_ai_command {
-            println!("[AI] Console AI requests are disabled by configuration.");
+    /// Lets a player run a real console command directly from Minecraft chat
+    /// by prefixing it with `#` -- e.g. typing `#goto 100 64 20` in chat runs
+    /// exactly what typing `/goto 100 64 20` in the local console would.
+    /// `/quit` is hard-blocked regardless of access config: shutting the
+    /// whole bot down from a stray chat message should never be possible.
+    async fn handle_chat_console_command(
+        &mut self,
+        sender: Option<String>,
+        sender_uuid: Option<uuid::Uuid>,
+        command_text: &str,
+    ) {
+        let command_text = command_text.trim();
+        if command_text.is_empty() {
             return;
         }
-        self.submit_ai_request(crate::ai::AiRequest {
-            text: request,
-            requester: None,
-            source: crate::ai::AiRequestSource::Console,
-        })
-        .await;
-    }
-    fn can_accept_ai_request(&self) -> Result<(), &'static str> {
-        match self.config.ai.busy_behavior {
-            crate::config::AiBusyBehavior::Reject => {
-                if self.ai_session.as_ref().is_some_and(AiSession::is_active) {
-                    Err("busy")
-                } else {
-                    Ok(())
-                }
+        let Some(name) = sender else {
+            return;
+        };
+        if !self.chat_access_allowed(&name) {
+            logging::warning(format!(
+                "[Chat] Command from {name} rejected: access denied"
+            ));
+            return;
+        }
+        if !self.consume_chat_rate_limit(&name, sender_uuid) {
+            logging::warning(format!("[Chat] Command from {name} rejected: rate limited"));
+            return;
+        }
+        let input_line = format!("/{command_text}");
+        let input = match console::commands::parse_input(&input_line) {
+            Ok(input) => input,
+            Err(error) => {
+                logging::warning(format!(
+                    "[Chat] Invalid command from {name} ({input_line}): {error}"
+                ));
+                return;
             }
+        };
+        if matches!(input, ConsoleInput::Command(ConsoleCommand::Quit)) {
+            logging::warning(format!(
+                "[Chat] {name} tried to run /quit from chat; ignored"
+            ));
+            return;
+        }
+        logging::info(format!("[Chat] {name} ran: {input_line}"));
+        if let Err(error) = self.execute_console_input(input).await {
+            logging::warning(format!("[Chat] Command error: {error}"));
         }
     }
 
-    fn chat_access_allowed(&self, requester: &crate::ai::AiRequester) -> bool {
-        let access = &self.config.ai.chat.access;
+    fn chat_access_allowed(&self, player_name: &str) -> bool {
+        let access = &self.config.chat_commands.access;
         // Azalea does not expose a stable operator permission signal here.
         // Do not guess: operators_only rejects until a trusted adapter exists.
         if access.operators_only
             || access
                 .blocked_players
                 .iter()
-                .any(|name| name.eq_ignore_ascii_case(&requester.name))
+                .any(|name| name.eq_ignore_ascii_case(player_name))
         {
             return false;
         }
@@ -1399,17 +1316,19 @@ impl App {
             || access
                 .allowed_players
                 .iter()
-                .any(|name| name.eq_ignore_ascii_case(&requester.name))
+                .any(|name| name.eq_ignore_ascii_case(player_name))
     }
 
-    fn consume_chat_rate_limit(&mut self, requester: &crate::ai::AiRequester) -> bool {
-        let limit = &self.config.ai.chat.rate_limit;
+    fn consume_chat_rate_limit(
+        &mut self,
+        player_name: &str,
+        player_uuid: Option<uuid::Uuid>,
+    ) -> bool {
+        let limit = &self.config.chat_commands.rate_limit;
         if !limit.enabled {
             return true;
         }
-        let key = requester
-            .uuid
-            .map_or_else(|| requester.name.to_ascii_lowercase(), |id| id.to_string());
+        let key = player_uuid.map_or_else(|| player_name.to_ascii_lowercase(), |id| id.to_string());
         let now = Instant::now();
         let entries = self.chat_rate_limits.entry(key).or_default();
         while entries
@@ -1425,1709 +1344,17 @@ impl App {
         true
     }
 
-    async fn send_ai_chat_response(&self, message: &str) {
-        if !self.config.ai.chat.respond_in_chat {
-            return;
-        }
-        let message = message.trim().trim_start_matches('/').trim();
-        if message.is_empty() {
-            return;
-        }
-        let prefixed = if message.starts_with("[AI]") {
-            message.to_owned()
-        } else {
-            format!("[AI] {message}")
-        };
-        for chunk in ai_chat_chunks(&prefixed, crate::minecraft::client::MAX_CHAT_MESSAGE_LENGTH) {
-            if let Err(error) = self.minecraft.send_chat(&chunk).await {
-                logging::warning(format!(
-                    "[AI] Chat response could not be delivered: {error}"
-                ));
-                break;
-            }
-        }
-    }
-
-    /// Format current inventory as a structured summary for AI consumption.
-    async fn inventory_summary(&self) -> InventorySummary {
-        let world = self.minecraft.world_state_snapshot().await;
-        let mut slots = Vec::new();
-        for slot in &world.inventory.slots {
-            if let Some(ref id) = slot.item_id {
-                let display_name = slot.display_name.as_deref().unwrap_or(id).to_owned();
-                slots.push(InventoryItemSummary {
-                    item_id: id.clone(),
-                    display_name,
-                    count: slot.count,
-                    slot: slot.slot as u16,
-                });
-            }
-        }
-        let total_slots: usize = 41; // 36 inventory + 5 armor/offhand
-        let empty_slots = total_slots.saturating_sub(slots.len());
-        InventorySummary {
-            slots,
-            empty_slots,
-            selected_hotbar_slot: world.inventory.selected_hotbar_slot.unwrap_or(0),
-        }
-    }
-
-    /// Execute a read-only tool call (knowledge query or state query).
-    /// Returns a JSON-serializable value to feed back to the AI.
-    /// `session` is passed explicitly rather than read from `self.ai_session`
-    /// because the only caller (`run_ai_turn`) holds the session as a local
-    /// variable for the whole turn (`self.ai_session.take()` at the top) --
-    /// `self.ai_session` is `None` for the entire duration this can be
-    /// called, which previously made `get_active_action` permanently report
-    /// "no active action" regardless of real state.
-    async fn execute_readonly_tool(
-        &self,
-        tool_name: &str,
-        arguments: &serde_json::Value,
-        session: &AiSession,
-    ) -> serde_json::Value {
-        match tool_name {
-            "query_inventory" => {
-                let summary = self.inventory_summary().await;
-                serde_json::to_value(&summary)
-                    .unwrap_or(serde_json::json!({"error": "inventory unavailable"}))
-            }
-            "get_bot_position" | "get_bot_health" => {
-                let world = self.minecraft.world_state_snapshot().await;
-                let pos = world.bot.position.unwrap_or_default();
-                serde_json::json!({
-                    "position": { "x": pos.x, "y": pos.y, "z": pos.z },
-                    "health": world.bot.health,
-                    "dimension": world.bot.dimension,
-                    "alive": world.bot.alive,
-                })
-            }
-            "get_food_level" => {
-                let world = self.minecraft.world_state_snapshot().await;
-                serde_json::json!({
-                    "food": world.bot.food_level,
-                    "saturation": world.bot.saturation,
-                })
-            }
-            "get_equipment" => {
-                let world = self.minecraft.world_state_snapshot().await;
-                let selected = world.inventory.selected_item().map(|item| {
-                    serde_json::json!({
-                        "item_id": item.item_id,
-                        "count": item.count,
-                        "slot": item.slot,
-                    })
-                });
-                serde_json::json!({
-                    "selected_hotbar_slot": world.inventory.selected_hotbar_slot,
-                    "selected_item": selected,
-                })
-            }
-            "get_recipe" => {
-                let item = arguments
-                    .get("item")
-                    .and_then(serde_json::Value::as_str)
-                    .unwrap_or("");
-                let recipe = self.recipes.recipe(item);
-                match recipe {
-                    Ok(r) => {
-                        let ingredients: Vec<serde_json::Value> = match &r.layout {
-                            crate::crafting::RecipeLayout::Shaped { ingredients, .. }
-                            | crate::crafting::RecipeLayout::Shapeless { ingredients } => {
-                                ingredients
-                                    .iter()
-                                    .filter_map(|is| {
-                                        let name = match &is.ingredient {
-                                            crate::crafting::Ingredient::Empty => return None,
-                                            crate::crafting::Ingredient::Item(id) => id.clone(),
-                                            crate::crafting::Ingredient::Alternatives(alts) => {
-                                                alts.first()?.clone()
-                                            }
-                                            crate::crafting::Ingredient::Tag(t) => {
-                                                format!("#{}", t)
-                                            }
-                                            crate::crafting::Ingredient::Special(s) => s.clone(),
-                                        };
-                                        Some(serde_json::json!({"item": name, "count": is.count}))
-                                    })
-                                    .collect()
-                            }
-                        };
-                        let shape = match &r.layout {
-                            crate::crafting::RecipeLayout::Shaped { width, height, .. } => {
-                                serde_json::json!({"type": "shaped", "width": width, "height": height})
-                            }
-                            crate::crafting::RecipeLayout::Shapeless { .. } => {
-                                serde_json::json!({"type": "shapeless"})
-                            }
-                        };
-                        serde_json::json!({
-                            "item": r.output,
-                            "count": r.output_count,
-                            "ingredients": ingredients,
-                            "station": r.station,
-                            "shape": shape,
-                        })
-                    }
-                    Err(_) => serde_json::json!({"error": format!("No recipe found for {}", item)}),
-                }
-            }
-            "get_item_information" => {
-                let item = arguments
-                    .get("item")
-                    .and_then(serde_json::Value::as_str)
-                    .unwrap_or("");
-                let recipe = self.recipes.recipe(item);
-                match recipe {
-                    Ok(r) => serde_json::json!({
-                        "item": r.output,
-                        "display_name": r.output,
-                        "stack_size": 64,
-                        "craftable": true,
-                        "station": r.station,
-                    }),
-                    Err(_) => serde_json::json!({
-                        "item": item,
-                        "display_name": item,
-                        "stack_size": 64,
-                        "craftable": false,
-                    }),
-                }
-            }
-            "get_block_information" => {
-                let block = arguments
-                    .get("block")
-                    .and_then(serde_json::Value::as_str)
-                    .unwrap_or("");
-                let (hardness, tool) = match block {
-                    b if b.contains("stone") || b.contains("cobblestone") => (1.5, "pickaxe"),
-                    b if b.contains("iron_ore") => (3.0, "stone_pickaxe"),
-                    b if b.contains("diamond_ore") => (3.0, "iron_pickaxe"),
-                    b if b.contains("obsidian") => (50.0, "diamond_pickaxe"),
-                    b if b.contains("log") || b.contains("wood") || b.contains("oak") => {
-                        (2.0, "axe")
-                    }
-                    b if b.contains("dirt")
-                        || b.contains("grass")
-                        || b.contains("sand")
-                        || b.contains("gravel") =>
-                    {
-                        (0.5, "shovel")
-                    }
-                    _ => (1.0, "hand"),
-                };
-                serde_json::json!({
-                    "block": block,
-                    "hardness": hardness,
-                    "required_tool": tool,
-                })
-            }
-            "get_available_capabilities" => {
-                let exec_names: Vec<&str> = ai::registry::command_registry()
-                    .iter()
-                    .filter(|c| c.enabled)
-                    .map(|c| c.name)
-                    .collect();
-                let readonly_names = ai::readonly_tool_names();
-                serde_json::json!({
-                    "read_only_capabilities": readonly_names,
-                    "executable_capabilities": exec_names,
-                })
-            }
-            "get_active_action" => {
-                let movement = self.movement.snapshot().await;
-                let follow = (movement.status
-                    == crate::minecraft::world_state::MovementStatus::FollowingPlayer)
-                    .then(|| {
-                        serde_json::json!({
-                            "following": movement.target_player,
-                            "status": format!("{:?}", movement.status),
-                        })
-                    });
-                if let Some(active) = &session.active_action {
-                    serde_json::json!({
-                        "active": true,
-                        "action": format!("{:?}", active.action),
-                        "status": format!("{:?}", active.status),
-                        "elapsed_seconds": active.started_at.elapsed().as_secs_f64(),
-                        "background_follow": follow,
-                    })
-                } else {
-                    serde_json::json!({
-                        "active": false,
-                        "session_status": format!("{:?}", session.status),
-                        "background_follow": follow,
-                    })
-                }
-            }
-            "get_nearby_entities" => {
-                let radius = arguments
-                    .get("radius")
-                    .and_then(serde_json::Value::as_u64)
-                    .unwrap_or(32) as f64;
-                let world = self.minecraft.world_state_snapshot().await;
-                let in_range: Vec<_> = world
-                    .entities
-                    .iter()
-                    .filter(|e| {
-                        let dx = e.position.x - world.bot.position.unwrap_or_default().x;
-                        let dz = e.position.z - world.bot.position.unwrap_or_default().z;
-                        (dx * dx + dz * dz).sqrt() <= radius
-                    })
-                    .collect();
-                const MAX_REPORTED: usize = 20;
-                let nearby: Vec<serde_json::Value> = in_range
-                    .iter()
-                    .take(MAX_REPORTED)
-                    .map(|e| {
-                        serde_json::json!({
-                            "id": e.entity_id,
-                            "kind": e.entity_type,
-                            "position": { "x": e.position.x, "y": e.position.y, "z": e.position.z },
-                        })
-                    })
-                    .collect();
-                serde_json::json!({
-                    "entities": nearby,
-                    "count": nearby.len(),
-                    "total_in_range": in_range.len(),
-                    "truncated": in_range.len() > MAX_REPORTED,
-                })
-            }
-            "get_block" => {
-                let x = arguments
-                    .get("x")
-                    .and_then(serde_json::Value::as_i64)
-                    .unwrap_or(0) as i32;
-                let y = arguments
-                    .get("y")
-                    .and_then(serde_json::Value::as_i64)
-                    .unwrap_or(0) as i32;
-                let z = arguments
-                    .get("z")
-                    .and_then(serde_json::Value::as_i64)
-                    .unwrap_or(0) as i32;
-                match self.minecraft.block_id_at(BlockPosition { x, y, z }).await {
-                    // `None` here means the chunk isn't loaded/tracked, not
-                    // that the block is air -- air is a real, present block
-                    // state (`minecraft:air`) that `block_id_at` reports
-                    // like any other when the chunk *is* loaded.
-                    Ok(Some(block_id)) => serde_json::json!({
-                        "position": { "x": x, "y": y, "z": z },
-                        "block_id": block_id,
-                    }),
-                    Ok(None) => serde_json::json!({
-                        "position": { "x": x, "y": y, "z": z },
-                        "error": "chunk not loaded at this position",
-                    }),
-                    Err(e) => serde_json::json!({
-                        "position": { "x": x, "y": y, "z": z },
-                        "error": format!("block data unavailable: {e}"),
-                    }),
-                }
-            }
-            "find_blocks" => {
-                let block_ids: Vec<String> = arguments
-                    .get("block_ids")
-                    .and_then(serde_json::Value::as_array)
-                    .map(|arr| {
-                        arr.iter()
-                            .filter_map(serde_json::Value::as_str)
-                            .map(str::to_owned)
-                            .collect()
-                    })
-                    .unwrap_or_default();
-                let radius = arguments
-                    .get("radius")
-                    .and_then(serde_json::Value::as_u64)
-                    .unwrap_or(32) as u32;
-                let max_results = arguments
-                    .get("maximum_results")
-                    .and_then(serde_json::Value::as_u64)
-                    .unwrap_or(16) as usize;
-                if block_ids.is_empty() {
-                    return serde_json::json!({"blocks": [], "count": 0, "error": "No block IDs specified"});
-                }
-                let mut all_results = Vec::new();
-                let mut errors = Vec::new();
-                let block_search = BlockSearchService::new(
-                    self.config.block_search.maximum_radius,
-                    self.config.block_search.maximum_result_limit,
-                    self.config.block_search.default_vertical_range,
-                );
-                for block_id in &block_ids {
-                    // Without normalizing (lowercase, add "minecraft:" if
-                    // missing -- same as every other block-id path in this
-                    // codebase), a bare id like "oak_log" fails to parse
-                    // downstream and previously vanished into an ignored
-                    // `Err`, indistinguishable from "genuinely nothing here".
-                    let normalized = match crate::blocks::block_query::normalize_block_id(block_id)
-                    {
-                        Ok(id) => id,
-                        Err(e) => {
-                            errors.push(format!("{block_id}: {e}"));
-                            continue;
-                        }
-                    };
-                    let query = BlockSearchQuery {
-                        block_id: normalized,
-                        radius,
-                        maximum_results: max_results,
-                        vertical_range: self.config.block_search.default_vertical_range,
-                    };
-                    match self
-                        .tasks
-                        .find_block(&self.minecraft, &block_search, query)
-                        .await
-                    {
-                        Ok(found) => all_results.extend(found),
-                        Err(e) => errors.push(format!("{block_id}: {e}")),
-                    }
-                }
-                all_results.sort_by(|a, b| {
-                    a.distance
-                        .partial_cmp(&b.distance)
-                        .unwrap_or(std::cmp::Ordering::Equal)
-                });
-                all_results.truncate(max_results);
-                let blocks: Vec<serde_json::Value> = all_results
-                    .iter()
-                    .map(|b| {
-                        serde_json::json!({
-                            "position": { "x": b.position.x, "y": b.position.y, "z": b.position.z },
-                            "block_id": b.block_id,
-                            "distance": b.distance,
-                        })
-                    })
-                    .collect();
-                let mut response = serde_json::json!({"blocks": blocks, "count": blocks.len()});
-                if !errors.is_empty() {
-                    response["errors"] = serde_json::json!(errors);
-                }
-                response
-            }
-            _ => serde_json::json!({"error": format!("Unknown read-only tool: {}", tool_name)}),
-        }
-    }
-
-    /// Entry point for a brand-new user request (console/chat). Starts a
-    /// fresh session and hands off to `run_ai_turn`, which is also the
-    /// resumption point after every action completes -- see
-    /// `complete_ai_action` for why that re-entrancy is required at all.
-    async fn submit_ai_request(&mut self, incoming: crate::ai::AiRequest) {
-        if !ai::active_provider_enabled(&self.config) {
-            println!(
-                "[AI] Selected provider ({:?}) is disabled in its config section.",
-                self.config.ai.provider
-            );
-            return;
-        }
-
-        let has_active_session = self.ai_session.as_ref().is_some_and(AiSession::is_active);
-        let text_lower = incoming.text.to_ascii_lowercase();
-        let is_conversation_or_query = !has_active_session
-            || text_lower.starts_with("what")
-            || text_lower.starts_with("how")
-            || text_lower.starts_with("do you")
-            || text_lower.starts_with("are you")
-            || text_lower.contains("inventory")
-            || text_lower.contains("health")
-            || text_lower.contains("position")
-            || text_lower.contains("status")
-            || text_lower.contains("doing")
-            || text_lower.contains("nearby");
-
-        if has_active_session && !is_conversation_or_query {
-            println!("[AI] Another AI task is already active.");
-            if incoming.source == crate::ai::AiRequestSource::MinecraftChat {
-                let reply =
-                    "I am already completing another task. Please ask for status or say stop.";
-                self.send_ai_chat_response(reply).await;
-            }
-            return;
-        }
-
-        let mut session = AiSession::new(
-            incoming.text.clone(),
-            self.config.groq.limits.max_actions_per_session,
-        );
-        if let Some(requester) = incoming.requester.as_ref() {
-            session.requester = Some(requester.name.clone());
-        }
-        self.ai_session = Some(session);
-        self.run_ai_turn(None).await;
-    }
-
-    /// Advances `self.ai_session` by one or more provider round-trips until
-    /// either an executable action is dispatched (returning control to the
-    /// tick loop, which resumes this function via `complete_ai_action` once
-    /// the action's real-world result is known) or the session reaches a
-    /// terminal state. `previous_result` is a human-readable summary of the
-    /// action that just completed, fed back to the model as context.
-    async fn run_ai_turn(&mut self, previous_result: Option<String>) {
-        let Some(mut session) = self.ai_session.take() else {
-            return;
-        };
-
-        let provider = match ai::build_provider(&self.config) {
-            Ok(p) => p,
-            Err(e) => {
-                println!("[AI] Failed to create AI provider: {e}");
-                session.status = AiSessionStatus::Failed;
-                self.ai_session = Some(session);
-                self.finalize_ai_task().await;
-                self.ai_request_in_flight = false;
-                return;
-            }
-        };
-        logging::info("[AI] Request received");
-        self.ai_request_in_flight = true;
-
-        let request = session.original_request.clone();
-        let requester = session
-            .requester
-            .clone()
-            .map(|name| crate::ai::AiRequester {
-                name,
-                uuid: None,
-                source: crate::ai::AiRequestSource::Internal,
-            });
-        let binding_request = crate::ai::AiRequest {
-            text: request.clone(),
-            requester: requester.clone(),
-            source: crate::ai::AiRequestSource::Internal,
-        };
-
-        let mut messages: Vec<ChatMessage> = Vec::new();
-        // Readonly tool round-trips do not advance `session.current_step`, so
-        // they need their own bound to keep a model that only ever calls
-        // read-only tools from looping forever.
-        let mut provider_calls: u32 = 0;
-        let max_provider_calls = (self.config.groq.limits.max_actions_per_session as u32 + 1) * 6;
-
-        loop {
-            if session.current_step >= self.config.groq.limits.max_actions_per_session
-                || session.current_step >= self.config.groq.max_request_retries as usize * 10
-            {
-                println!("[AI] Action limit reached.");
-                session.status = AiSessionStatus::Failed;
-                self.ai_session = Some(session);
-                self.finalize_ai_task().await;
-                self.ai_request_in_flight = false;
-                return;
-            }
-            provider_calls += 1;
-            if provider_calls > max_provider_calls {
-                println!("[AI] Too many provider round-trips without a physical action.");
-                session.status = AiSessionStatus::Failed;
-                self.ai_session = Some(session);
-                self.finalize_ai_task().await;
-                self.ai_request_in_flight = false;
-                return;
-            }
-
-            let world = self.minecraft.world_state_snapshot().await;
-            let bot = world.bot.position.unwrap_or_default();
-
-            let requester_info = requester.as_ref().map(|r| {
-                format!("The trusted requester is player {}. Words such as me, my, and I refer to this player.", r.name)
-            }).unwrap_or_default();
-
-            let context = format!(
-                "User request: {}\n{}\nBot position: {:.1} {:.1} {:.1}\nHealth: {:?}\nHunger: {:?}\nInventory items: {}\nNearby players: {}\nPrevious action result: {}\nStep: {}/{}{}",
-                request,
-                requester_info,
-                bot.x,
-                bot.y,
-                bot.z,
-                world.bot.health,
-                world.bot.food_level,
-                world.inventory.total_counts.len(),
-                world
-                    .players
-                    .iter()
-                    .take(8)
-                    .map(|p| p.username.as_str())
-                    .collect::<Vec<_>>()
-                    .join(", "),
-                previous_result.as_deref().unwrap_or("none"),
-                session.current_step + 1,
-                self.config.groq.limits.max_actions_per_session,
-                "",
-            );
-
-            messages.push(ChatMessage::user(context));
-
-            let ai_request = AiProviderRequest {
-                messages: messages.clone(),
-                tools: ai::generate_all_tool_definitions(),
-                system_prompt: Some(ai::build_system_prompt()),
-            };
-
-            match provider.chat(ai_request).await {
-                Ok(response) => {
-                    if response.finish_reason == "tool_calls" && !response.tool_calls.is_empty() {
-                        messages.push(ChatMessage::assistant_tool_calls(
-                            response.tool_calls.clone(),
-                        ));
-                    } else {
-                        messages.push(ChatMessage::assistant_text(response.message.clone()));
-                    }
-
-                    if response.finish_reason == "tool_calls" && !response.tool_calls.is_empty() {
-                        for tc in &response.tool_calls {
-                            if ai::is_readonly_tool(&tc.name) {
-                                println!("[AI] > {}", format_tool_call(&tc.name, &tc.arguments));
-                                let result = self
-                                    .execute_readonly_tool(&tc.name, &tc.arguments, &session)
-                                    .await;
-                                let result_str =
-                                    serde_json::to_string(&result).unwrap_or_else(|_| "{}".into());
-                                messages.push(ChatMessage::tool_result(tc.id.clone(), result_str));
-                                continue;
-                            }
-
-                            match ai::tool_call_to_action(&tc.name, &tc.arguments) {
-                                Ok(mut action) => {
-                                    println!(
-                                        "[AI] > {}",
-                                        format_tool_call(&tc.name, &tc.arguments)
-                                    );
-                                    ai::bind_requester_intent(&mut action, &binding_request);
-                                    let should_respond = !response.message.is_empty()
-                                        && !session.responded_to_player
-                                        && matches!(action, AiAction::Finish { .. });
-                                    if should_respond {
-                                        session.responded_to_player = true;
-                                    }
-                                    self.ai_session = Some(session);
-                                    if should_respond {
-                                        self.send_ai_chat_response(&response.message).await;
-                                    }
-                                    self.ai_request_in_flight = false;
-                                    self.execute_ai_action(action).await;
-                                    return;
-                                }
-                                Err(e) => {
-                                    let error_json = serde_json::json!({
-                                        "success": false,
-                                        "error": format!("Tool call error: {e}")
-                                    });
-                                    let result_str = serde_json::to_string(&error_json)
-                                        .unwrap_or_else(|_| r#"{"success":false}"#.into());
-                                    messages
-                                        .push(ChatMessage::tool_result(tc.id.clone(), result_str));
-                                    logging::warning(format!("[AI] {e}"));
-                                }
-                            }
-                        }
-                        continue;
-                    } else {
-                        if !response.message.is_empty() && !session.responded_to_player {
-                            session.responded_to_player = true;
-                            println!("[AI] {}", response.message);
-                            self.send_ai_chat_response(&response.message).await;
-                        }
-                        session.status = AiSessionStatus::Completed;
-                        logging::info("[AI] Session completed");
-                        self.ai_session = Some(session);
-                        self.finalize_ai_task().await;
-                        self.ai_request_in_flight = false;
-                        return;
-                    }
-                }
-                Err(e) => match &e {
-                    AiProviderError::RateLimited(info) => {
-                        let retry_after = info.retry_after.unwrap_or(Duration::from_secs(30)).min(
-                            Duration::from_secs(
-                                self.config.groq.rate_limits.maximum_retry_delay_seconds,
-                            ),
-                        );
-                        let model = info
-                            .model
-                            .clone()
-                            .unwrap_or_else(|| self.config.groq.model.clone());
-                        let retry_at = Instant::now() + retry_after;
-                        println!(
-                            "[AI] Provider rate limited. Retrying at {:?} with model '{}'",
-                            retry_at, model
-                        );
-                        session.status = AiSessionStatus::WaitingForProvider {
-                            retry_at,
-                            model: model.clone(),
-                        };
-                        self.ai_session = Some(session);
-                        self.ai_request_in_flight = false;
-                        logging::warning(format!(
-                            "[AI] Provider rate limited, retrying in {:?}",
-                            retry_after
-                        ));
-                        return;
-                    }
-                    AiProviderError::UnknownModel(m) => {
-                        println!("[AI] Unknown model: {m}");
-                        session.status = AiSessionStatus::Failed;
-                        self.ai_session = Some(session);
-                        self.finalize_ai_task().await;
-                        self.ai_request_in_flight = false;
-                        return;
-                    }
-                    AiProviderError::Permission(msg)
-                    | AiProviderError::AuthenticationError(msg) => {
-                        println!("[AI] Permission/Auth error: {msg}");
-                        session.status = AiSessionStatus::Failed;
-                        self.ai_session = Some(session);
-                        self.finalize_ai_task().await;
-                        self.ai_request_in_flight = false;
-                        return;
-                    }
-                    _ => {
-                        println!("[AI] Provider error: {e}");
-                        session.status = AiSessionStatus::Failed;
-                        self.ai_session = Some(session);
-                        self.finalize_ai_task().await;
-                        self.ai_request_in_flight = false;
-                        return;
-                    }
-                },
-            }
-        }
-    }
-
-    async fn tick_ai_chat(&mut self) {
-        if !self.config.ai.chat.enabled {
-            return;
-        }
+    /// Drains incoming player chat and dispatches `#`-prefixed messages to
+    /// `handle_chat_console_command`. Everything else is ignored.
+    async fn tick_chat_commands(&mut self) {
         while let Some(chat) = self.minecraft.pop_incoming_player_chat().await {
-            if chat.kind != crate::minecraft::world_state::ChatMessageKind::Player
-                || (self.config.ai.chat.require_prefix
-                    && !chat.text.starts_with(&self.config.ai.chat.prefix))
-            {
+            if chat.kind != crate::minecraft::world_state::ChatMessageKind::Player {
                 continue;
             }
-            let Some(name) = chat.sender else {
-                continue;
-            };
-            let requester = crate::ai::AiRequester {
-                name,
-                uuid: chat.sender_uuid,
-                source: crate::ai::AiRequestSource::MinecraftChat,
-            };
-            let request = match crate::ai::chat_request(
-                &chat.text,
-                requester,
-                &self.config.ai.chat.prefix,
-                self.config.ai.chat.require_prefix,
-                self.config.ai.chat.strip_prefix_whitespace,
-                self.config.ai.chat.max_request_length,
-            ) {
-                Ok(request) => request,
-                Err(error) => {
-                    logging::warning(format!("[AI] Chat request rejected: {error}"));
-                    continue;
-                }
-            };
-            if matches!(
-                request.text.to_ascii_lowercase().as_str(),
-                "stop" | "cancel"
-            ) {
-                self.cancel_ai().await;
-                self.send_ai_chat_response("Current task cancelled.").await;
-                continue;
-            }
-            if !self.chat_access_allowed(
-                request
-                    .requester
-                    .as_ref()
-                    .expect("chat request has requester"),
-            ) {
-                logging::warning("[AI] Request rejected: access denied");
-                self.send_ai_chat_response("You are not allowed to use this bot.")
+            if let Some(command_text) = chat.text.strip_prefix('#') {
+                self.handle_chat_console_command(chat.sender, chat.sender_uuid, command_text)
                     .await;
-                continue;
             }
-            let text_lower = request.text.to_ascii_lowercase();
-            let is_state_or_conversation = text_lower.starts_with("what")
-                || text_lower.starts_with("how")
-                || text_lower.starts_with("do you")
-                || text_lower.starts_with("are you")
-                || text_lower.contains("inventory")
-                || text_lower.contains("health")
-                || text_lower.contains("position")
-                || text_lower.contains("status")
-                || text_lower.contains("doing")
-                || text_lower.contains("nearby")
-                || text_lower.contains("hi")
-                || text_lower.contains("hello")
-                || text_lower.contains("hey");
-
-            if self.can_accept_ai_request().is_err() && !is_state_or_conversation {
-                logging::warning("[AI] Request rejected: bot busy");
-                let reply = if let Some(s) = self.ai_session.as_ref() {
-                    "I am already completing another task. Tell me to stop first, or ask what I'm doing.".to_owned()
-                } else {
-                    "I am already completing another task.".into()
-                };
-                self.send_ai_chat_response(&reply).await;
-                continue;
-            }
-            if !self.consume_chat_rate_limit(
-                request
-                    .requester
-                    .as_ref()
-                    .expect("chat request has requester"),
-            ) {
-                logging::warning("[AI] Request rejected: rate limited");
-                self.send_ai_chat_response("You are sending requests too quickly.")
-                    .await;
-                continue;
-            }
-            logging::info("[AI] Chat request received");
-            if self.config.ai.chat.acknowledge_requests {
-                self.send_ai_chat_response("Request received.").await;
-            }
-            self.submit_ai_request(request).await;
-        }
-    }
-
-    async fn enforce_ai_limits(&mut self) {
-        let timed_out = self.ai_session.as_ref().is_some_and(|session| {
-            session.is_active()
-                && session.started_at.elapsed()
-                    >= Duration::from_secs(self.config.groq.limits.max_session_seconds)
-        });
-        if timed_out {
-            if let Some(session) = self.ai_session.as_mut() {
-                session.active_action = None;
-                session.pending_action = None;
-                session.generation = session.generation.wrapping_add(1);
-                session.status = AiSessionStatus::TimedOut;
-            }
-            self.finalize_ai_task().await;
-            self.ai_request_in_flight = false;
-            logging::warning("[AI] Session timed out");
-            self.send_ai_chat_response("Session timed out.").await;
-        }
-    }
-
-    async fn tick_ai_provider(&mut self) {
-        if self.ai_request_in_flight {
-            return;
-        }
-        let Some(session) = self.ai_session.as_ref() else {
-            return;
-        };
-        if !session.is_waiting_for_provider() {
-            return;
-        }
-        let (should_retry, _model) = match &session.status {
-            AiSessionStatus::WaitingForProvider { retry_at, model } => {
-                (Instant::now() >= *retry_at, model.clone())
-            }
-            _ => (false, String::new()),
-        };
-        if !should_retry {
-            return;
-        }
-        let _ = session;
-        let Some(mut session) = self.ai_session.take() else {
-            return;
-        };
-        session.status = AiSessionStatus::Interpreting;
-        self.ai_session = Some(session);
-        // Resume the existing session directly rather than routing through
-        // `submit_ai_request`, which would build a brand-new session and
-        // discard this one's action history / step count / generation.
-        self.run_ai_turn(None).await;
-    }
-
-    /// Client-side reach check for entity actions. Azalea's `attack()`/
-    /// `entity_interact()` send their packets with no range or
-    /// line-of-sight validation of their own, so without this the bot
-    /// would report false success for targets the server silently rejects.
-    async fn entity_in_reach(&self, entity_id: i32) -> Result<(), String> {
-        let world = self.minecraft.world_state_snapshot().await;
-        let Some(entity) = world
-            .entities
-            .iter()
-            .find(|e| i64::from(e.entity_id) == i64::from(entity_id))
-        else {
-            return Err(format!(
-                "entity {entity_id} is not currently visible/tracked"
-            ));
-        };
-        let reach = self.config.interaction.maximum_reach;
-        if entity.distance > reach {
-            return Err(format!(
-                "entity {entity_id} is {:.1} blocks away, out of reach ({reach:.1})",
-                entity.distance
-            ));
-        }
-        Ok(())
-    }
-
-    /// Moves `count` items (0 = "as many as are there") from one player
-    /// inventory slot to another, honoring the exact count rather than
-    /// always moving the whole stack, and never silently swapping into a
-    /// slot that holds a different item.
-    ///
-    /// Vanilla's click protocol has no "move exactly N" operation -- only
-    /// whole-stack pickup/place (left-click) and place-one-at-a-time
-    /// (right-click). A partial move therefore has to: pick up the whole
-    /// source stack, right-click the destination `count` times, then
-    /// left-click the (now empty) source to return whatever remains held.
-    /// If the destination can't take everything placed at it (e.g. it hits
-    /// its own max stack size), the click can leave an item stuck on the
-    /// cursor rather than in any visible slot -- `carried_item`/recovery
-    /// below exists specifically to catch and undo that rather than losing
-    /// the item silently, which is the failure mode the old two-click
-    /// implementation had.
-    async fn move_inventory_item(
-        &mut self,
-        from_slot: u16,
-        to_slot: u16,
-        count: u16,
-    ) -> CapabilityResult {
-        use crate::container::model::{ClickButton, InventoryClick};
-
-        if from_slot == to_slot {
-            return CapabilityResult::failed(
-                CapabilityStatus::InvalidTarget,
-                "Source and destination slots are the same",
-            );
-        }
-
-        let before = self.minecraft.world_state_snapshot().await.inventory;
-        let from = from_slot as usize;
-        let to = to_slot as usize;
-
-        let Some(source) = before.slots.iter().find(|s| s.slot == from) else {
-            return CapabilityResult::failed(
-                CapabilityStatus::InvalidTarget,
-                format!("Source slot {from_slot} does not exist"),
-            );
-        };
-        let Some(source_item) = source.item_id.clone().filter(|_| source.count > 0) else {
-            return CapabilityResult::failed(
-                CapabilityStatus::MissingItem,
-                format!("Source slot {from_slot} is empty"),
-            );
-        };
-        let available = source.count;
-
-        let dest_before = before.slots.iter().find(|s| s.slot == to);
-        let Some(dest_before) = dest_before else {
-            return CapabilityResult::failed(
-                CapabilityStatus::InvalidTarget,
-                format!("Destination slot {to_slot} does not exist"),
-            );
-        };
-        if let Some(dest_item) = &dest_before.item_id
-            && *dest_item != source_item
-        {
-            return CapabilityResult::failed(
-                CapabilityStatus::InvalidTarget,
-                format!(
-                    "Destination slot {to_slot} already holds {dest_item}, not {source_item}; clear or pick a different slot first"
-                ),
-            );
-        }
-        let dest_before_count = dest_before.count;
-
-        let move_count = if count == 0 {
-            available
-        } else {
-            u32::from(count).min(available)
-        };
-
-        if let Err(e) = self
-            .minecraft
-            .container_click(
-                0,
-                InventoryClick {
-                    slot: from,
-                    button: ClickButton::Left,
-                },
-            )
-            .await
-        {
-            return CapabilityResult::failed(
-                CapabilityStatus::Failed,
-                format!("Could not pick up item from slot {from_slot}: {e}"),
-            );
-        }
-
-        let place_result = if move_count >= available {
-            self.minecraft
-                .container_click(
-                    0,
-                    InventoryClick {
-                        slot: to,
-                        button: ClickButton::Left,
-                    },
-                )
-                .await
-        } else {
-            let mut result = Ok(());
-            for _ in 0..move_count {
-                result = self
-                    .minecraft
-                    .container_click(
-                        0,
-                        InventoryClick {
-                            slot: to,
-                            button: ClickButton::Right,
-                        },
-                    )
-                    .await;
-                if result.is_err() {
-                    break;
-                }
-            }
-            result
-        };
-        if let Err(e) = place_result {
-            self.recover_carried_item(from).await;
-            return CapabilityResult::failed(
-                CapabilityStatus::Failed,
-                format!("Could not place item into slot {to_slot}: {e}"),
-            );
-        }
-
-        // Return any leftover (partial move, or destination couldn't take
-        // everything) to the source rather than leaving it on the cursor.
-        self.recover_carried_item(from).await;
-
-        let after = self.minecraft.world_state_snapshot().await.inventory;
-        let dest_after_count = after
-            .slots
-            .iter()
-            .find(|s| s.slot == to)
-            .map_or(0, |s| s.count);
-        let actually_moved = dest_after_count.saturating_sub(dest_before_count);
-
-        if actually_moved == 0 {
-            return CapabilityResult::failed(
-                CapabilityStatus::Failed,
-                format!("Move had no effect; slot {to_slot} is unchanged"),
-            );
-        }
-        if actually_moved < move_count {
-            return CapabilityResult::completed(
-                format!(
-                    "Moved only {actually_moved} of the requested {move_count} {source_item} (destination likely hit its stack limit)"
-                ),
-                serde_json::json!({"from_slot": from_slot, "to_slot": to_slot, "requested": move_count, "moved": actually_moved}),
-            );
-        }
-        CapabilityResult::completed(
-            format!(
-                "Moved {actually_moved} of {source_item} from slot {from_slot} to slot {to_slot}"
-            ),
-            serde_json::json!({"from_slot": from_slot, "to_slot": to_slot, "moved": actually_moved}),
-        )
-    }
-
-    /// If a click sequence left an item stuck on the cursor, click the
-    /// given slot to return it there instead of leaving it invisible (which
-    /// also silently breaks later clicks/throws -- see `move_inventory_item`).
-    async fn recover_carried_item(&self, return_slot: usize) {
-        use crate::container::model::{ClickButton, InventoryClick};
-        if matches!(self.minecraft.carried_item().await, Ok(Some(_))) {
-            let _ = self
-                .minecraft
-                .container_click(
-                    0,
-                    InventoryClick {
-                        slot: return_slot,
-                        button: ClickButton::Left,
-                    },
-                )
-                .await;
-        }
-    }
-
-    async fn execute_ai_action(&mut self, action: AiAction) {
-        if self.physical_action_active {
-            println!("[AI] A physical action is already executing; rejecting new action.");
-            let result = CapabilityResult::failed(
-                CapabilityStatus::Failed,
-                "A physical action is already active. Wait for it to complete or use cancel_action.",
-            );
-            if let Some(session) = self.ai_session.as_mut() {
-                if let Some(id) = session.active_action.as_ref().map(|a| a.execution_id) {
-                    session.complete_action(
-                        id,
-                        crate::ai::AiActionStatus::Failed,
-                        serde_json::to_value(&result).unwrap_or_default(),
-                    );
-                }
-                self.finalize_ai_task().await;
-            }
-            return;
-        }
-
-        let Some(session) = self.ai_session.as_ref() else {
-            return;
-        };
-        if session.active_action.is_some() {
-            println!("[AI] A previous action is still running; next action was not started.");
-            return;
-        }
-        let current_step = session.current_step;
-        if current_step >= self.config.groq.limits.max_actions_per_session {
-            if let Some(session) = self.ai_session.as_mut() {
-                session.status = AiSessionStatus::Failed;
-            }
-            println!("[AI] Action limit reached.");
-            return;
-        }
-        let bot = self
-            .minecraft
-            .world_state_snapshot()
-            .await
-            .bot
-            .position
-            .unwrap_or_default();
-        if let Err(e) =
-            ai::validate_action(&action, &self.config.groq.limits, (bot.x, bot.y, bot.z))
-        {
-            println!("[AI] Rejected planner action: {e}");
-            let result = CapabilityResult::failed(CapabilityStatus::InvalidTarget, e);
-            if let Some(session) = self.ai_session.as_mut() {
-                if let Some(id) = session.active_action.as_ref().map(|a| a.execution_id) {
-                    session.complete_action(
-                        id,
-                        crate::ai::AiActionStatus::Failed,
-                        serde_json::to_value(&result).unwrap_or_default(),
-                    );
-                }
-                session.status = AiSessionStatus::Replanning;
-            }
-            return;
-        }
-        if let Some(session) = self.ai_session.as_mut() {
-            session.current_step += 1;
-            if let Err(error) = session.begin_action(action.clone()) {
-                println!("[AI] {error}");
-                return;
-            }
-        }
-        // `tick_ai_action_completion` re-derives the execution id from
-        // `session.active_action` once the result is known, so it is not
-        // threaded through the pending-action dispatch below.
-        logging::info(format!(
-            "[AI] Executing action {}: {:?}",
-            current_step + 1,
-            action
-        ));
-
-        // Every action, fast or slow, is considered "pending" until
-        // `tick_ai_action_completion` (driven by the interaction tick, every
-        // ~50ms) observes a terminal result and calls `complete_ai_action`.
-        // WalkTo/BreakBlock/PlaceBlock only *start* an azalea/interaction
-        // state machine here -- their real result is only known once that
-        // state machine reaches a terminal state on a later tick, so they
-        // report `PendingAction::Movement`/`Interaction` instead of a result
-        // computed at dispatch time. Every other action already completes
-        // synchronously by the time control returns here.
-        self.physical_action_active = true;
-
-        match action.clone() {
-            // --- Movement ---
-            AiAction::WalkTo { x, y, z } => {
-                let result = self
-                    .tasks
-                    .goto_position(
-                        &self.minecraft,
-                        &self.movement,
-                        crate::minecraft::world_state::PositionSnapshot { x, y, z },
-                        NavigationMode::MovementOnly,
-                    )
-                    .await;
-                self.pending_action = Some(match result {
-                    Ok(()) => PendingAction::Movement,
-                    Err(e) => PendingAction::Instant(CapabilityResult::failed(
-                        CapabilityStatus::Unreachable,
-                        format!("Could not reach position: {e}"),
-                    )),
-                });
-            }
-            AiAction::FollowEntity { player } => {
-                let result = self.movement.follow(&self.minecraft, &player).await;
-                let capability_result = match result {
-                    Ok(()) => CapabilityResult::completed(
-                        format!("Following {player}"),
-                        serde_json::json!({"following": player}),
-                    ),
-                    Err(e) => CapabilityResult::failed(
-                        CapabilityStatus::TargetNotFound,
-                        format!("Could not follow {player}: {e}"),
-                    ),
-                };
-                self.pending_action = Some(PendingAction::Instant(capability_result));
-            }
-            AiAction::LookAt { x, y, z } => {
-                let result = self
-                    .tasks
-                    .look_at(
-                        &self.minecraft,
-                        &self.look,
-                        LookTarget::World(crate::minecraft::world_state::PositionSnapshot {
-                            x,
-                            y,
-                            z,
-                        }),
-                    )
-                    .await;
-                self.pending_action = Some(match result {
-                    // `look_at` only submits the target and applies one
-                    // interpolation step; the turn isn't actually finished
-                    // yet (see `PendingAction::Look`).
-                    Ok(()) => PendingAction::Look,
-                    Err(e) => PendingAction::Instant(CapabilityResult::failed(
-                        CapabilityStatus::Failed,
-                        format!("Could not look at target: {e}"),
-                    )),
-                });
-            }
-            AiAction::StopMovement => {
-                let _ = self.movement.stop(&self.minecraft).await;
-                self.pending_action = Some(PendingAction::Instant(CapabilityResult::completed(
-                    "Movement stopped",
-                    serde_json::json!({}),
-                )));
-            }
-            // --- Block interaction ---
-            AiAction::BreakBlock { x, y, z } => {
-                let target = BlockPosition { x, y, z };
-                let result = self
-                    .tasks
-                    .break_block(
-                        &self.minecraft,
-                        &self.movement,
-                        &self.look,
-                        &self.interaction,
-                        &self.block_navigation,
-                        target,
-                    )
-                    .await;
-                self.pending_action = Some(match result {
-                    Ok(()) => PendingAction::Interaction,
-                    Err(e) => PendingAction::Instant(CapabilityResult::failed(
-                        CapabilityStatus::Unreachable,
-                        format!("Could not break block: {e}"),
-                    )),
-                });
-            }
-            AiAction::PlaceBlock { x, y, z, block_id } => {
-                let target = BlockPosition { x, y, z };
-                let result = self
-                    .tasks
-                    .place_block(
-                        &self.minecraft,
-                        &self.movement,
-                        &self.look,
-                        &self.interaction,
-                        &self.block_navigation,
-                        target,
-                        block_id.clone(),
-                    )
-                    .await;
-                self.pending_action = Some(match result {
-                    Ok(()) => PendingAction::Interaction,
-                    Err(e) => PendingAction::Instant(CapabilityResult::failed(
-                        CapabilityStatus::Failed,
-                        format!("Could not place block: {e}"),
-                    )),
-                });
-            }
-            AiAction::UseBlock { x, y, z } => {
-                // `interact_block` sends a raw, unchecked-by-azalea use
-                // packet (it can "click through walls" per its own doc
-                // comment) -- without this check the bot would report
-                // success for a block it can't actually reach, since the
-                // server silently drops/ignores an out-of-range interact.
-                let world = self.minecraft.world_state_snapshot().await;
-                let target = BlockPosition { x, y, z };
-                let capability_result = if !crate::interaction::reach::within_reach(
-                    world.bot.position,
-                    target,
-                    self.config.interaction.maximum_reach,
-                ) {
-                    CapabilityResult::failed(
-                        CapabilityStatus::OutOfRange,
-                        "Block is out of reach; walk closer first",
-                    )
-                } else {
-                    match self.minecraft.interact_block(target).await {
-                        Ok(()) => CapabilityResult::completed(
-                            "Block used",
-                            serde_json::json!({"block": {"x": x, "y": y, "z": z}}),
-                        ),
-                        Err(e) => CapabilityResult::failed(
-                            CapabilityStatus::Failed,
-                            format!("Could not use block: {e}"),
-                        ),
-                    }
-                };
-                self.pending_action = Some(PendingAction::Instant(capability_result));
-            }
-            // --- Inventory ---
-            AiAction::EquipItem { item_id } => {
-                let capability_result = match self.minecraft.select_item_in_hotbar(&item_id).await {
-                    Ok(true) => CapabilityResult::completed(
-                        format!("Equipped {item_id}"),
-                        serde_json::json!({"item_id": item_id}),
-                    ),
-                    Ok(false) => CapabilityResult::failed(
-                        CapabilityStatus::MissingItem,
-                        format!("{item_id} not found in hotbar"),
-                    ),
-                    Err(e) => CapabilityResult::failed(
-                        CapabilityStatus::Failed,
-                        format!("Failed to equip {item_id}: {e}"),
-                    ),
-                };
-                self.pending_action = Some(PendingAction::Instant(capability_result));
-            }
-            AiAction::MoveInventoryItem {
-                from_slot,
-                to_slot,
-                count,
-            } => {
-                let capability_result = self.move_inventory_item(from_slot, to_slot, count).await;
-                self.pending_action = Some(PendingAction::Instant(capability_result));
-            }
-            AiAction::DropItem { item_id, count } => {
-                let world = self.minecraft.world_state_snapshot().await;
-                if let Some(nearest) = nearest_player(&world) {
-                    // Fire-and-forget: only submits the target. The actual
-                    // turn happens on later `look_tick`s, so the drop must
-                    // wait for it via `tick_ai_action_completion` rather
-                    // than blocking here.
-                    let _ = self
-                        .tasks
-                        .look_at(
-                            &self.minecraft,
-                            &self.look,
-                            LookTarget::Player(nearest.username.clone()),
-                        )
-                        .await;
-                    self.pending_action = Some(PendingAction::LookThenDrop { item_id, count });
-                } else {
-                    let capability_result =
-                        drop_item_result(self.minecraft.drop_item(&item_id, count).await, &item_id);
-                    self.pending_action = Some(PendingAction::Instant(capability_result));
-                }
-            }
-            AiAction::UseItem => {
-                let result = self.minecraft.use_item_at_look_target().await;
-                let capability_result = match result {
-                    Ok(()) => CapabilityResult::completed("Item used", serde_json::json!({})),
-                    Err(e) => CapabilityResult::failed(
-                        CapabilityStatus::Failed,
-                        format!("Could not use item: {e}"),
-                    ),
-                };
-                self.pending_action = Some(PendingAction::Instant(capability_result));
-            }
-            // --- Crafting ---
-            AiAction::CraftItem { item, quantity } => {
-                let world = self.minecraft.world_state_snapshot().await;
-                let plan = self
-                    .recipes
-                    .plan(&item, quantity, &world.inventory, false, 3);
-                // NOTE: crafting execution (actually clicking a crafting grid)
-                // is not implemented anywhere in this codebase yet -- only
-                // planning is. Report *why* accurately instead of always
-                // blaming a missing station, which sent the AI on pointless
-                // "walk to a table" loops even when materials were on hand.
-                let capability_result = match plan.failure {
-                    None => CapabilityResult::failed(
-                        CapabilityStatus::Failed,
-                        format!(
-                            "Materials for {item} are available, but crafting execution is not implemented yet. Do not retry craft_item for this item; tell the requester it cannot be crafted automatically right now."
-                        ),
-                    ),
-                    Some(crate::crafting::Failure::StationUnavailable(_)) => {
-                        CapabilityResult::failed(
-                            CapabilityStatus::MissingItem,
-                            format!(
-                                "Cannot craft {item}: requires a crafting table, and crafting execution is not implemented yet regardless."
-                            ),
-                        )
-                    }
-                    Some(failure) => CapabilityResult::failed(
-                        CapabilityStatus::MissingItem,
-                        format!("Cannot craft {item}: {failure:?}"),
-                    ),
-                };
-                self.pending_action = Some(PendingAction::Instant(capability_result));
-            }
-            // --- Containers ---
-            AiAction::OpenContainer { x, y, z } => {
-                let result = self
-                    .container
-                    .open(
-                        &self.minecraft,
-                        &self.movement,
-                        &self.block_navigation,
-                        BlockPosition { x, y, z },
-                    )
-                    .await;
-                // `open()` only submits (navigate/align/interact/await-menu
-                // is a multi-tick state machine driven by `ContainerService::tick`);
-                // the menu isn't actually open yet when this returns `Ok(())`.
-                self.pending_action = Some(match result {
-                    Ok(()) => PendingAction::Container,
-                    Err(e) => PendingAction::Instant(CapabilityResult::failed(
-                        CapabilityStatus::Failed,
-                        format!("Could not open container: {e}"),
-                    )),
-                });
-            }
-            AiAction::TakeItem { item, quantity } => {
-                let result = self
-                    .container
-                    .transfer(
-                        &self.minecraft,
-                        TransferDirection::Take,
-                        item.clone(),
-                        quantity,
-                    )
-                    .await;
-                // `transfer()` only queues clicks for `tick()` to drain
-                // (75ms apart); nothing has actually moved yet.
-                self.pending_action = Some(match result {
-                    Ok(()) => PendingAction::Container,
-                    Err(e) => PendingAction::Instant(CapabilityResult::failed(
-                        CapabilityStatus::MissingItem,
-                        format!("Could not take {item}: {e}"),
-                    )),
-                });
-            }
-            AiAction::StoreItem { item, quantity } => {
-                let result = self
-                    .container
-                    .transfer(
-                        &self.minecraft,
-                        TransferDirection::Store,
-                        item.clone(),
-                        quantity,
-                    )
-                    .await;
-                self.pending_action = Some(match result {
-                    Ok(()) => PendingAction::Container,
-                    Err(e) => PendingAction::Instant(CapabilityResult::failed(
-                        CapabilityStatus::MissingItem,
-                        format!("Could not store {item}: {e}"),
-                    )),
-                });
-            }
-            AiAction::CloseContainer => {
-                self.container.close(&self.minecraft).await;
-                self.pending_action = Some(PendingAction::Container);
-            }
-            // --- Entities / Combat ---
-            AiAction::AttackEntity { entity_id } => {
-                // Azalea's `attack()` performs no range/visibility check at
-                // all (its own doc comment: "might trigger anticheats") --
-                // without this, the bot would report a successful attack on
-                // an entity 30 blocks away that the server silently drops.
-                let capability_result = match self.entity_in_reach(entity_id).await {
-                    Ok(()) => match self.minecraft.attack_entity(entity_id).await {
-                        Ok(()) => CapabilityResult::completed(
-                            format!("Attacked entity {entity_id}"),
-                            serde_json::json!({"entity_id": entity_id}),
-                        ),
-                        Err(e) => CapabilityResult::failed(
-                            CapabilityStatus::InvalidTarget,
-                            format!("Could not attack entity: {e}"),
-                        ),
-                    },
-                    Err(reason) => CapabilityResult::failed(CapabilityStatus::OutOfRange, reason),
-                };
-                self.pending_action = Some(PendingAction::Instant(capability_result));
-            }
-            AiAction::InteractWithEntity { entity_id } => {
-                // Same missing-validation issue as AttackEntity: Azalea's
-                // `entity_interact()` doc comment warns it "can click
-                // through walls."
-                let capability_result = match self.entity_in_reach(entity_id).await {
-                    Ok(()) => match self.minecraft.interact_with_entity(entity_id).await {
-                        Ok(()) => CapabilityResult::completed(
-                            format!("Interacted with entity {entity_id}"),
-                            serde_json::json!({"entity_id": entity_id}),
-                        ),
-                        Err(e) => CapabilityResult::failed(
-                            CapabilityStatus::InvalidTarget,
-                            format!("Could not interact with entity: {e}"),
-                        ),
-                    },
-                    Err(reason) => CapabilityResult::failed(CapabilityStatus::OutOfRange, reason),
-                };
-                self.pending_action = Some(PendingAction::Instant(capability_result));
-            }
-            // --- Control ---
-            AiAction::Wait { milliseconds } => {
-                tokio::time::sleep(Duration::from_millis(milliseconds)).await;
-                self.pending_action = Some(PendingAction::Instant(CapabilityResult::completed(
-                    format!("Waited {milliseconds}ms"),
-                    serde_json::json!({"waited_ms": milliseconds}),
-                )));
-            }
-            AiAction::CancelAction => {
-                self.pending_action = Some(PendingAction::Instant(CapabilityResult::completed(
-                    "Action cancelled",
-                    serde_json::json!({}),
-                )));
-            }
-            AiAction::Finish { summary } => {
-                if let Some(s) = summary {
-                    println!("[AI] {s}");
-                }
-                self.pending_action = Some(PendingAction::Instant(CapabilityResult::completed(
-                    "Task finished",
-                    serde_json::json!({}),
-                )));
-            }
-            AiAction::GetStatus => {
-                self.print_status().await;
-                self.pending_action = Some(PendingAction::Instant(CapabilityResult::completed(
-                    "Status retrieved",
-                    serde_json::json!({}),
-                )));
-            }
-            AiAction::GetInventory => {
-                self.print_inventory().await;
-                self.pending_action = Some(PendingAction::Instant(CapabilityResult::completed(
-                    "Inventory retrieved",
-                    serde_json::json!({}),
-                )));
-            }
-        }
-    }
-    /// Records an action's real-world result on the session, decides the
-    /// session's next status, and -- if the session is still active -- feeds
-    /// the result back to the model by re-entering `run_ai_turn`. This is
-    /// the sole place that continues a multi-step AI plan; without it the
-    /// session would sit in `Replanning` forever after the first action
-    /// (see `PendingAction` / `execute_ai_action` for why completion is
-    /// detected here rather than inline in `execute_ai_action`, which would
-    /// require calling back into itself through `run_ai_turn` -- Rust does
-    /// not allow that recursive `async fn` cycle without heap-boxing it).
-    async fn complete_ai_action(
-        &mut self,
-        execution_id: Option<crate::ai::AiExecutionId>,
-        result: CapabilityResult,
-    ) {
-        self.physical_action_active = false;
-        self.pending_action = None;
-        let summary = summarize_capability_result(&result);
-        println!("[AI] < {summary}");
-        let result_json = serde_json::to_value(&result).unwrap_or_default();
-        let mut continue_session = false;
-        if let Some(session) = self.ai_session.as_mut() {
-            let completed_action = session.active_action.as_ref().map(|a| a.action.clone());
-            if let Some(id) = execution_id {
-                let status = if result.success {
-                    crate::ai::AiActionStatus::Succeeded
-                } else {
-                    crate::ai::AiActionStatus::Failed
-                };
-                session.complete_action(id, status, result_json);
-            }
-            session.status = match completed_action {
-                Some(AiAction::Finish { .. }) => AiSessionStatus::Completed,
-                Some(AiAction::CancelAction) => AiSessionStatus::Cancelled,
-                // `complete_action` already set this to `Replanning`.
-                _ => session.status.clone(),
-            };
-            continue_session = session.is_active();
-        }
-        self.ai_request_in_flight = false;
-        if !continue_session {
-            self.finalize_ai_task().await;
-            return;
-        }
-        self.run_ai_turn(Some(summary)).await;
-    }
-
-    /// Runs on the interaction tick cadence (~50ms). Checks whether the
-    /// currently pending action has reached a terminal, real-world result
-    /// yet, and if so hands it to `complete_ai_action`.
-    async fn tick_ai_action_completion(&mut self) {
-        if !self.physical_action_active {
-            return;
-        }
-        let Some(kind) = self.pending_action.clone() else {
-            self.physical_action_active = false;
-            return;
-        };
-        let Some(session) = self.ai_session.as_ref() else {
-            self.physical_action_active = false;
-            self.pending_action = None;
-            return;
-        };
-        let Some(active) = session.active_action.as_ref() else {
-            self.physical_action_active = false;
-            self.pending_action = None;
-            return;
-        };
-        let execution_id = active.execution_id;
-        let action = active.action.clone();
-        let started_at = active.started_at;
-
-        const MOVEMENT_TIMEOUT: Duration = Duration::from_secs(45);
-        const INTERACTION_TIMEOUT: Duration = Duration::from_secs(30);
-        const LOOK_TIMEOUT: Duration = Duration::from_millis(1200);
-        const CONTAINER_TIMEOUT: Duration = Duration::from_secs(8);
-
-        let result = match kind {
-            PendingAction::Instant(result) => Some(result),
-            PendingAction::Movement => {
-                let snapshot = self.movement.snapshot().await;
-                match snapshot.status {
-                    MovementStatus::Completed => Some(CapabilityResult::completed(
-                        "Reached the target position",
-                        walk_to_result_data(&action),
-                    )),
-                    MovementStatus::Failed | MovementStatus::Cancelled => {
-                        Some(CapabilityResult::failed(
-                            CapabilityStatus::Unreachable,
-                            snapshot
-                                .failure_reason
-                                .unwrap_or_else(|| "movement failed".into()),
-                        ))
-                    }
-                    _ if started_at.elapsed() > MOVEMENT_TIMEOUT => Some(CapabilityResult::failed(
-                        CapabilityStatus::TimedOut,
-                        "navigation timed out before reaching the target",
-                    )),
-                    _ => None,
-                }
-            }
-            PendingAction::Interaction => {
-                let snapshot = self.interaction.snapshot().await;
-                match snapshot.state {
-                    InteractionState::Completed => {
-                        let (message, data) = interaction_result_data(&action);
-                        Some(CapabilityResult::completed(message, data))
-                    }
-                    InteractionState::Failed | InteractionState::Cancelled => {
-                        Some(CapabilityResult::failed(
-                            CapabilityStatus::Failed,
-                            snapshot
-                                .failure_reason
-                                .unwrap_or_else(|| "interaction failed".into()),
-                        ))
-                    }
-                    _ if started_at.elapsed() > INTERACTION_TIMEOUT => {
-                        Some(CapabilityResult::failed(
-                            CapabilityStatus::TimedOut,
-                            "interaction timed out",
-                        ))
-                    }
-                    _ => None,
-                }
-            }
-            PendingAction::LookThenDrop { item_id, count } => {
-                let snapshot = self.look.snapshot().await;
-                let ready = matches!(
-                    snapshot.state,
-                    LookState::Completed | LookState::Failed | LookState::Cancelled
-                ) || started_at.elapsed() > LOOK_TIMEOUT;
-                if ready {
-                    let drop_result = self.minecraft.drop_item(&item_id, count).await;
-                    Some(drop_item_result(drop_result, &item_id))
-                } else {
-                    // Still turning; check again on the next tick.
-                    None
-                }
-            }
-            PendingAction::Look => {
-                let snapshot = self.look.snapshot().await;
-                match snapshot.state {
-                    LookState::Completed => Some(CapabilityResult::completed(
-                        "Looked at target",
-                        look_at_result_data(&action),
-                    )),
-                    LookState::Failed | LookState::Cancelled => Some(CapabilityResult::failed(
-                        CapabilityStatus::Failed,
-                        snapshot
-                            .failure_reason
-                            .unwrap_or_else(|| "look failed".into()),
-                    )),
-                    _ if started_at.elapsed() > LOOK_TIMEOUT => Some(CapabilityResult::failed(
-                        CapabilityStatus::TimedOut,
-                        "turning toward the target timed out",
-                    )),
-                    _ => None,
-                }
-            }
-            PendingAction::Container => {
-                let status = self.container.status().await;
-                use crate::container::model::ContainerPhase;
-                match status.phase {
-                    ContainerPhase::Open | ContainerPhase::Completed => {
-                        Some(container_result(&status, &action))
-                    }
-                    ContainerPhase::Failed | ContainerPhase::Cancelled => {
-                        Some(container_result(&status, &action))
-                    }
-                    _ if started_at.elapsed() > CONTAINER_TIMEOUT => {
-                        Some(CapabilityResult::failed(
-                            CapabilityStatus::TimedOut,
-                            "container action timed out",
-                        ))
-                    }
-                    _ => None,
-                }
-            }
-        };
-        let Some(result) = result else {
-            // Still in progress; check again on the next tick.
-            return;
-        };
-        self.complete_ai_action(Some(execution_id), result).await;
-    }
-    async fn cancel_ai(&mut self) {
-        if let Some(s) = self.ai_session.as_mut() {
-            s.cancel_active_action();
-        }
-        self.physical_action_active = false;
-        self.pending_action = None;
-        self.ai_request_in_flight = false;
-        self.finalize_ai_task().await;
-    }
-
-    /// Central cleanup for all AI task terminal states.
-    async fn finalize_ai_task(&mut self) {
-        self.physical_action_active = false;
-        self.pending_action = None;
-        self.interaction
-            .cancel(&self.minecraft, &self.movement, &self.look)
-            .await;
-        self.block_navigation
-            .cancel(&self.minecraft, &self.movement)
-            .await;
-        let _ = self.movement.stop(&self.minecraft).await;
-        self.tasks.cancel(&self.minecraft).await;
-    }
-
-    fn print_ai_status(&self) {
-        match &self.ai_session {
-            Some(s) => println!(
-                "AI session: {:?}\nRequester: {}\nObjective: {:?}\nStep: {}/{}\nElapsed: {} seconds",
-                s.status,
-                s.requester.as_deref().unwrap_or("unknown"),
-                s.objective,
-                s.current_step,
-                s.max_steps,
-                s.started_at.elapsed().as_secs()
-            ),
-            None => println!("No AI session is active."),
         }
     }
 
@@ -3300,301 +1527,208 @@ impl App {
         if let Some(reason) = movement.failure_reason {
             println!("Failure reason: {reason}");
         }
-        let vertical = self.vertical_construction.status();
-        if vertical.state
-            != crate::navigation::vertical_construction::VerticalConstructionState::Idle
-        {
-            println!(
-                "Vertical construction: {:?}{}{}",
-                vertical.state,
-                vertical
-                    .last_action
-                    .map_or_else(String::new, |a| format!(" (last: {a})")),
-                vertical
-                    .failure_reason
-                    .map_or_else(String::new, |r| format!(" ({r})")),
-            );
-        }
     }
 
-    async fn print_task_status(&self) {
-        let workflow = self.tasks.status().await;
-        let movement = self.movement.snapshot().await;
-        let movement_text = match movement.status {
-            crate::minecraft::world_state::MovementStatus::FollowingPlayer => format!(
-                "Following {}",
-                movement.target_player.as_deref().unwrap_or("unknown")
-            ),
-            crate::minecraft::world_state::MovementStatus::MovingToPosition => {
-                movement.destination.map_or_else(
-                    || "Navigating".to_owned(),
-                    |position| {
-                        format!(
-                            "Navigating to {:.0} {:.0} {:.0}",
-                            position.x, position.y, position.z
-                        )
-                    },
-                )
-            }
-            crate::minecraft::world_state::MovementStatus::Completed => "Completed".to_owned(),
-            crate::minecraft::world_state::MovementStatus::Cancelled => "Cancelled".to_owned(),
-            crate::minecraft::world_state::MovementStatus::Failed => "Failed".to_owned(),
-            crate::minecraft::world_state::MovementStatus::Idle => "Idle".to_owned(),
-        };
-        let look = self.look.snapshot().await;
-        let look_text = match look.state {
-            LookState::Looking => {
-                format!("Tracking {}", look.target.as_deref().unwrap_or("target"))
-            }
-            LookState::Completed => {
-                format!("Looking at {}", look.target.as_deref().unwrap_or("target"))
-            }
-            LookState::Idle | LookState::Cancelled | LookState::Failed => "Idle".to_owned(),
-        };
-        println!("Movement: {movement_text}");
-        println!("Look: {look_text}");
-        println!(
-            "Workflow: #{} {} ({:?})",
-            workflow.metadata.id, workflow.metadata.task_type, workflow.state
-        );
-        if !workflow.progress.phase.is_empty() {
-            println!(
-                "Progress: {} {}/{}",
-                workflow.progress.phase,
-                workflow.progress.completed_units,
-                workflow
-                    .progress
-                    .total_units
-                    .map_or_else(|| "?".into(), |n| n.to_string())
-            );
+    // ---- Direct service calls with completion polling ----------------------
+    //
+    // Each of these calls the owning service directly (no task queue, no
+    // resource leasing, no task IDs -- "the bot does it directly"), waits for
+    // it to reach a terminal state via the `await_*_terminal` pollers above,
+    // and shows a lightweight name in `/status`'s "Current task" line for the
+    // duration (purely a display aid; nothing reads it back programmatically).
+
+    async fn goto_and_wait(
+        &self,
+        name: &str,
+        destination: crate::minecraft::world_state::PositionSnapshot,
+        mode: NavigationMode,
+    ) -> Result<(), AppError> {
+        self.minecraft.set_current_task(task_snapshot(name)).await;
+        let result = async {
+            self.movement
+                .goto(&self.minecraft, destination, mode)
+                .await?;
+            await_movement_terminal(&self.movement, &self.minecraft).await
         }
-        println!(
-            "Active tasks: {}; recent tasks: {}",
-            self.tasks.active().len(),
-            self.tasks.recent().len()
-        );
+        .await;
+        self.minecraft.clear_current_task().await;
+        result
     }
 
-    fn print_task_by_id(&self, id: TaskId) {
-        match self.tasks.query(id) {
-            Some(task) => {
-                println!("Task #{} {}: {:?}", id, task.metadata.task_type, task.state);
-                println!(
-                    "Source: {}; correlation: {}",
-                    task.metadata.source_command, task.metadata.correlation_id
-                );
-                println!(
-                    "Progress: {} {}/{}",
-                    task.progress.phase,
-                    task.progress.completed_units,
-                    task.progress
-                        .total_units
-                        .map_or_else(|| "?".into(), |n| n.to_string())
-                );
-                if let Some(failure) = task.failure {
-                    println!(
-                        "Failure: {:?}: {} (partial {})",
-                        failure.category, failure.message, failure.partial_completed
-                    );
-                }
-            }
-            None => println!("Unknown task #{id}."),
+    async fn goto_block_and_wait(
+        &self,
+        block_id: String,
+        radius: u32,
+        mode: NavigationMode,
+    ) -> Result<(), AppError> {
+        self.minecraft
+            .set_current_task(task_snapshot(format!("Go to {block_id}")))
+            .await;
+        let result = async {
+            self.block_navigation
+                .start(&self.minecraft, &self.movement, block_id, radius, mode)
+                .await?;
+            await_block_navigation_terminal(&self.block_navigation, &self.minecraft, &self.movement)
+                .await
         }
+        .await;
+        self.minecraft.clear_current_task().await;
+        result
     }
 
-    fn print_recent_tasks(&self) {
-        let recent = self.tasks.recent();
-        if recent.is_empty() {
-            println!("No recently completed tasks.");
-            return;
+    async fn look_and_wait(&self, name: &str, target: LookTarget) -> Result<(), AppError> {
+        self.minecraft.set_current_task(task_snapshot(name)).await;
+        let result = async {
+            self.look.look_at(&self.minecraft, target).await?;
+            await_look_terminal(&self.look, &self.minecraft).await
         }
-        for task in recent {
-            println!(
-                "#{} {} {:?} {}/{}",
-                task.metadata.id,
-                task.metadata.task_type,
-                task.state,
-                task.progress.completed_units,
-                task.progress
-                    .total_units
-                    .map_or_else(|| "?".into(), |n| n.to_string())
-            );
+        .await;
+        self.minecraft.clear_current_task().await;
+        result
+    }
+
+    async fn look_block_and_wait(&self, block_id: String) -> Result<(), AppError> {
+        self.minecraft
+            .set_current_task(task_snapshot(format!("Look at {block_id}")))
+            .await;
+        let result = async {
+            self.look
+                .look_at_block_id(&self.minecraft, block_id)
+                .await?;
+            await_look_terminal(&self.look, &self.minecraft).await
         }
+        .await;
+        self.minecraft.clear_current_task().await;
+        result
+    }
+
+    async fn break_looked_and_wait(&self) -> Result<(), AppError> {
+        self.minecraft
+            .set_current_task(task_snapshot("Break looked block"))
+            .await;
+        let result = async {
+            self.interaction
+                .break_looked(&self.minecraft, &self.movement, &self.look)
+                .await?;
+            await_interaction_terminal(
+                &self.interaction,
+                &self.minecraft,
+                &self.movement,
+                &self.block_navigation,
+                &self.look,
+            )
+            .await
+        }
+        .await;
+        self.minecraft.clear_current_task().await;
+        result
+    }
+
+    async fn break_at_and_wait(
+        &self,
+        target: crate::minecraft::world_state::BlockPosition,
+    ) -> Result<(), AppError> {
+        self.minecraft
+            .set_current_task(task_snapshot("Break block"))
+            .await;
+        let result = async {
+            self.interaction
+                .break_at(&self.minecraft, &self.movement, &self.look, target)
+                .await?;
+            await_interaction_terminal(
+                &self.interaction,
+                &self.minecraft,
+                &self.movement,
+                &self.block_navigation,
+                &self.look,
+            )
+            .await
+        }
+        .await;
+        self.minecraft.clear_current_task().await;
+        result
+    }
+
+    async fn break_nearest_and_wait(&self, block_id: String) -> Result<(), AppError> {
+        self.minecraft
+            .set_current_task(task_snapshot(format!("Break nearest {block_id}")))
+            .await;
+        let result = async {
+            self.interaction
+                .break_nearest(&self.minecraft, &self.movement, &self.look, block_id)
+                .await?;
+            await_interaction_terminal(
+                &self.interaction,
+                &self.minecraft,
+                &self.movement,
+                &self.block_navigation,
+                &self.look,
+            )
+            .await
+        }
+        .await;
+        self.minecraft.clear_current_task().await;
+        result
+    }
+
+    async fn place_looked_and_wait(&self, item: String) -> Result<(), AppError> {
+        self.minecraft
+            .set_current_task(task_snapshot(format!("Place {item}")))
+            .await;
+        let result = async {
+            self.interaction
+                .place_looked(&self.minecraft, &self.movement, &self.look, item)
+                .await?;
+            await_interaction_terminal(
+                &self.interaction,
+                &self.minecraft,
+                &self.movement,
+                &self.block_navigation,
+                &self.look,
+            )
+            .await
+        }
+        .await;
+        self.minecraft.clear_current_task().await;
+        result
+    }
+
+    async fn place_at_and_wait(
+        &self,
+        target: crate::minecraft::world_state::BlockPosition,
+        item: String,
+    ) -> Result<(), AppError> {
+        self.minecraft
+            .set_current_task(task_snapshot(format!("Place {item}")))
+            .await;
+        let result = async {
+            self.interaction
+                .place_at(&self.minecraft, &self.movement, &self.look, target, item)
+                .await?;
+            await_interaction_terminal(
+                &self.interaction,
+                &self.minecraft,
+                &self.movement,
+                &self.block_navigation,
+                &self.look,
+            )
+            .await
+        }
+        .await;
+        self.minecraft.clear_current_task().await;
+        result
+    }
+}
+
+fn task_snapshot(name: impl Into<String>) -> TaskSnapshot {
+    TaskSnapshot {
+        name: name.into(),
+        started_at: SystemTime::now(),
     }
 }
 
 fn fmt_opt<T: std::fmt::Display>(value: Option<T>) -> String {
     value.map_or_else(|| "unknown".into(), |v| v.to_string())
-}
-
-/// Builds the AI-facing result for a `drop_item` call from the raw client
-/// result, shared by the immediate (no nearby player) and deferred
-/// (look-then-drop) dispatch paths.
-fn drop_item_result(result: Result<u16, AppError>, item_id: &str) -> CapabilityResult {
-    match result {
-        Ok(dropped) => CapabilityResult::completed(
-            format!("Dropped {dropped} of {item_id}"),
-            serde_json::json!({"item_id": item_id, "count": dropped}),
-        ),
-        Err(e) => CapabilityResult::failed(
-            CapabilityStatus::MissingItem,
-            format!("Could not drop {item_id}: {e}"),
-        ),
-    }
-}
-
-/// Closest tracked player with a known distance, if any -- used to face the
-/// bot toward someone before an interaction like dropping an item.
-fn nearest_player(world: &WorldStateSnapshot) -> Option<&PlayerSnapshot> {
-    world
-        .players
-        .iter()
-        .filter(|p| p.distance.is_some())
-        .min_by(|a, b| a.distance.unwrap().total_cmp(&b.distance.unwrap()))
-}
-
-/// Renders a model tool call as `name(arg=value, ...)` for the console, so
-/// every command the AI decides to run -- read-only lookups and physical
-/// actions alike -- is visible as it happens, not just in verbose logs.
-fn format_tool_call(name: &str, arguments: &serde_json::Value) -> String {
-    let args = arguments
-        .as_object()
-        .filter(|obj| !obj.is_empty())
-        .map(|obj| {
-            obj.iter()
-                .map(|(k, v)| format!("{k}={v}"))
-                .collect::<Vec<_>>()
-                .join(", ")
-        })
-        .unwrap_or_default();
-    format!("{name}({args})")
-}
-
-/// Human-readable text fed back to the model as "Previous action result"
-/// once a dispatched action reaches a terminal, real-world outcome.
-fn summarize_capability_result(result: &CapabilityResult) -> String {
-    if result.success {
-        result.message.clone()
-    } else {
-        format!("FAILED ({:?}): {}", result.status, result.message)
-    }
-}
-
-/// Rebuilds `walk_to`'s result payload from the stored action once real
-/// movement completion is observed on a later tick (see `PendingAction`).
-fn walk_to_result_data(action: &AiAction) -> serde_json::Value {
-    match action {
-        AiAction::WalkTo { x, y, z } => serde_json::json!({"position": {"x": x, "y": y, "z": z}}),
-        _ => serde_json::json!({}),
-    }
-}
-
-/// Rebuilds `look_at`'s result payload from the stored action once the real
-/// turn completes (see `PendingAction::Look`).
-fn look_at_result_data(action: &AiAction) -> serde_json::Value {
-    match action {
-        AiAction::LookAt { x, y, z } => serde_json::json!({"target": {"x": x, "y": y, "z": z}}),
-        _ => serde_json::json!({}),
-    }
-}
-
-/// Builds the AI-facing result for a container action (open/take/store)
-/// once `ContainerService`'s state machine reaches a terminal phase, using
-/// the server-confirmed `status.transferred` amount rather than the
-/// originally requested quantity -- a partial transfer (e.g. destination
-/// ran out of space) must not be reported as if the full amount moved.
-fn container_result(
-    status: &crate::container::model::ContainerStatus,
-    action: &AiAction,
-) -> CapabilityResult {
-    use crate::container::model::{ContainerOutcome, ContainerPhase};
-    let failed = |message: String| CapabilityResult::failed(CapabilityStatus::Failed, message);
-    match action {
-        AiAction::OpenContainer { x, y, z } => match status.phase {
-            ContainerPhase::Open => CapabilityResult::completed(
-                "Container opened",
-                serde_json::json!({"container": {"x": x, "y": y, "z": z}}),
-            ),
-            _ => failed(format!(
-                "Could not open container: {}",
-                status
-                    .detail
-                    .clone()
-                    .or_else(|| status.outcome.as_ref().map(|o| format!("{o:?}")))
-                    .unwrap_or_else(|| "unknown failure".into())
-            )),
-        },
-        AiAction::TakeItem { item, .. } | AiAction::StoreItem { item, .. } => {
-            let verb = if matches!(action, AiAction::TakeItem { .. }) {
-                "Took"
-            } else {
-                "Stored"
-            };
-            match status.outcome {
-                Some(ContainerOutcome::TransferCompleted) => CapabilityResult::completed(
-                    format!("{verb} {} of {item}", status.transferred),
-                    serde_json::json!({"item": item, "requested": status.requested, "transferred": status.transferred}),
-                ),
-                Some(ContainerOutcome::TransferPartial) => CapabilityResult::completed(
-                    format!(
-                        "{verb} only {} of the requested {} {item} (destination or source limited it)",
-                        status.transferred, status.requested
-                    ),
-                    serde_json::json!({"item": item, "requested": status.requested, "transferred": status.transferred, "partial": true}),
-                ),
-                _ => failed(format!(
-                    "Could not transfer {item}: {}",
-                    status
-                        .detail
-                        .clone()
-                        .or_else(|| status.outcome.as_ref().map(|o| format!("{o:?}")))
-                        .unwrap_or_else(|| "unknown failure".into())
-                )),
-            }
-        }
-        AiAction::CloseContainer => match status.phase {
-            ContainerPhase::Completed | ContainerPhase::Idle => {
-                CapabilityResult::completed("Container closed", serde_json::json!({}))
-            }
-            _ => failed("Could not close container".into()),
-        },
-        _ => failed("unexpected action for container completion".into()),
-    }
-}
-
-/// Rebuilds `break_block`/`place_block`'s success message and result
-/// payload from the stored action once real interaction completion is
-/// observed on a later tick (see `PendingAction`).
-fn interaction_result_data(action: &AiAction) -> (String, serde_json::Value) {
-    match action {
-        AiAction::BreakBlock { x, y, z } => (
-            "Block broken".into(),
-            serde_json::json!({"block": {"x": x, "y": y, "z": z}}),
-        ),
-        AiAction::PlaceBlock { x, y, z, block_id } => (
-            format!("Placed {block_id}"),
-            serde_json::json!({"block": {"x": x, "y": y, "z": z, "block_id": block_id}}),
-        ),
-        _ => ("Interaction completed".into(), serde_json::json!({})),
-    }
-}
-
-fn ai_chat_chunks(message: &str, maximum: usize) -> Vec<String> {
-    if maximum == 0 {
-        return Vec::new();
-    }
-    let mut chunks = Vec::new();
-    let mut chunk = String::new();
-    for character in message.chars() {
-        if chunk.chars().count() == maximum {
-            chunks.push(std::mem::take(&mut chunk));
-        }
-        chunk.push(character);
-    }
-    if !chunk.is_empty() {
-        chunks.push(chunk);
-    }
-    chunks
 }
 
 fn print_help() {
@@ -3609,8 +1743,6 @@ fn print_help() {
     println!("  /health                    Show health and food level");
     println!("  /inventory                 Show inventory contents");
     println!("  /movement                  Show movement status");
-    println!("  /task                      Show task status, or /task status <id>");
-    println!("  /tasks                     Show all task status");
     println!();
     println!("World");
     println!("  /break <x> <y> <z>         Break a block and wait until it is broken");
@@ -3621,17 +1753,15 @@ fn print_help() {
     println!("  /equip <item>              Equip an item to the active hotbar slot");
     println!("  /craft <item> [count]      Craft an item using the player crafting grid");
     println!();
-    println!("AI");
-    println!("  /ai <message>              Send a request to the configured AI provider");
-    println!();
     println!("Other");
     println!("  /help                      Show this message");
     println!("  /status                    Show full connection/application status");
     println!("  /chat <text>               Send text to Minecraft chat");
-    println!("  /aicancel | /aistatus      Cancel or inspect the active AI session");
-    println!("  /task cancel <id|all>      Cancel a task");
     println!("  /reconnect                 Reconnect to the configured server");
     println!("  /quit                      Shut down the application");
+    println!(
+        "  A player can also run any command from Minecraft chat by prefixing it with #, e.g. \"#goto 100 64 20\"."
+    );
     println!(
         "  Additional lower-level debug commands (findblock, gotoblock, lookblock, breaknearest, placeblock, ...) remain available; see src/console/commands.rs for the complete set."
     );
@@ -3641,31 +1771,17 @@ async fn await_console_task(task: JoinHandle<()>) {
     let _ = task.await;
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::blocks::block_snapshot::BlockSnapshot;
-
-    fn log(x: i32, y: i32, z: i32) -> BlockSnapshot {
-        BlockSnapshot {
-            position: BlockPosition { x, y, z },
-            block_id: "minecraft:oak_log".into(),
-            distance: 0.0,
-            dimension: Some("minecraft:overworld".into()),
-            chunk_loaded: true,
-        }
-    }
-
-    #[test]
-    fn long_ai_chat_message_is_split_on_utf8_boundaries() {
-        let message = format!("[AI] {} 😀", "x".repeat(300));
-        let chunks = ai_chat_chunks(&message, 64);
-        assert!(chunks.iter().all(|chunk| chunk.chars().count() <= 64));
-        assert_eq!(chunks.concat().replace(' ', ""), message.replace(' ', ""));
-    }
-
-    #[test]
-    fn empty_ai_chat_message_has_no_chunks() {
-        assert!(ai_chat_chunks("", 256).is_empty());
-    }
+/// Waits for SIGTERM on Unix (what `docker stop` / Pterodactyl-Pelican eggs
+/// send by default to stop a container) so the same graceful-shutdown path
+/// used for Ctrl+C also runs there. On non-Unix platforms this simply never
+/// resolves, leaving Ctrl+C as the only shutdown signal.
+#[cfg(unix)]
+async fn wait_for_terminate_signal() -> std::io::Result<()> {
+    let mut sigterm = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
+    sigterm.recv().await;
+    Ok(())
+}
+#[cfg(not(unix))]
+async fn wait_for_terminate_signal() -> std::io::Result<()> {
+    std::future::pending().await
 }

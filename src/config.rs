@@ -47,71 +47,24 @@ pub struct Config {
     #[serde(default)]
     pub ensure_tool: EnsureToolConfig,
     #[serde(default)]
-    pub gemini: GeminiConfig,
-    #[serde(default)]
-    pub groq: GroqConfig,
-    #[serde(default)]
-    pub ollama: OllamaConfig,
-    #[serde(default)]
-    pub ai: AiConfig,
+    pub chat_commands: ChatCommandsConfig,
 }
 
+/// Access control and rate limiting for the `#`-prefixed direct console
+/// command feature in Minecraft chat (see `App::handle_chat_console_command`).
+/// Typing `#goto 100 64 20` in chat runs exactly what `/goto 100 64 20`
+/// would in the local console -- a strictly more powerful (and more directly
+/// abusable) surface than anything else reachable from chat, so it is never
+/// less guarded than this section allows.
 #[derive(Clone, Debug, Deserialize)]
-pub struct AiConfig {
-    /// Which backend answers AI requests. `[groq]`/`[ollama]` below are
-    /// only consulted for whichever one is selected here.
+pub struct ChatCommandsConfig {
     #[serde(default)]
-    pub provider: AiProviderKind,
+    pub access: ChatCommandsAccessConfig,
     #[serde(default)]
-    pub chat: AiChatConfig,
-    #[serde(default)]
-    pub busy_behavior: AiBusyBehavior,
-}
-#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq)]
-#[serde(rename_all = "snake_case")]
-pub enum AiProviderKind {
-    #[default]
-    Groq,
-    Ollama,
-}
-#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq)]
-#[serde(rename_all = "snake_case")]
-pub enum AiBusyBehavior {
-    #[default]
-    Reject,
-}
-#[derive(Clone, Debug, Deserialize)]
-pub struct AiChatConfig {
-    #[serde(default = "default_true")]
-    pub enabled: bool,
-    #[serde(default = "default_ai_prefix")]
-    pub prefix: String,
-    /// When false, every player chat message is treated as an AI request
-    /// instead of only ones starting with `prefix`. `access`/`rate_limit`
-    /// still apply, but this makes ambient chat between other players
-    /// trigger the bot too -- there is no way to tell "talking to the bot"
-    /// from "talking near the bot" without a prefix.
-    #[serde(default = "default_true")]
-    pub require_prefix: bool,
-    #[serde(default = "default_true")]
-    pub respond_in_chat: bool,
-    #[serde(default = "default_true")]
-    pub acknowledge_requests: bool,
-    #[serde(default = "default_true")]
-    pub accept_console_ai_command: bool,
-    #[serde(default = "default_true")]
-    pub strip_prefix_whitespace: bool,
-    #[serde(default = "default_ai_request_length")]
-    pub max_request_length: usize,
-    #[serde(default = "default_incoming_queue_capacity")]
-    pub incoming_queue_capacity: usize,
-    #[serde(default)]
-    pub access: AiChatAccessConfig,
-    #[serde(default)]
-    pub rate_limit: AiChatRateLimitConfig,
+    pub rate_limit: ChatCommandsRateLimitConfig,
 }
 #[derive(Clone, Debug, Default, Deserialize)]
-pub struct AiChatAccessConfig {
+pub struct ChatCommandsAccessConfig {
     #[serde(default)]
     pub operators_only: bool,
     #[serde(default)]
@@ -120,15 +73,15 @@ pub struct AiChatAccessConfig {
     pub blocked_players: Vec<String>,
 }
 #[derive(Clone, Debug, Deserialize)]
-pub struct AiChatRateLimitConfig {
+pub struct ChatCommandsRateLimitConfig {
     #[serde(default = "default_true")]
     pub enabled: bool,
-    #[serde(default = "default_rate_limit_requests")]
+    #[serde(default = "default_chat_command_rate_limit_requests")]
     pub requests: usize,
-    #[serde(default = "default_rate_limit_window")]
+    #[serde(default = "default_chat_command_rate_limit_window")]
     pub window_seconds: u64,
 }
-impl Default for AiChatRateLimitConfig {
+impl Default for ChatCommandsRateLimitConfig {
     fn default() -> Self {
         Self {
             enabled: true,
@@ -137,480 +90,17 @@ impl Default for AiChatRateLimitConfig {
         }
     }
 }
-fn default_ai_prefix() -> String {
-    "!".into()
-}
-fn default_ai_request_length() -> usize {
-    500
-}
-fn default_incoming_queue_capacity() -> usize {
-    64
-}
-fn default_rate_limit_requests() -> usize {
+fn default_chat_command_rate_limit_requests() -> usize {
     3
 }
-fn default_rate_limit_window() -> u64 {
+fn default_chat_command_rate_limit_window() -> u64 {
     30
 }
-impl Default for AiConfig {
+impl Default for ChatCommandsConfig {
     fn default() -> Self {
         Self {
-            provider: AiProviderKind::default(),
-            chat: AiChatConfig::default(),
-            busy_behavior: AiBusyBehavior::Reject,
-        }
-    }
-}
-impl Default for AiChatConfig {
-    fn default() -> Self {
-        Self {
-            enabled: true,
-            prefix: default_ai_prefix(),
-            require_prefix: true,
-            respond_in_chat: true,
-            acknowledge_requests: true,
-            accept_console_ai_command: true,
-            strip_prefix_whitespace: true,
-            max_request_length: default_ai_request_length(),
-            incoming_queue_capacity: default_incoming_queue_capacity(),
-            access: AiChatAccessConfig::default(),
-            rate_limit: AiChatRateLimitConfig::default(),
-        }
-    }
-}
-
-/// Configuration for the remote planner. Secrets are never included in logs
-/// or errors; a local configuration key takes priority over an environment key.
-#[derive(Clone, Deserialize)]
-pub struct GeminiConfig {
-    #[serde(default)]
-    pub enabled: bool,
-    #[serde(default)]
-    pub api_key: Option<String>,
-    #[serde(default)]
-    pub api_key_env: Option<String>,
-    #[serde(default = "default_gemini_model")]
-    pub model: String,
-    #[serde(default = "default_gemini_timeout")]
-    pub request_timeout_seconds: u64,
-    #[serde(default = "default_gemini_retries")]
-    pub max_request_retries: u32,
-    #[serde(default = "default_gemini_steps")]
-    pub max_steps_per_session: usize,
-    #[serde(default = "default_gemini_session_seconds")]
-    pub max_session_seconds: u64,
-    #[serde(default = "default_gemini_temperature")]
-    pub temperature: f32,
-    #[serde(default = "default_true")]
-    pub include_nearby_blocks: bool,
-    #[serde(default = "default_true")]
-    pub include_nearby_entities: bool,
-    #[serde(default = "default_true")]
-    pub include_inventory: bool,
-    #[serde(default)]
-    pub limits: GeminiLimits,
-}
-
-impl std::fmt::Debug for GeminiConfig {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("GeminiConfig")
-            .field("enabled", &self.enabled)
-            .field("api_key", &self.api_key.as_ref().map(|_| "********"))
-            .field("api_key_env", &self.api_key_env)
-            .field("model", &self.model)
-            .field("request_timeout_seconds", &self.request_timeout_seconds)
-            .field("max_request_retries", &self.max_request_retries)
-            .field("max_steps_per_session", &self.max_steps_per_session)
-            .field("max_session_seconds", &self.max_session_seconds)
-            .field("temperature", &self.temperature)
-            .field("include_nearby_blocks", &self.include_nearby_blocks)
-            .field("include_nearby_entities", &self.include_nearby_entities)
-            .field("include_inventory", &self.include_inventory)
-            .field("limits", &self.limits)
-            .finish()
-    }
-}
-#[derive(Clone, Debug, Deserialize)]
-pub struct GeminiLimits {
-    #[serde(default = "default_gemini_quantity")]
-    pub max_gather_quantity: u32,
-    #[serde(default = "default_gemini_quantity")]
-    pub max_mine_quantity: u32,
-    #[serde(default = "default_gemini_quantity")]
-    pub max_craft_quantity: u32,
-    #[serde(default = "default_gemini_distance")]
-    pub max_navigation_distance: f64,
-    #[serde(default = "default_gemini_steps")]
-    pub max_actions_per_session: usize,
-    #[serde(default = "default_gemini_replans")]
-    pub max_replans_per_session: usize,
-    #[serde(default = "default_gemini_session_seconds")]
-    pub max_session_seconds: u64,
-    #[serde(default = "default_true")]
-    pub allow_mining: bool,
-    #[serde(default = "default_true")]
-    pub allow_crafting: bool,
-    #[serde(default = "default_true")]
-    pub allow_containers: bool,
-    #[serde(default)]
-    pub allow_block_placement: bool,
-}
-fn default_gemini_model() -> String {
-    "gemini-2.5-flash".into()
-}
-fn default_gemini_timeout() -> u64 {
-    30
-}
-fn default_gemini_retries() -> u32 {
-    2
-}
-fn default_gemini_steps() -> usize {
-    30
-}
-fn default_gemini_session_seconds() -> u64 {
-    600
-}
-fn default_gemini_temperature() -> f32 {
-    0.1
-}
-fn default_gemini_quantity() -> u32 {
-    64
-}
-fn default_gemini_distance() -> f64 {
-    256.0
-}
-fn default_gemini_replans() -> usize {
-    8
-}
-impl Default for GeminiConfig {
-    fn default() -> Self {
-        Self {
-            enabled: false,
-            api_key: None,
-            api_key_env: None,
-            model: default_gemini_model(),
-            request_timeout_seconds: default_gemini_timeout(),
-            max_request_retries: default_gemini_retries(),
-            max_steps_per_session: default_gemini_steps(),
-            max_session_seconds: default_gemini_session_seconds(),
-            temperature: default_gemini_temperature(),
-            include_nearby_blocks: true,
-            include_nearby_entities: true,
-            include_inventory: true,
-            limits: GeminiLimits::default(),
-        }
-    }
-}
-
-impl GeminiConfig {
-    /// Resolve without ever returning a diagnostic that contains a secret.
-    /// The callback keeps tests independent from process-wide environment state.
-    pub fn resolve_api_key_with(
-        &self,
-        env_lookup: impl FnOnce(&str) -> Option<String>,
-    ) -> Result<String, AppError> {
-        if let Some(key) = self.api_key.as_deref().filter(|key| !key.trim().is_empty()) {
-            return Ok(key.to_owned());
-        }
-        if let Some(name) = self
-            .api_key_env
-            .as_deref()
-            .filter(|name| !name.trim().is_empty())
-            && let Some(key) = env_lookup(name).filter(|key| !key.trim().is_empty())
-        {
-            return Ok(key);
-        }
-        Err(AppError::InvalidConfiguration(
-            "Gemini is enabled but no API key is configured or available".into(),
-        ))
-    }
-
-    pub fn resolve_api_key(&self) -> Result<String, AppError> {
-        self.resolve_api_key_with(|name| std::env::var(name).ok())
-    }
-
-    fn has_key_source(&self) -> bool {
-        self.api_key
-            .as_deref()
-            .is_some_and(|key| !key.trim().is_empty())
-            || self
-                .api_key_env
-                .as_deref()
-                .is_some_and(|name| !name.trim().is_empty())
-    }
-}
-impl Default for GeminiLimits {
-    fn default() -> Self {
-        Self {
-            max_gather_quantity: 64,
-            max_mine_quantity: 64,
-            max_craft_quantity: 64,
-            max_navigation_distance: 256.0,
-            max_actions_per_session: 30,
-            max_replans_per_session: 8,
-            max_session_seconds: 600,
-            allow_mining: true,
-            allow_crafting: true,
-            allow_containers: true,
-            allow_block_placement: true,
-        }
-    }
-}
-
-/// Configuration for the Groq provider (OpenAI-compatible).
-#[derive(Clone, Deserialize)]
-pub struct GroqConfig {
-    #[serde(default)]
-    pub enabled: bool,
-    #[serde(default)]
-    pub api_key: Option<String>,
-    #[serde(default)]
-    pub api_key_env: Option<String>,
-    #[serde(default = "default_groq_model")]
-    pub model: String,
-    #[serde(default)]
-    pub fallback_models: Vec<String>,
-    #[serde(default = "default_groq_base_url")]
-    pub base_url: String,
-    #[serde(default = "default_gemini_timeout")]
-    pub request_timeout_seconds: u64,
-    #[serde(default = "default_gemini_retries")]
-    pub max_request_retries: u32,
-    #[serde(default = "default_gemini_temperature")]
-    pub temperature: f32,
-    #[serde(default)]
-    pub service_tier: Option<String>,
-    /// Caps how many tokens a single completion may generate. Groq's decode
-    /// speed is already very fast (hundreds of tokens/sec on
-    /// `llama-3.1-8b-instant`), so the dominant lever for perceived latency
-    /// per turn is *how much* it generates, not how fast each token is.
-    #[serde(default = "default_groq_max_completion_tokens")]
-    pub max_completion_tokens: u32,
-    #[serde(default = "default_true")]
-    pub include_nearby_blocks: bool,
-    #[serde(default = "default_true")]
-    pub include_nearby_entities: bool,
-    #[serde(default = "default_true")]
-    pub include_inventory: bool,
-    #[serde(default)]
-    pub rate_limits: GroqRateLimitConfig,
-    #[serde(default)]
-    pub context: GroqContextConfig,
-    #[serde(default)]
-    pub limits: GeminiLimits,
-}
-
-#[derive(Clone, Debug, Deserialize)]
-pub struct GroqRateLimitConfig {
-    #[serde(default = "default_true")]
-    pub respect_retry_after: bool,
-    #[serde(default = "default_max_retry_delay")]
-    pub maximum_retry_delay_seconds: u64,
-    #[serde(default = "default_true")]
-    pub switch_model_on_daily_limit: bool,
-    #[serde(default = "default_true")]
-    pub switch_model_on_rate_limit: bool,
-}
-
-fn default_max_retry_delay() -> u64 {
-    3600
-}
-
-impl Default for GroqRateLimitConfig {
-    fn default() -> Self {
-        Self {
-            respect_retry_after: true,
-            maximum_retry_delay_seconds: 3600,
-            switch_model_on_daily_limit: true,
-            switch_model_on_rate_limit: true,
-        }
-    }
-}
-
-#[derive(Clone, Debug, Deserialize)]
-pub struct GroqContextConfig {
-    #[serde(default = "default_context_chat_messages")]
-    pub max_chat_messages: usize,
-    #[serde(default = "default_context_inventory_entries")]
-    pub max_inventory_entries: usize,
-    #[serde(default = "default_context_nearby_entities")]
-    pub max_nearby_entities: usize,
-    #[serde(default = "default_context_nearby_blocks")]
-    pub max_nearby_blocks: usize,
-    #[serde(default = "default_context_action_results")]
-    pub max_previous_action_results: usize,
-    #[serde(default = "default_true")]
-    pub include_full_command_descriptions: bool,
-}
-
-fn default_context_chat_messages() -> usize {
-    8
-}
-fn default_context_inventory_entries() -> usize {
-    36
-}
-fn default_context_nearby_entities() -> usize {
-    12
-}
-fn default_context_nearby_blocks() -> usize {
-    32
-}
-fn default_context_action_results() -> usize {
-    4
-}
-
-impl Default for GroqContextConfig {
-    fn default() -> Self {
-        Self {
-            max_chat_messages: 8,
-            max_inventory_entries: 36,
-            max_nearby_entities: 12,
-            max_nearby_blocks: 32,
-            max_previous_action_results: 4,
-            include_full_command_descriptions: true,
-        }
-    }
-}
-
-impl std::fmt::Debug for GroqConfig {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("GroqConfig")
-            .field("enabled", &self.enabled)
-            .field("api_key", &self.api_key.as_deref().map(|_| "***"))
-            .field("api_key_env", &self.api_key_env)
-            .field("model", &self.model)
-            .field("fallback_models", &self.fallback_models)
-            .field("base_url", &self.base_url)
-            .field("request_timeout_seconds", &self.request_timeout_seconds)
-            .field("max_request_retries", &self.max_request_retries)
-            .field("temperature", &self.temperature)
-            .field("service_tier", &self.service_tier)
-            .field("max_completion_tokens", &self.max_completion_tokens)
-            .field("include_nearby_blocks", &self.include_nearby_blocks)
-            .field("include_nearby_entities", &self.include_nearby_entities)
-            .field("include_inventory", &self.include_inventory)
-            .field("rate_limits", &self.rate_limits)
-            .field("context", &self.context)
-            .field("limits", &self.limits)
-            .finish()
-    }
-}
-
-fn default_groq_model() -> String {
-    "llama-3.1-8b-instant".into()
-}
-
-/// A tool-call turn is a function name plus a small JSON args object; a
-/// final chat reply is meant to be one short sentence (see
-/// `send_ai_chat_response`). 400 tokens comfortably covers both while
-/// preventing the model from rambling and adding latency for no benefit.
-fn default_groq_max_completion_tokens() -> u32 {
-    250
-}
-
-fn default_groq_base_url() -> String {
-    "https://api.groq.com/openai/v1".into()
-}
-
-impl Default for GroqConfig {
-    fn default() -> Self {
-        Self {
-            enabled: true,
-            api_key: None,
-            api_key_env: Some("GROQ_API_KEY".into()),
-            model: default_groq_model(),
-            fallback_models: Vec::new(),
-            base_url: default_groq_base_url(),
-            request_timeout_seconds: 60,
-            max_request_retries: 3,
-            temperature: 0.1,
-            service_tier: None,
-            max_completion_tokens: default_groq_max_completion_tokens(),
-            include_nearby_blocks: true,
-            include_nearby_entities: true,
-            include_inventory: true,
-            rate_limits: GroqRateLimitConfig::default(),
-            context: GroqContextConfig::default(),
-            limits: GeminiLimits::default(),
-        }
-    }
-}
-
-impl GroqConfig {
-    pub fn resolve_api_key(&self) -> Result<String, AppError> {
-        if let Some(key) = self.api_key.as_deref()
-            && !key.trim().is_empty()
-        {
-            return Ok(key.trim().to_owned());
-        }
-        if let Some(name) = self.api_key_env.as_deref().filter(|n| !n.trim().is_empty())
-            && let Ok(key) = std::env::var(name.trim())
-            && !key.trim().is_empty()
-        {
-            return Ok(key.trim().to_owned());
-        }
-        Err(AppError::InvalidConfiguration(
-            "No Groq API key configured. Set `groq.api_key` in config or `groq.api_key_env`."
-                .into(),
-        ))
-    }
-}
-
-/// Configuration for a local OpenAI-compatible AI server. Despite the name
-/// this works for Ollama *or* LM Studio *or* anything else exposing a
-/// `/v1/chat/completions` endpoint in that shape -- only `base_url`/`model`
-/// need to change (Ollama: `http://localhost:11434/v1`; LM Studio:
-/// `http://localhost:1234/v1`). Selected instead of Groq by setting
-/// `[ai] provider = "ollama"`. No real API key is needed -- these servers
-/// accept any placeholder value. `limits` is intentionally not duplicated
-/// here: bot behavior limits (`[groq.limits]`) apply regardless of which
-/// provider is active.
-#[derive(Clone, Debug, Deserialize)]
-pub struct OllamaConfig {
-    #[serde(default)]
-    pub enabled: bool,
-    #[serde(default = "default_ollama_base_url")]
-    pub base_url: String,
-    /// Must already be pulled locally (`ollama pull <model>`) and support
-    /// tool calling -- not every model does. llama3.1/3.2, qwen2.5, and
-    /// mistral-nemo are known-good choices as of writing.
-    #[serde(default = "default_ollama_model")]
-    pub model: String,
-    /// Local inference on modest hardware can be far slower than a cloud
-    /// API, so this defaults higher than Groq's timeout.
-    #[serde(default = "default_ollama_timeout")]
-    pub request_timeout_seconds: u64,
-    #[serde(default = "default_gemini_retries")]
-    pub max_request_retries: u32,
-    #[serde(default = "default_gemini_temperature")]
-    pub temperature: f32,
-    #[serde(default = "default_ollama_max_tokens")]
-    pub max_tokens: u32,
-}
-
-fn default_ollama_base_url() -> String {
-    "http://localhost:11434/v1".into()
-}
-fn default_ollama_model() -> String {
-    "llama3.1".into()
-}
-fn default_ollama_timeout() -> u64 {
-    120
-}
-fn default_ollama_max_tokens() -> u32 {
-    250
-}
-
-impl Default for OllamaConfig {
-    fn default() -> Self {
-        Self {
-            enabled: false,
-            base_url: default_ollama_base_url(),
-            model: default_ollama_model(),
-            request_timeout_seconds: default_ollama_timeout(),
-            max_request_retries: 1,
-            temperature: 0.1,
-            max_tokens: default_ollama_max_tokens(),
+            access: ChatCommandsAccessConfig::default(),
+            rate_limit: ChatCommandsRateLimitConfig::default(),
         }
     }
 }
@@ -783,13 +273,29 @@ pub struct MovementConfig {
     pub repath_interval_ms: u64,
     #[serde(default = "default_arrival_distance")]
     pub arrival_distance: f64,
+    /// Hard ceiling on how long a single `/goto`/`/goto-mine` (or any other
+    /// direct caller awaiting movement, e.g. `App::goto_and_wait`) will wait
+    /// for the pathfinder to reach `Completed`/`Failed`/`Cancelled` before giving up
+    /// on its own. Azalea's pathfinder is submitted with
+    /// `retry_on_no_path(true)`, so a genuinely unreachable goal (a route
+    /// that needs more scaffold material than is held, a destination behind
+    /// terrain the current policy can't cross) would otherwise retry inside
+    /// Azalea forever without ever reporting failure -- since movement
+    /// commands run on the same single-threaded console loop as every other
+    /// command, that would freeze the whole app, including `/stop`, until
+    /// the process is killed and restarted.
+    #[serde(default = "default_maximum_navigation_seconds")]
+    pub maximum_navigation_seconds: u64,
 }
 
-/// Policy for vertical construction routes (pillaring, safe digging-down)
-/// that Azalea's own pathfinder cannot perform on its own. Enabled by
-/// default; `denied_building_blocks` plus a built-in hard denylist (tools,
-/// ores, containers, valuables) keep it from ever consuming or placing
-/// anything unexpected.
+/// Policy for the pathfinding engine's terrain-modifying movement
+/// primitives (pillaring, bridging, staircasing, safe digging-down). These
+/// are real A* graph edges inside the pathfinder itself (see
+/// `azalea::pathfinder::moves::build` and `azalea::pathfinder::policy`), not
+/// command-layer logic -- every `/goto`, `/follow`, and task automatically
+/// inherits them. Enabled by default; `denied_building_blocks` plus a
+/// built-in hard denylist (tools, ores, containers, valuables) keep it from
+/// ever consuming or placing anything unexpected.
 #[derive(Clone, Debug, Deserialize)]
 pub struct VerticalNavigationConfig {
     #[serde(default = "default_true")]
@@ -798,6 +304,8 @@ pub struct VerticalNavigationConfig {
     pub allow_pillaring: bool,
     #[serde(default = "default_true")]
     pub allow_digging_down: bool,
+    #[serde(default = "default_true")]
+    pub allow_bridging: bool,
     #[serde(default = "default_true")]
     pub prefer_staircase_descent: bool,
     #[serde(default = "default_vertical_pillar_height")]
@@ -848,6 +356,7 @@ impl Default for VerticalNavigationConfig {
             enabled: true,
             allow_pillaring: true,
             allow_digging_down: true,
+            allow_bridging: true,
             prefer_staircase_descent: true,
             max_pillar_height: default_vertical_pillar_height(),
             max_dig_depth: default_vertical_dig_depth(),
@@ -1325,6 +834,7 @@ impl Default for MovementConfig {
             follow_distance: 3.0,
             repath_interval_ms: 150,
             arrival_distance: 1.5,
+            maximum_navigation_seconds: default_maximum_navigation_seconds(),
         }
     }
 }
@@ -1390,6 +900,13 @@ impl Config {
         if !(self.movement.arrival_distance > 0.0 && self.movement.arrival_distance <= 16.0) {
             return Err(AppError::InvalidMovementConfiguration(
                 "arrival_distance must be greater than zero and at most 16".into(),
+            ));
+        }
+        if self.movement.maximum_navigation_seconds == 0
+            || self.movement.maximum_navigation_seconds > 3600
+        {
+            return Err(AppError::InvalidMovementConfiguration(
+                "maximum_navigation_seconds must be between 1 and 3600".into(),
             ));
         }
         let multitasking = &self.multitasking;
@@ -1537,63 +1054,20 @@ impl Config {
                 "tree_chopping limits or allowed_tree_types are invalid".into(),
             ));
         }
-        let gemini = &self.gemini;
-        if gemini.model.trim().is_empty()
-            || gemini.request_timeout_seconds == 0
-            || gemini.max_steps_per_session == 0
-            || gemini.max_session_seconds == 0
-            || !(0.0..=2.0).contains(&gemini.temperature)
-            || gemini.limits.max_gather_quantity == 0
-            || gemini.limits.max_mine_quantity == 0
-            || gemini.limits.max_craft_quantity == 0
-            || gemini.limits.max_actions_per_session == 0
-            || gemini.limits.max_replans_per_session == 0
-            || !gemini.limits.max_navigation_distance.is_finite()
-            || gemini.limits.max_navigation_distance <= 0.0
+        let chat_commands = &self.chat_commands;
+        if (chat_commands.rate_limit.enabled
+            && (chat_commands.rate_limit.requests == 0
+                || chat_commands.rate_limit.window_seconds == 0))
+            || chat_commands.access.allowed_players.iter().any(|allowed| {
+                chat_commands
+                    .access
+                    .blocked_players
+                    .iter()
+                    .any(|blocked| allowed.eq_ignore_ascii_case(blocked))
+            })
         {
             return Err(AppError::InvalidConfiguration(
-                "gemini configuration or limits are invalid".into(),
-            ));
-        }
-        if gemini.enabled && !gemini.has_key_source() {
-            return Err(AppError::InvalidConfiguration(
-                "Gemini is enabled but neither gemini.api_key nor gemini.api_key_env is configured"
-                    .into(),
-            ));
-        }
-        let groq = &self.groq;
-        if groq.model.trim().is_empty()
-            || groq.request_timeout_seconds == 0
-            || groq.max_request_retries == 0
-            || groq.base_url.trim().is_empty()
-            || !(0.0..=2.0).contains(&groq.temperature)
-            || groq.limits.max_gather_quantity == 0
-            || groq.limits.max_mine_quantity == 0
-            || groq.limits.max_craft_quantity == 0
-            || groq.limits.max_actions_per_session == 0
-            || groq.limits.max_replans_per_session == 0
-            || !groq.limits.max_navigation_distance.is_finite()
-            || groq.limits.max_navigation_distance <= 0.0
-        {
-            return Err(AppError::InvalidConfiguration(
-                "groq configuration or limits are invalid".into(),
-            ));
-        }
-        let chat = &self.ai.chat;
-        if chat.enabled
-            && (chat.prefix.is_empty()
-                || chat.incoming_queue_capacity == 0
-                || (chat.rate_limit.enabled
-                    && (chat.rate_limit.requests == 0 || chat.rate_limit.window_seconds == 0))
-                || chat.access.allowed_players.iter().any(|allowed| {
-                    chat.access
-                        .blocked_players
-                        .iter()
-                        .any(|blocked| allowed.eq_ignore_ascii_case(blocked))
-                }))
-        {
-            return Err(AppError::InvalidConfiguration(
-                "AI chat prefix, queue, rate limit, or access lists are invalid".into(),
+                "chat_commands rate limit or access lists are invalid".into(),
             ));
         }
         Ok(())
@@ -1628,80 +1102,6 @@ pub fn init_logging(config: &LoggingConfig) -> Result<(), AppError> {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn gemini_uses_configured_api_key() {
-        let config = GeminiConfig {
-            api_key: Some("file-key".into()),
-            ..GeminiConfig::default()
-        };
-        assert_eq!(
-            config
-                .resolve_api_key_with(|_| Some("environment-key".into()))
-                .unwrap(),
-            "file-key"
-        );
-    }
-
-    #[test]
-    fn gemini_uses_environment_api_key_when_config_key_is_absent() {
-        let config = GeminiConfig {
-            api_key_env: Some("TEST_GEMINI_KEY".into()),
-            ..GeminiConfig::default()
-        };
-        assert_eq!(
-            config
-                .resolve_api_key_with(
-                    |name| (name == "TEST_GEMINI_KEY").then(|| "environment-key".into())
-                )
-                .unwrap(),
-            "environment-key"
-        );
-    }
-
-    #[test]
-    fn gemini_prefers_configured_key_over_environment_key() {
-        let config = GeminiConfig {
-            api_key: Some("preferred".into()),
-            api_key_env: Some("IGNORED".into()),
-            ..GeminiConfig::default()
-        };
-        assert_eq!(
-            config
-                .resolve_api_key_with(|_| panic!("environment lookup must not happen"))
-                .unwrap(),
-            "preferred"
-        );
-    }
-
-    #[test]
-    fn gemini_missing_key_is_rejected_and_debug_redacts_secret() {
-        let config = GeminiConfig {
-            enabled: true,
-            ..GeminiConfig::default()
-        };
-        assert!(config.resolve_api_key_with(|_| None).is_err());
-        assert!(
-            format!(
-                "{:?}",
-                GeminiConfig {
-                    api_key: Some("private-key".into()),
-                    ..GeminiConfig::default()
-                }
-            )
-            .contains("********")
-        );
-        assert!(
-            !format!(
-                "{:?}",
-                GeminiConfig {
-                    api_key: Some("private-key".into()),
-                    ..GeminiConfig::default()
-                }
-            )
-            .contains("private-key")
-        );
-    }
 
     #[test]
     fn loads_localhost_without_requiring_a_port() {
