@@ -49,8 +49,8 @@ use crate::{
         block_snapshot::LoadedBlockCandidate,
     },
     config::{
-        AccountMode, ConsoleConfig, MinecraftConfig, ReconnectConfig, VerticalNavigationConfig,
-        WorldStateConfig,
+        AccountMode, BridgingConfig, ConsoleConfig, MinecraftConfig, ReconnectConfig,
+        VerticalNavigationConfig, WorldStateConfig,
     },
     error::AppError,
     logging,
@@ -114,6 +114,7 @@ pub struct MinecraftClient {
     reconnect: ReconnectConfig,
     console: ConsoleConfig,
     vertical_navigation: VerticalNavigationConfig,
+    bridging: BridgingConfig,
     state: watch::Receiver<ConnectionState>,
     state_tx: watch::Sender<ConnectionState>,
     current_client: Arc<Mutex<Option<Client>>>,
@@ -196,6 +197,7 @@ impl MinecraftClient {
         console: ConsoleConfig,
         world_config: WorldStateConfig,
         vertical_navigation: VerticalNavigationConfig,
+        bridging: BridgingConfig,
     ) -> Self {
         let (state_tx, state) = watch::channel(ConnectionState::Disconnected);
         let mut world = WorldState::with_limits(
@@ -217,6 +219,7 @@ impl MinecraftClient {
             reconnect,
             console,
             vertical_navigation,
+            bridging,
             state,
             state_tx,
             current_client: Arc::new(Mutex::new(None)),
@@ -1246,6 +1249,8 @@ impl MinecraftClient {
             allow_pillaring: allow_build && self.vertical_navigation.allow_pillaring,
             allow_bridging: allow_build && self.vertical_navigation.allow_bridging,
             allow_staircase_building: allow_build && self.vertical_navigation.allow_digging_down,
+            fast_bridge_enabled: self.bridging.fast_bridge_enabled,
+            fast_bridge_edge_threshold: self.bridging.edge_threshold,
             scaffold: ScaffoldPolicy {
                 allowed: scaffold_allowed,
                 denied: self.vertical_navigation.denied_building_blocks.clone(),
@@ -1957,6 +1962,7 @@ mod tests {
             ConsoleConfig::default(),
             WorldStateConfig::default(),
             VerticalNavigationConfig::default(),
+            BridgingConfig::default(),
         )
     }
 

@@ -202,6 +202,7 @@ impl App {
             config.console.clone(),
             config.world_state.clone(),
             config.vertical_navigation.clone(),
+            config.bridging.clone(),
         );
         // Bounded buffer for incoming player chat messages (currently only
         // consumed by the `#`-prefixed direct console command feature, see

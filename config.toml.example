@@ -180,6 +180,15 @@ minimum_building_blocks = 4
 # anything listed here.
 denied_building_blocks = ["minecraft:diamond_block", "minecraft:chest", "minecraft:crafting_table"]
 
+# Baritone-style "fast bridging": walk normally across each placed block,
+# only sneaking for the brief moment needed to place the next one near the
+# edge. This is the default bridge-move technique for every /goto, /follow,
+# and task -- set fast_bridge_enabled = false to fall back to the original
+# permanent-sneak technique.
+[bridging]
+fast_bridge_enabled = true
+edge_threshold = 0.18
+
 [multitasking]
 normal_forward_angle = 35.0
 strafe_angle = 75.0

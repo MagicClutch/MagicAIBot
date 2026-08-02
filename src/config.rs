@@ -29,6 +29,8 @@ pub struct Config {
     #[serde(default)]
     pub vertical_navigation: VerticalNavigationConfig,
     #[serde(default)]
+    pub bridging: BridgingConfig,
+    #[serde(default)]
     pub block_search: BlockSearchConfig,
     #[serde(default)]
     pub block_navigation: BlockNavigationConfig,
@@ -356,6 +358,41 @@ impl Default for VerticalNavigationConfig {
             max_dig_depth: default_vertical_dig_depth(),
             minimum_building_blocks: default_minimum_building_blocks(),
             denied_building_blocks: default_denied_building_blocks(),
+        }
+    }
+}
+
+/// Controls Baritone-style "fast bridging" (speed bridging): walking
+/// normally across each placed block and only sneaking for the brief
+/// moment needed to place the next one near the edge, instead of sneaking
+/// for the entire approach. This is the default technique the pathfinder's
+/// bridge move primitive uses whenever it decides a bridge must be built --
+/// see `azalea::pathfinder::moves::build::execute_fast_bridge_move` -- for
+/// every `/goto`, `/follow`, and task that crosses a gap, not a
+/// command-specific implementation.
+#[derive(Clone, Debug, Deserialize)]
+pub struct BridgingConfig {
+    /// `false` falls back to the original permanent-sneak bridging
+    /// technique.
+    #[serde(default = "default_true")]
+    pub fast_bridge_enabled: bool,
+    /// How close to a block's edge (in blocks) the bot must be before it
+    /// starts sneaking to place the next bridge block. Must be wide enough
+    /// that a single tick's normal-speed walking step can't skip clean over
+    /// the detection window (see
+    /// `azalea::pathfinder::moves::build::FAST_BRIDGE_EDGE_THRESHOLD_FALLBACK`'s
+    /// doc comment) -- 0.15-0.25 is a reasonable range.
+    #[serde(default = "default_edge_threshold")]
+    pub edge_threshold: f64,
+}
+fn default_edge_threshold() -> f64 {
+    0.18
+}
+impl Default for BridgingConfig {
+    fn default() -> Self {
+        Self {
+            fast_bridge_enabled: true,
+            edge_threshold: default_edge_threshold(),
         }
     }
 }
