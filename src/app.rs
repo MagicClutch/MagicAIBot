@@ -639,6 +639,21 @@ impl App {
                         Err(error) => logging::error(error),
                     }
                 }
+                ConsoleCommand::InteractNearest {
+                    block_id,
+                    items,
+                    radius,
+                } => {
+                    self.block_navigation
+                        .cancel(&self.minecraft, &self.movement)
+                        .await;
+                    if let Err(error) = self
+                        .interact_nearest_and_wait(block_id, items, radius)
+                        .await
+                    {
+                        logging::warning(format!("Cannot interact with block: {error}"));
+                    }
+                }
                 ConsoleCommand::StopInteraction => {
                     self.interaction
                         .cancel(&self.minecraft, &self.movement, &self.look)
@@ -1671,6 +1686,40 @@ impl App {
         result
     }
 
+    async fn interact_nearest_and_wait(
+        &self,
+        block_id: String,
+        items: Vec<String>,
+        radius: u32,
+    ) -> Result<(), AppError> {
+        self.minecraft
+            .set_current_task(task_snapshot(format!("Interact with nearest {block_id}")))
+            .await;
+        let result = async {
+            self.interaction
+                .interact_nearest(
+                    &self.minecraft,
+                    &self.movement,
+                    &self.look,
+                    block_id,
+                    items,
+                    radius,
+                )
+                .await?;
+            await_interaction_terminal(
+                &self.interaction,
+                &self.minecraft,
+                &self.movement,
+                &self.block_navigation,
+                &self.look,
+            )
+            .await
+        }
+        .await;
+        self.minecraft.clear_current_task().await;
+        result
+    }
+
     async fn place_looked_and_wait(&self, item: String) -> Result<(), AppError> {
         self.minecraft
             .set_current_task(task_snapshot(format!("Place {item}")))
@@ -1748,6 +1797,9 @@ fn print_help() {
     println!("  /break <x> <y> <z>         Break a block and wait until it is broken");
     println!("  /place <block> <x> <y> <z> Place a block and wait until it is placed");
     println!("  /find <block> [radius]     Find the nearest matching block");
+    println!(
+        "  /interact <block> <item[,item...]> [radius]  Right-click the nearest matching block with a held item (e.g. till dirt with a hoe)"
+    );
     println!();
     println!("Inventory");
     println!("  /equip <item>              Equip an item to the active hotbar slot");

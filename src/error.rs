@@ -63,6 +63,8 @@ pub enum AppError {
     InteractionItemMissing(String),
     #[error("cannot place block: {0}")]
     CannotPlaceBlock(String),
+    #[error("cannot interact with block: {0}")]
+    CannotInteract(String),
     #[error("interaction timed out")]
     InteractionTimeout,
     #[error("interaction was cancelled")]

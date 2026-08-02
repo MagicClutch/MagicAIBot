@@ -39,6 +39,7 @@ pub enum InteractionState {
     Preparing,
     Breaking,
     Placing,
+    Interacting,
     Retrying,
     Completed,
     #[allow(dead_code)]
@@ -71,6 +72,17 @@ enum Operation {
         support_id: String,
         face: BlockFace,
         inventory_before: u32,
+    },
+    /// Right-click an existing block with a held item without placing a new
+    /// block -- e.g. tilling dirt with a hoe, or turning dirt/grass into a
+    /// path with a shovel. Completion is detected generically, by the
+    /// target block's id changing from `original_id`, rather than by
+    /// hardcoding the expected result for every possible tool/block pair.
+    Interact {
+        target: BlockPosition,
+        item_id: String,
+        original_id: String,
+        face: BlockFace,
     },
 }
 struct Inner {
@@ -308,6 +320,86 @@ impl InteractionController {
         .await
     }
 
+    /// Right-clicks the nearest block matching `block_id` within `radius`
+    /// with the first held item from `item_ids` that's available, e.g.
+    /// tilling the nearest dirt with a hoe or turning it into a path with a
+    /// shovel.
+    pub async fn interact_nearest(
+        &self,
+        minecraft: &MinecraftClient,
+        movement: &MovementService,
+        look: &LookController,
+        block_id: String,
+        item_ids: Vec<String>,
+        radius: u32,
+    ) -> Result<(), AppError> {
+        let Some(candidate) = self
+            .search
+            .search_raw(
+                minecraft,
+                BlockSearchQuery {
+                    block_id,
+                    radius,
+                    maximum_results: 1,
+                    vertical_range: 0,
+                },
+            )
+            .await?
+            .into_iter()
+            .next()
+        else {
+            return Err(AppError::NoMatchingBlock);
+        };
+        self.interact_at(minecraft, movement, look, candidate.position, item_ids)
+            .await
+    }
+    /// Right-clicks the block at `target` with the first held item from
+    /// `item_ids` that's available. Unlike [`Self::place_at`], `target` is
+    /// the existing block being interacted with (not a cell it gets placed
+    /// into), and completion is confirmed once the block's own id changes.
+    pub async fn interact_at(
+        &self,
+        minecraft: &MinecraftClient,
+        movement: &MovementService,
+        look: &LookController,
+        target: BlockPosition,
+        item_ids: Vec<String>,
+    ) -> Result<(), AppError> {
+        let world = minecraft.world_state_snapshot().await;
+        if !world.inventory.available {
+            return Err(AppError::CannotInteract(
+                "inventory state is stale or unavailable".into(),
+            ));
+        }
+        let item_id = item_ids
+            .iter()
+            .find(|item| {
+                world.inventory.has_item(item, 1) && world.inventory.item_is_in_hotbar(item)
+            })
+            .cloned()
+            .ok_or_else(|| AppError::InteractionItemMissing(item_ids.join(" or ")))?;
+        let original_id = block_id(minecraft, target)
+            .await?
+            .ok_or(AppError::TargetChunkUnloaded)?;
+        let position = world
+            .bot
+            .position
+            .ok_or(AppError::BlockSearchPositionUnavailable)?;
+        let face = best_face(target, [position.x, position.y, position.z]);
+        self.replace(
+            Operation::Interact {
+                target,
+                item_id,
+                original_id,
+                face,
+            },
+            minecraft,
+            movement,
+            look,
+        )
+        .await
+    }
+
     /// Starts a typed single-block request. Substitution is deliberately
     /// limited to an explicitly supplied accepted-item list.
     pub async fn place_request(
@@ -350,9 +442,16 @@ impl InteractionController {
         let target = match &operation {
             Operation::Break { expected, .. } => expected.clone(),
             Operation::Place { item_id, .. } => item_id.clone(),
+            Operation::Interact {
+                item_id,
+                original_id,
+                ..
+            } => format!("{item_id} on {original_id}"),
         };
         let block_position = match &operation {
-            Operation::Break { target, .. } | Operation::Place { target, .. } => *target,
+            Operation::Break { target, .. }
+            | Operation::Place { target, .. }
+            | Operation::Interact { target, .. } => *target,
         };
         let world = minecraft.world_state_snapshot().await;
         if !world.joined_world() {
@@ -403,6 +502,7 @@ impl InteractionController {
                         | InteractionState::Preparing
                         | InteractionState::Breaking
                         | InteractionState::Placing
+                        | InteractionState::Interacting
                         | InteractionState::Retrying
                 )
         };
@@ -457,7 +557,9 @@ impl InteractionController {
             return;
         }
         let target = match &operation {
-            Operation::Break { target, .. } | Operation::Place { target, .. } => *target,
+            Operation::Break { target, .. }
+            | Operation::Place { target, .. }
+            | Operation::Interact { target, .. } => *target,
         };
         let world = minecraft.world_state_snapshot().await;
         if !world.joined_world() {
@@ -494,6 +596,11 @@ impl InteractionController {
                         support_id,
                         ..
                     } => Some((*support, support_id.clone())),
+                    Operation::Interact {
+                        target,
+                        original_id,
+                        ..
+                    } => Some((*target, original_id.clone())),
                 };
                 let Some((navigation_position, navigation_block_id)) = navigation_target else {
                     self.fail("navigation support disappeared").await;
@@ -551,6 +658,12 @@ impl InteractionController {
                         face,
                         ..
                     } => (*support, Some(support_id.clone()), *face),
+                    Operation::Interact {
+                        target,
+                        original_id,
+                        face,
+                        ..
+                    } => (*target, Some(original_id.clone()), *face),
                 };
                 let (face_attempt, hit_point_attempt) = {
                     let inner = self.inner.lock().await;
@@ -558,15 +671,15 @@ impl InteractionController {
                 };
                 let face = match &operation {
                     Operation::Break { .. } => break_face_order(base_face)[face_attempt % 6],
-                    Operation::Place { .. } => base_face,
+                    Operation::Place { .. } | Operation::Interact { .. } => base_face,
                 };
                 let points = face_hit_points(
                     look_position,
                     face,
-                    if matches!(&operation, Operation::Place { .. }) {
-                        BlockFacePurpose::PlaceSupport
-                    } else {
-                        BlockFacePurpose::Break
+                    match &operation {
+                        Operation::Place { .. } => BlockFacePurpose::PlaceSupport,
+                        Operation::Interact { .. } => BlockFacePurpose::Interact,
+                        Operation::Break { .. } => BlockFacePurpose::Break,
                     },
                     self.config.face_targeting.face_inset,
                     self.config.face_targeting.edge_margin,
@@ -606,14 +719,21 @@ impl InteractionController {
                 let (expected_hit, expected_face) = match &operation {
                     Operation::Break { target, face, .. } => (*target, *face),
                     Operation::Place { support, face, .. } => (*support, *face),
+                    Operation::Interact { target, face, .. } => (*target, *face),
                 };
                 match minecraft.looked_block().await {
-                    // Breaking needs the target block. Unlike placement, the
-                    // exact face is advisory and can legitimately vary after
-                    // interpolation or a collision-shape raycast.
+                    // Breaking and interacting only need the target block.
+                    // Unlike placement, the exact face is advisory and can
+                    // legitimately vary after interpolation or a
+                    // collision-shape raycast -- and unlike placement,
+                    // neither operation is face-direction-sensitive (a hoe
+                    // tills dirt clicked from any exposed side, not just the
+                    // top).
                     Ok(hit)
-                        if matches!(&operation, Operation::Break { .. })
-                            && hit.position == expected_hit =>
+                        if matches!(
+                            &operation,
+                            Operation::Break { .. } | Operation::Interact { .. }
+                        ) && hit.position == expected_hit =>
                     {
                         if self.operation_still_valid(minecraft, &operation).await {
                             self.dispatch(minecraft, &operation).await
@@ -645,7 +765,7 @@ impl InteractionController {
                             self.recover_break_raycast(minecraft, movement, &operation)
                                 .await;
                         } else {
-                            self.retry_or_fail("wrong support block is being looked at")
+                            self.retry_or_fail("wrong support or target block is being looked at")
                                 .await;
                         }
                     }
@@ -658,7 +778,7 @@ impl InteractionController {
         }
         if matches!(
             state,
-            InteractionState::Breaking | InteractionState::Placing
+            InteractionState::Breaking | InteractionState::Placing | InteractionState::Interacting
         ) && dispatched
         {
             match &operation {
@@ -704,6 +824,22 @@ impl InteractionController {
                     Err(_) => self.retry_or_fail("chunk unloaded").await,
                     _ => {}
                 },
+                Operation::Interact {
+                    target,
+                    original_id,
+                    ..
+                } => match block_id(minecraft, *target).await {
+                    Ok(Some(id)) if id != *original_id => {
+                        self.complete("Block interaction confirmed").await;
+                        let _ = look.release_precise(minecraft).await;
+                    }
+                    Ok(_) if self.elapsed_exceeded().await => {
+                        self.retry_or_fail("interaction did not change the block in time")
+                            .await
+                    }
+                    Err(_) => self.retry_or_fail("chunk unloaded").await,
+                    _ => {}
+                },
             }
         }
     }
@@ -721,10 +857,10 @@ impl InteractionController {
                 return;
             }
             inner.dispatched = true;
-            inner.snapshot.state = if matches!(operation, Operation::Break { .. }) {
-                InteractionState::Breaking
-            } else {
-                InteractionState::Placing
+            inner.snapshot.state = match operation {
+                Operation::Break { .. } => InteractionState::Breaking,
+                Operation::Place { .. } => InteractionState::Placing,
+                Operation::Interact { .. } => InteractionState::Interacting,
             };
             inner.snapshot.started_at = Some(SystemTime::now());
         }
@@ -771,15 +907,27 @@ impl InteractionController {
                     Err(error) => Err(error),
                 }
             }
-        };
-        match result {
-            Ok(()) => {
-                if matches!(operation, Operation::Break { .. }) {
-                    logging::info("Beginning block break");
-                } else {
-                    logging::info("Placing block");
+            Operation::Interact { item_id, .. } => {
+                match minecraft.select_item_in_hotbar(item_id).await {
+                    Ok(true) => {
+                        let Operation::Interact { target, .. } = operation else {
+                            unreachable!()
+                        };
+                        minecraft.interact_block(*target).await
+                    }
+                    Ok(false) => Err(AppError::CannotInteract(format!(
+                        "item {item_id} exists but is not accessible in the hotbar"
+                    ))),
+                    Err(error) => Err(error),
                 }
             }
+        };
+        match result {
+            Ok(()) => match operation {
+                Operation::Break { .. } => logging::info("Beginning block break"),
+                Operation::Place { .. } => logging::info("Placing block"),
+                Operation::Interact { .. } => logging::info("Interacting with block"),
+            },
             Err(error) => {
                 self.retry_or_fail(&error.to_string()).await;
             }
@@ -808,6 +956,19 @@ impl InteractionController {
                         .flatten()
                         .as_deref()
                         == Some(support_id)
+                    && minecraft
+                        .world_state_snapshot()
+                        .await
+                        .inventory
+                        .has_item(item_id, 1)
+            }
+            Operation::Interact {
+                target,
+                original_id,
+                item_id,
+                ..
+            } => {
+                block_id(minecraft, *target).await.ok().flatten().as_deref() == Some(original_id)
                     && minecraft
                         .world_state_snapshot()
                         .await

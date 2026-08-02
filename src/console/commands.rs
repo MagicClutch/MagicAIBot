@@ -99,6 +99,11 @@ pub enum ConsoleCommand {
         z: i32,
         block_id: String,
     },
+    InteractNearest {
+        block_id: String,
+        items: Vec<String>,
+        radius: u32,
+    },
     StopInteraction,
     InteractionStatus,
     Craft {
@@ -271,6 +276,7 @@ pub fn parse_input(input: &str) -> Result<ConsoleInput, AppError> {
         },
         "place" => parse_place(arguments)?,
         "placeblock" => parse_placeblock(arguments)?,
+        "interact" => parse_interact(arguments)?,
         "stopinteraction" => no_arguments(command, arguments, ConsoleCommand::StopInteraction)?,
         "interactionstatus" => no_arguments(command, arguments, ConsoleCommand::InteractionStatus)?,
         "craft" => parse_craft(arguments)?,
@@ -531,6 +537,41 @@ fn parse_nearest_block(arguments: &str) -> Result<ConsoleCommand, AppError> {
     }
     Ok(ConsoleCommand::NearestBlock {
         block_id: normalize_block_id(block_id)?,
+        radius,
+    })
+}
+
+fn parse_interact(arguments: &str) -> Result<ConsoleCommand, AppError> {
+    const USAGE: &str = "/interact <block_id> <item_id[,item_id...]> [radius]";
+    let mut parts = arguments.split_whitespace();
+    let block_id = parts
+        .next()
+        .ok_or_else(|| AppError::MissingConsoleArgument(USAGE.into()))?;
+    let items = parts
+        .next()
+        .ok_or_else(|| AppError::MissingConsoleArgument(USAGE.into()))?;
+    let radius = parts
+        .next()
+        .map(|value| {
+            value.parse().map_err(|_| {
+                AppError::InvalidEntityQuery("radius must be a positive integer".into())
+            })
+        })
+        .transpose()?
+        .unwrap_or(32);
+    if parts.next().is_some() {
+        return Err(AppError::InvalidConsoleSyntax(USAGE.into()));
+    }
+    let items = items
+        .split(',')
+        .map(normalize_item_id)
+        .collect::<Result<Vec<_>, _>>()?;
+    if items.is_empty() {
+        return Err(AppError::InvalidConsoleSyntax(USAGE.into()));
+    }
+    Ok(ConsoleCommand::InteractNearest {
+        block_id: normalize_block_id(block_id)?,
+        items,
         radius,
     })
 }
@@ -848,6 +889,28 @@ mod tests {
             parse_input("/testoaklog").unwrap(),
             ConsoleInput::Command(ConsoleCommand::TestOakLog)
         );
+    }
+
+    #[test]
+    fn parses_interact_command() {
+        assert_eq!(
+            parse_input("/interact dirt wooden_hoe,stone_hoe").unwrap(),
+            ConsoleInput::Command(ConsoleCommand::InteractNearest {
+                block_id: "minecraft:dirt".into(),
+                items: vec!["minecraft:wooden_hoe".into(), "minecraft:stone_hoe".into()],
+                radius: 32,
+            })
+        );
+        assert_eq!(
+            parse_input("/interact minecraft:grass_block wooden_shovel 16").unwrap(),
+            ConsoleInput::Command(ConsoleCommand::InteractNearest {
+                block_id: "minecraft:grass_block".into(),
+                items: vec!["minecraft:wooden_shovel".into()],
+                radius: 16,
+            })
+        );
+        assert!(parse_input("/interact dirt").is_err());
+        assert!(parse_input("/interact dirt wooden_hoe extra garbage").is_err());
     }
 
     #[test]
