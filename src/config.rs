@@ -293,9 +293,12 @@ pub struct MovementConfig {
 /// are real A* graph edges inside the pathfinder itself (see
 /// `azalea::pathfinder::moves::build` and `azalea::pathfinder::policy`), not
 /// command-layer logic -- every `/goto`, `/follow`, and task automatically
-/// inherits them. Enabled by default; `denied_building_blocks` plus a
-/// built-in hard denylist (tools, ores, containers, valuables) keep it from
-/// ever consuming or placing anything unexpected.
+/// inherits them. Enabled by default. Building material is a deny-list, not
+/// an allow-list (see `crate::bridging`): the bot may use any placeable
+/// block it holds except `crate::bridging::SCAFFOLD_BLACKLIST`,
+/// `denied_building_blocks` below, and a built-in hard denylist inside the
+/// pathfinder engine itself (tools, ores, valuables) -- so it never
+/// consumes or places anything unexpected.
 #[derive(Clone, Debug, Deserialize)]
 pub struct VerticalNavigationConfig {
     #[serde(default = "default_true")]
@@ -314,8 +317,11 @@ pub struct VerticalNavigationConfig {
     pub max_dig_depth: u32,
     #[serde(default = "default_minimum_building_blocks")]
     pub minimum_building_blocks: u32,
-    #[serde(default = "default_allowed_building_blocks")]
-    pub allowed_building_blocks: Vec<String>,
+    /// Extra blocks to deny beyond `crate::bridging::SCAFFOLD_BLACKLIST`
+    /// (the built-in blacklist covering containers, valuables, redstone,
+    /// decorative blocks, crops, etc.). Building material is otherwise a
+    /// deny-list, not an allow-list: the bot may use any placeable block it
+    /// holds except what's blacklisted here or in the built-in list.
     #[serde(default = "default_denied_building_blocks")]
     pub denied_building_blocks: Vec<String>,
 }
@@ -327,18 +333,6 @@ fn default_vertical_dig_depth() -> u32 {
 }
 fn default_minimum_building_blocks() -> u32 {
     4
-}
-fn default_allowed_building_blocks() -> Vec<String> {
-    [
-        "minecraft:dirt",
-        "minecraft:cobblestone",
-        "minecraft:stone",
-        "minecraft:deepslate",
-        "minecraft:netherrack",
-    ]
-    .into_iter()
-    .map(str::to_owned)
-    .collect()
 }
 fn default_denied_building_blocks() -> Vec<String> {
     [
@@ -361,7 +355,6 @@ impl Default for VerticalNavigationConfig {
             max_pillar_height: default_vertical_pillar_height(),
             max_dig_depth: default_vertical_dig_depth(),
             minimum_building_blocks: default_minimum_building_blocks(),
-            allowed_building_blocks: default_allowed_building_blocks(),
             denied_building_blocks: default_denied_building_blocks(),
         }
     }

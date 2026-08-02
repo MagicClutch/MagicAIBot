@@ -174,7 +174,10 @@ prefer_staircase_descent = true
 max_pillar_height = 32
 max_dig_depth = 64
 minimum_building_blocks = 4
-allowed_building_blocks = ["minecraft:dirt", "minecraft:cobblestone", "minecraft:stone", "minecraft:deepslate", "minecraft:netherrack"]
+# Building material is a deny-list, not an allow-list: the bot may use any
+# placeable block it holds except src/bridging's built-in blacklist
+# (containers, valuables, redstone, decorative blocks, crops, etc.) plus
+# anything listed here.
 denied_building_blocks = ["minecraft:diamond_block", "minecraft:chest", "minecraft:crafting_table"]
 
 [multitasking]

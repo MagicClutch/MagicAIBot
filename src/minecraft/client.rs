@@ -121,6 +121,11 @@ pub struct MinecraftClient {
     shutdown: CancellationToken,
     supervisor: Option<JoinHandle<()>>,
     inventory_actions: InventoryActionService,
+    /// Debounces [`crate::bridging::NO_SAFE_SCAFFOLD_MESSAGE`] so it logs
+    /// once when the bot runs out of usable scaffold material rather than
+    /// every `repath_interval_ms` (as often as every 150ms) while a route
+    /// needing build moves keeps resubmitting.
+    no_scaffold_warned: Arc<std::sync::atomic::AtomicBool>,
 }
 
 #[derive(Clone, Debug)]
@@ -219,6 +224,7 @@ impl MinecraftClient {
             shutdown: CancellationToken::new(),
             supervisor: None,
             inventory_actions: InventoryActionService::default(),
+            no_scaffold_warned: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         }
     }
 
@@ -1200,12 +1206,48 @@ impl MinecraftClient {
             .clone()
             .ok_or(AppError::MovementUnavailable)?;
         let allow_build = self.vertical_navigation.enabled && mode.allows_mining();
+        // Deny-list model: the bot may build with anything it holds except
+        // `crate::bridging::SCAFFOLD_BLACKLIST` (containers, valuables,
+        // redstone, decorative blocks, crops, etc.), preferring plain
+        // disposable materials when it has a choice. Computed fresh from the
+        // live hotbar on every call rather than a fixed config list, since
+        // "everything except the blacklist" is only meaningful against
+        // whatever the bot is actually carrying right now.
+        let scaffold_allowed = if allow_build {
+            client
+                .menu()
+                .ok()
+                .map(|menu| {
+                    let slots = menu.slots();
+                    let held: Vec<String> = menu
+                        .hotbar_slots_range()
+                        .filter_map(|slot| slots.get(slot))
+                        .filter(|item| !item.is_empty())
+                        .map(|item| item.kind().to_string())
+                        .collect();
+                    crate::bridging::scaffold_allow_list(held.iter().map(String::as_str))
+                })
+                .unwrap_or_default()
+        } else {
+            Vec::new()
+        };
+        if allow_build && scaffold_allowed.is_empty() {
+            if !self
+                .no_scaffold_warned
+                .swap(true, std::sync::atomic::Ordering::Relaxed)
+            {
+                logging::warning(crate::bridging::NO_SAFE_SCAFFOLD_MESSAGE);
+            }
+        } else {
+            self.no_scaffold_warned
+                .store(false, std::sync::atomic::Ordering::Relaxed);
+        }
         let mut policy = PathfindingPolicy {
             allow_pillaring: allow_build && self.vertical_navigation.allow_pillaring,
             allow_bridging: allow_build && self.vertical_navigation.allow_bridging,
             allow_staircase_building: allow_build && self.vertical_navigation.allow_digging_down,
             scaffold: ScaffoldPolicy {
-                allowed: self.vertical_navigation.allowed_building_blocks.clone(),
+                allowed: scaffold_allowed,
                 denied: self.vertical_navigation.denied_building_blocks.clone(),
                 minimum_held: self.vertical_navigation.minimum_building_blocks,
             },

@@ -1,5 +1,6 @@
 mod app;
 mod blocks;
+mod bridging;
 mod collection;
 mod config;
 mod console;
