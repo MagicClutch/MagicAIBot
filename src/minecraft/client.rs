@@ -1249,6 +1249,7 @@ impl MinecraftClient {
             allow_pillaring: allow_build && self.vertical_navigation.allow_pillaring,
             allow_bridging: allow_build && self.vertical_navigation.allow_bridging,
             allow_staircase_building: allow_build && self.vertical_navigation.allow_digging_down,
+            max_pillar_height: self.vertical_navigation.max_pillar_height,
             fast_bridge_enabled: self.bridging.fast_bridge_enabled,
             fast_bridge_edge_threshold: self.bridging.edge_threshold,
             scaffold: ScaffoldPolicy {
