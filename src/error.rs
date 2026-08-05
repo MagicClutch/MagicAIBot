@@ -18,8 +18,6 @@ pub enum AppError {
     WorldStateUnavailable,
     #[error("inventory is unavailable")]
     InventoryUnavailable,
-    #[error("recipe data unavailable: {0}")]
-    RecipeData(String),
     #[error("inventory mutation is busy")]
     InventoryBusy,
     #[error("inventory mutation was rejected: {0}")]
@@ -85,6 +83,12 @@ pub enum AppError {
     BlockSearchUnavailable,
     #[error("no matching block found")]
     NoMatchingBlock,
+    #[error("no matching mob found")]
+    NoMatchingMob,
+    #[error("unknown resource identifier: {0}")]
+    UnknownResourceIdentifier(String),
+    #[error("combat was cancelled")]
+    CombatCancelled,
     #[error("no valid approach position")]
     NoValidApproachPosition,
     #[error("target block disappeared")]

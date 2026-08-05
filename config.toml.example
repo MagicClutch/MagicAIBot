@@ -18,139 +18,20 @@ show_action_bar_messages = false
 level = "info"
 debug = false
 
-[groq]
-# Groq is the AI provider (OpenAI-compatible API).
-enabled = true
-# llama-3.1-8b-instant is Groq's fastest model that reliably supports tool
-# calling and is available on the free tier — this is the main speed lever.
-# Fallbacks only kick in on rate limits/daily caps, so they can be larger.
-model = "llama-3.1-8b-instant"
-fallback_models = ["llama-3.3-70b-versatile", "mixtral-8x7b-32768"]
-# base_url = "https://api.groq.com/openai/v1"
+# A player can run a real console command directly from Minecraft chat with
+# a `#` prefix, e.g. `#goto 100 64 20` runs exactly what `/goto 100 64 20`
+# would in the local console. `/quit` can never be run this way.
+[chat_commands]
 
-# Direct API key (preferred — do not commit this file if set here)
-# api_key = "YOUR_GROQ_API_KEY"
-
-# Optional fallback environment variable name
-api_key_env = "GROQ_API_KEY"
-request_timeout_seconds = 60
-max_request_retries = 3
-temperature = 0.1
-# Caps generation length per turn (tool call or chat reply). Lower is
-# faster; each turn only needs one tool call or one short sentence.
-max_completion_tokens = 250
-include_nearby_entities = true
-include_inventory = true
-
-[groq.limits]
-max_gather_quantity = 64
-max_mine_quantity = 64
-max_craft_quantity = 64
-max_navigation_distance = 256
-max_actions_per_session = 30
-max_replans_per_session = 8
-max_session_seconds = 600
-allow_mining = true
-allow_crafting = true
-allow_containers = true
-allow_block_placement = true
-
-[groq.rate_limits]
-respect_retry_after = true
-maximum_retry_delay_seconds = 3600
-switch_model_on_daily_limit = true
-switch_model_on_rate_limit = true
-
-[groq.context]
-max_chat_messages = 8
-max_inventory_entries = 36
-max_nearby_entities = 12
-max_nearby_blocks = 32
-max_previous_action_results = 4
-include_full_command_descriptions = true
-
-# Local AI server. Despite the section name this works for Ollama OR LM
-# Studio OR anything else exposing an OpenAI-compatible /v1/chat/completions
-# endpoint -- only base_url/model need to change. No API key needed. Set
-# [ai] provider = "ollama" above to use this instead of Groq.
-# Most small/quantized models do NOT reliably support tool calling, which
-# this whole bot depends on -- stick to models documented as tool-capable.
-#
-# Ollama (https://ollama.com): run `ollama serve`, pull a model first
-#   (`ollama pull llama3.1`), base_url = "http://localhost:11434/v1"
-# LM Studio (https://lmstudio.ai): load a model and start its local server
-#   (Developer tab -> Start Server), base_url = "http://localhost:1234/v1",
-#   model = the identifier shown in LM Studio for the loaded model
-[ollama]
-enabled = false
-base_url = "http://localhost:11434/v1"
-model = "llama3.1"
-request_timeout_seconds = 120
-max_request_retries = 1
-temperature = 0.1
-max_tokens = 250
-
-# Legacy Gemini configuration (deprecated - use [groq] instead).
-[gemini]
-enabled = false
-api_key_env = "GEMINI_API_KEY"
-model = "gemini-2.5-flash"
-request_timeout_seconds = 30
-max_request_retries = 2
-max_steps_per_session = 30
-max_session_seconds = 600
-temperature = 0.1
-include_nearby_blocks = true
-include_nearby_entities = true
-include_inventory = true
-
-[gemini.limits]
-max_gather_quantity = 64
-max_mine_quantity = 64
-max_craft_quantity = 64
-max_navigation_distance = 256
-max_actions_per_session = 30
-max_replans_per_session = 8
-max_session_seconds = 600
-allow_mining = true
-allow_crafting = true
-allow_containers = true
-allow_block_placement = true
-
-[ai]
-# "groq" (cloud, fast, free tier) or "ollama" (local, no network round trip,
-# speed depends entirely on your hardware and chosen model). Only the
-# selected provider's config section below is used.
-provider = "groq"
-busy_behavior = "reject"
-
-[ai.chat]
-enabled = true
-prefix = "!"
-# false = every player chat message is treated as an AI request, not just
-# ones starting with `prefix`. access/rate_limit below still apply, but
-# there is no way to distinguish "talking to the bot" from ambient chat
-# between other players once this is off -- expect it to respond to things
-# not meant for it, and to burn through rate limits faster on busy servers.
-require_prefix = true
-respond_in_chat = true
-accept_console_ai_command = true
-acknowledge_requests = true
-strip_prefix_whitespace = true
-max_request_length = 500
-incoming_queue_capacity = 64
-
-[ai.chat.access]
+[chat_commands.access]
 operators_only = false # Operator state is not currently exposed reliably; use lists below.
 allowed_players = []
 blocked_players = []
 
-[ai.chat.rate_limit]
+[chat_commands.rate_limit]
 enabled = true
 requests = 3
 window_seconds = 30
-# Logs stay local and are never relayed to Minecraft chat. Operation correlation
-# IDs are random diagnostics identifiers; account/session secrets are not logged.
 
 [world_state]
 nearby_entity_radius = 64
@@ -278,38 +159,3 @@ face_inset = 0.001
 edge_margin = 0.12
 maximum_face_attempts = 6
 maximum_hit_points_per_face = 5
-
-[smelting]
-station_search_radius = 32
-observation_interval_ms = 250
-confirmation_timeout_ms = 3000
-total_timeout_seconds = 300
-reopen_limit = 2
-# Inventory cleanup is deny-by-default: with no rules every item is kept.
-# Rules are evaluated deterministically; exact item rules beat tag rules and
-# the first rule wins ties. `discard` is the only authorization to drop.
-[inventory_cleanup]
-protect_rare_items = true
-protect_tools = true
-rules = []
-# Conservative loaded-world tree recognition. It never crafts, builds, climbs, or replants.
-[tree_chopping]
-allowed_tree_types = ["oak", "birch", "spruce", "jungle", "acacia", "dark_oak", "mangrove", "cherry", "pale_oak"]
-require_nearby_leaves = true
-maximum_connected_logs = 192
-maximum_tree_height = 48
-maximum_branch_distance = 12
-maximum_horizontal_logs = 48
-break_leaves = false
-collect_saplings = true
-allow_hand_chopping = false
-search_radius = 32
-maximum_trees = 16
-total_timeout_seconds = 300
-[ensure_tool]
-# Highest preference first. Unsupported or insufficient tiers are skipped.
-material_tier_preference = ["iron", "stone", "wood"]
-# A tool at or below this remaining durability is not eligible.
-durability_reserve = 10
-# Uses the existing furnace executor when a recipe dependency requires it.
-allow_smelting = false

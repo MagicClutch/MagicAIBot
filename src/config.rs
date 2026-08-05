@@ -39,15 +39,7 @@ pub struct Config {
     #[serde(default)]
     pub interaction: InteractionConfig,
     #[serde(default)]
-    pub smelting: crate::smelting::SmeltingConfig,
-    #[serde(default)]
     pub multitasking: MultitaskingConfig,
-    #[serde(default)]
-    pub inventory_cleanup: crate::inventory_cleanup::CleanupPolicy,
-    #[serde(default)]
-    pub tree_chopping: TreeChoppingConfig,
-    #[serde(default)]
-    pub ensure_tool: EnsureToolConfig,
     #[serde(default)]
     pub chat_commands: ChatCommandsConfig,
 }
@@ -58,7 +50,7 @@ pub struct Config {
 /// would in the local console -- a strictly more powerful (and more directly
 /// abusable) surface than anything else reachable from chat, so it is never
 /// less guarded than this section allows.
-#[derive(Clone, Debug, Deserialize)]
+#[derive(Clone, Debug, Default, Deserialize)]
 pub struct ChatCommandsConfig {
     #[serde(default)]
     pub access: ChatCommandsAccessConfig,
@@ -97,117 +89,6 @@ fn default_chat_command_rate_limit_requests() -> usize {
 }
 fn default_chat_command_rate_limit_window() -> u64 {
     30
-}
-impl Default for ChatCommandsConfig {
-    fn default() -> Self {
-        Self {
-            access: ChatCommandsAccessConfig::default(),
-            rate_limit: ChatCommandsRateLimitConfig::default(),
-        }
-    }
-}
-
-#[derive(Clone, Debug, Deserialize)]
-pub struct TreeChoppingConfig {
-    #[serde(default = "default_tree_types")]
-    pub allowed_tree_types: Vec<String>,
-    #[serde(default = "default_true")]
-    pub require_nearby_leaves: bool,
-    #[serde(default = "default_max_connected_logs")]
-    pub maximum_connected_logs: usize,
-    #[serde(default = "default_max_tree_height")]
-    pub maximum_tree_height: u32,
-    #[serde(default = "default_max_branch_distance")]
-    pub maximum_branch_distance: u32,
-    #[serde(default = "default_max_horizontal_logs")]
-    pub maximum_horizontal_logs: usize,
-    #[serde(default)]
-    pub break_leaves: bool,
-    #[serde(default = "default_true")]
-    pub collect_saplings: bool,
-    #[serde(default)]
-    pub allow_hand_chopping: bool,
-    #[serde(default = "default_tree_search_radius")]
-    pub search_radius: u32,
-    #[serde(default = "default_maximum_trees")]
-    pub maximum_trees: u32,
-    #[serde(default = "default_tree_timeout")]
-    pub total_timeout_seconds: u64,
-}
-fn default_tree_types() -> Vec<String> {
-    [
-        "oak", "birch", "spruce", "jungle", "acacia", "dark_oak", "mangrove", "cherry", "pale_oak",
-    ]
-    .into_iter()
-    .map(str::to_owned)
-    .collect()
-}
-fn default_max_connected_logs() -> usize {
-    192
-}
-fn default_max_tree_height() -> u32 {
-    48
-}
-fn default_max_branch_distance() -> u32 {
-    12
-}
-fn default_max_horizontal_logs() -> usize {
-    48
-}
-fn default_tree_search_radius() -> u32 {
-    32
-}
-fn default_maximum_trees() -> u32 {
-    16
-}
-fn default_tree_timeout() -> u64 {
-    300
-}
-impl Default for TreeChoppingConfig {
-    fn default() -> Self {
-        Self {
-            allowed_tree_types: default_tree_types(),
-            require_nearby_leaves: true,
-            maximum_connected_logs: default_max_connected_logs(),
-            maximum_tree_height: default_max_tree_height(),
-            maximum_branch_distance: default_max_branch_distance(),
-            maximum_horizontal_logs: default_max_horizontal_logs(),
-            break_leaves: false,
-            collect_saplings: true,
-            allow_hand_chopping: false,
-            search_radius: default_tree_search_radius(),
-            maximum_trees: default_maximum_trees(),
-            total_timeout_seconds: default_tree_timeout(),
-        }
-    }
-}
-
-#[derive(Clone, Debug, Deserialize)]
-pub struct EnsureToolConfig {
-    #[serde(default = "default_tool_tiers")]
-    pub material_tier_preference: Vec<String>,
-    #[serde(default = "default_tool_reserve")]
-    pub durability_reserve: u32,
-    #[serde(default)]
-    pub allow_smelting: bool,
-}
-fn default_tool_tiers() -> Vec<String> {
-    ["iron", "stone", "wood"]
-        .into_iter()
-        .map(str::to_owned)
-        .collect()
-}
-fn default_tool_reserve() -> u32 {
-    10
-}
-impl Default for EnsureToolConfig {
-    fn default() -> Self {
-        Self {
-            material_tier_preference: default_tool_tiers(),
-            durability_reserve: default_tool_reserve(),
-            allow_smelting: false,
-        }
-    }
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -1061,27 +942,6 @@ impl Config {
         {
             return Err(AppError::InvalidInteractionConfiguration(
                 "reach, retry, or verification values are invalid".into(),
-            ));
-        }
-        let tree = &self.tree_chopping;
-        if tree.allowed_tree_types.is_empty()
-            || tree.maximum_connected_logs == 0
-            || tree.maximum_connected_logs > 4096
-            || tree.maximum_tree_height == 0
-            || tree.maximum_tree_height > 128
-            || tree.maximum_branch_distance == 0
-            || tree.maximum_branch_distance > 32
-            || tree.maximum_horizontal_logs == 0
-            || tree.maximum_horizontal_logs > tree.maximum_connected_logs
-            || tree.search_radius == 0
-            || tree.search_radius > self.block_search.maximum_radius
-            || tree.maximum_trees == 0
-            || tree.maximum_trees > 128
-            || tree.total_timeout_seconds == 0
-            || tree.total_timeout_seconds > 3600
-        {
-            return Err(AppError::InvalidConfiguration(
-                "tree_chopping limits or allowed_tree_types are invalid".into(),
             ));
         }
         let chat_commands = &self.chat_commands;

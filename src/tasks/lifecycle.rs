@@ -2,10 +2,6 @@
 //! task-orchestration layer -- there isn't one; `InteractionController` uses
 //! these as its own internal error/identity types.
 
-use std::fmt;
-
-use uuid::Uuid;
-
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum Invalidation {
     TargetChanged,
@@ -45,26 +41,6 @@ pub enum ActionFailure {
     Internal(String),
 }
 
-#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
-pub struct OperationId(Uuid);
-
-impl OperationId {
-    pub fn new() -> Self {
-        Self(Uuid::new_v4())
-    }
-}
-
-impl Default for OperationId {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-impl fmt::Display for OperationId {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        self.0.fmt(f)
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -98,13 +74,5 @@ mod tests {
             assert_eq!(failure.clone(), failure);
             assert!(!failure.to_string().is_empty());
         }
-    }
-
-    #[test]
-    fn operation_ids_are_unique_and_displayable() {
-        let a = OperationId::new();
-        let b = OperationId::new();
-        assert_ne!(a, b);
-        assert!(!a.to_string().is_empty());
     }
 }

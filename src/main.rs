@@ -1,26 +1,18 @@
 mod app;
 mod blocks;
 mod bridging;
-mod collection;
 mod config;
 mod console;
 mod container;
-mod crafting;
 mod error;
-mod food;
 mod interaction;
-mod inventory;
-mod inventory_cleanup;
 mod logging;
 mod look;
 pub mod minecraft;
+mod mobs;
 mod movement;
 mod navigation;
-mod processing;
-mod skills;
-mod smelting;
 mod tasks;
-mod tree_chopping;
 
 fn main() -> Result<(), anyhow::Error> {
     // Azalea's connection/bootstrap path can temporarily use more stack than

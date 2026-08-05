@@ -18,14 +18,6 @@ pub enum ConsoleCommand {
     Players,
     Inventory,
     ObservedContainerStatus,
-    Recipe {
-        id: String,
-    },
-    CraftCheck {
-        item: String,
-        count: u32,
-        depth: usize,
-    },
     Entities {
         radius: Option<u32>,
     },
@@ -61,6 +53,10 @@ pub enum ConsoleCommand {
     },
     GotoBlockStatus,
     CancelGotoBlock,
+    GetResource {
+        resource_id: String,
+        amount: u32,
+    },
     Look {
         x: i32,
         y: i32,
@@ -106,17 +102,8 @@ pub enum ConsoleCommand {
     },
     StopInteraction,
     InteractionStatus,
-    Craft {
-        target: String,
-        count: u32,
-    },
-    CraftStatus,
-    CraftStop,
     Equip {
         item: String,
-    },
-    EnsureTool {
-        block_id: String,
     },
     TestOakLog,
     OpenChest {
@@ -179,10 +166,6 @@ pub fn parse_input(input: &str) -> Result<ConsoleInput, AppError> {
         "containerstatus" => {
             no_arguments(command, arguments, ConsoleCommand::ObservedContainerStatus)?
         }
-        "recipe" => ConsoleCommand::Recipe {
-            id: normalize_item_id(single_argument(command, arguments, "/recipe <recipe_id>")?)?,
-        },
-        "craft-check" => parse_craft_check(arguments)?,
         "entities" => {
             let radius = if arguments.is_empty() {
                 None
@@ -227,6 +210,7 @@ pub fn parse_input(input: &str) -> Result<ConsoleInput, AppError> {
         "gotoblock" | "navigate-to-block" => parse_goto_block(arguments)?,
         "gotoblockstatus" => no_arguments(command, arguments, ConsoleCommand::GotoBlockStatus)?,
         "cancelgotoblock" => no_arguments(command, arguments, ConsoleCommand::CancelGotoBlock)?,
+        "get" => parse_get(arguments)?,
         "look" | "lookat" => {
             let position = parse_coordinates(arguments)?;
             ConsoleCommand::Look {
@@ -279,16 +263,8 @@ pub fn parse_input(input: &str) -> Result<ConsoleInput, AppError> {
         "interact" => parse_interact(arguments)?,
         "stopinteraction" => no_arguments(command, arguments, ConsoleCommand::StopInteraction)?,
         "interactionstatus" => no_arguments(command, arguments, ConsoleCommand::InteractionStatus)?,
-        "craft" => parse_craft(arguments)?,
         "equip" => ConsoleCommand::Equip {
             item: normalize_item_id(single_argument(command, arguments, "/equip <item>")?)?,
-        },
-        "ensure-tool" | "craft-tool" => ConsoleCommand::EnsureTool {
-            block_id: normalize_block_id(single_argument(
-                command,
-                arguments,
-                "/ensure-tool <block_id>",
-            )?)?,
         },
         "testoaklog" => no_arguments(command, arguments, ConsoleCommand::TestOakLog)?,
         "open-chest" => {
@@ -332,62 +308,6 @@ fn normalize_item_id(value: &str) -> Result<String, AppError> {
         value.to_ascii_lowercase()
     } else {
         format!("minecraft:{}", value.to_ascii_lowercase())
-    })
-}
-
-fn parse_craft_check(arguments: &str) -> Result<ConsoleCommand, AppError> {
-    let parts: Vec<_> = arguments.split_whitespace().collect();
-    if !(1..=3).contains(&parts.len()) {
-        return Err(AppError::InvalidConsoleSyntax(
-            "/craft-check <item> [count] [depth]".into(),
-        ));
-    }
-    let count = parts
-        .get(1)
-        .map_or(Ok(1), |v| v.parse::<u32>())
-        .map_err(|_| {
-            AppError::InvalidConsoleSyntax("craft count must be a positive integer".into())
-        })?;
-    let depth = parts
-        .get(2)
-        .map_or(Ok(8), |v| v.parse::<usize>())
-        .map_err(|_| AppError::InvalidConsoleSyntax("depth must be an integer".into()))?;
-    if count == 0 || depth == 0 || depth > 64 {
-        return Err(AppError::InvalidConsoleSyntax(
-            "count must be positive and depth must be 1..=64".into(),
-        ));
-    }
-    Ok(ConsoleCommand::CraftCheck {
-        item: normalize_item_id(parts[0])?,
-        count,
-        depth,
-    })
-}
-
-fn parse_craft(arguments: &str) -> Result<ConsoleCommand, AppError> {
-    let parts: Vec<_> = arguments.split_whitespace().collect();
-    match parts.as_slice() {
-        ["status"] => Ok(ConsoleCommand::CraftStatus),
-        ["stop"] => Ok(ConsoleCommand::CraftStop),
-        [target] => Ok(ConsoleCommand::Craft {
-            target: normalize_item_id(target)?,
-            count: 1,
-        }),
-        [target, count] => Ok(ConsoleCommand::Craft {
-            target: normalize_item_id(target)?,
-            count: count.parse().map_err(|_| {
-                AppError::InvalidConsoleSyntax("/craft <item> [positive-count]".into())
-            })?,
-        }),
-        _ => Err(AppError::InvalidConsoleSyntax(
-            "/craft <item> [count], /craft status, or /craft stop".into(),
-        )),
-    }
-    .and_then(|command| match command {
-        ConsoleCommand::Craft { count: 0, .. } => Err(AppError::InvalidConsoleSyntax(
-            "craft count must be positive".into(),
-        )),
-        other => Ok(other),
     })
 }
 
@@ -606,6 +526,51 @@ fn parse_goto_block(arguments: &str) -> Result<ConsoleCommand, AppError> {
     })
 }
 
+/// Universal Baritone-style resource gathering: `/get <block_id> <amount>`
+/// (also reachable from Minecraft chat as `#get <block_id> <amount>` through
+/// the existing `#`-prefixed chat-to-console forwarding). `block_id` accepts
+/// any block registered in `azalea::registry::builtin::BlockKind` -- there is
+/// no hardcoded whitelist here, `normalize_block_id` already validates
+/// against the full registry.
+/// Universal Baritone-style resource gathering: `/get <resource> <amount>`
+/// (also reachable from Minecraft chat as `#get <resource> <amount>` through
+/// the existing `#`-prefixed chat-to-console forwarding). `resource` accepts
+/// either any block registered in `azalea::registry::builtin::BlockKind`, or
+/// any item known to be a mob drop via `crate::mobs::drops` -- there is no
+/// hardcoded block whitelist, and the mob-drop table is the single place new
+/// mobs/drops get added. `crate::mobs::resolve_resource` is the shared
+/// block-or-mob decision also used at dispatch time by
+/// `App::run_get_resource`.
+fn parse_get(arguments: &str) -> Result<ConsoleCommand, AppError> {
+    const USAGE: &str = "/get <resource> <amount>";
+    let mut parts = arguments.split_whitespace();
+    let resource = parts
+        .next()
+        .ok_or_else(|| AppError::MissingConsoleArgument(USAGE.into()))?;
+    let amount_raw = parts
+        .next()
+        .ok_or_else(|| AppError::MissingConsoleArgument(USAGE.into()))?;
+    let amount: u32 = amount_raw
+        .parse()
+        .map_err(|_| AppError::InvalidConsoleSyntax("amount must be a positive integer".into()))?;
+    if amount == 0 {
+        return Err(AppError::InvalidConsoleSyntax(
+            "amount must be greater than zero".into(),
+        ));
+    }
+    if parts.next().is_some() {
+        return Err(AppError::InvalidConsoleSyntax(USAGE.into()));
+    }
+    let resource_id = match crate::mobs::resolve_resource(resource)? {
+        crate::mobs::ResourceKind::Block(id) => id,
+        crate::mobs::ResourceKind::Mob { resource_id, .. } => resource_id,
+    };
+    Ok(ConsoleCommand::GetResource {
+        resource_id,
+        amount,
+    })
+}
+
 fn no_arguments(
     command: &str,
     arguments: &str,
@@ -640,25 +605,6 @@ fn single_argument<'a>(
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn parses_read_only_crafting_commands() {
-        assert_eq!(
-            parse_input("/recipe stick").unwrap(),
-            ConsoleInput::Command(ConsoleCommand::Recipe {
-                id: "minecraft:stick".into()
-            })
-        );
-        assert_eq!(
-            parse_input("/craft-check minecraft:torch 5 4").unwrap(),
-            ConsoleInput::Command(ConsoleCommand::CraftCheck {
-                item: "minecraft:torch".into(),
-                count: 5,
-                depth: 4
-            })
-        );
-        assert!(parse_input("/craft-check torch 0").is_err());
-    }
 
     #[test]
     fn parses_empty_input() {
@@ -701,26 +647,6 @@ mod tests {
                 message: "hello".to_owned()
             })
         );
-    }
-
-    #[test]
-    fn parses_crafting_debug_commands() {
-        assert_eq!(
-            parse_input("/craft stick 4").unwrap(),
-            ConsoleInput::Command(ConsoleCommand::Craft {
-                target: "minecraft:stick".into(),
-                count: 4
-            })
-        );
-        assert_eq!(
-            parse_input("/craft status").unwrap(),
-            ConsoleInput::Command(ConsoleCommand::CraftStatus)
-        );
-        assert_eq!(
-            parse_input("/craft stop").unwrap(),
-            ConsoleInput::Command(ConsoleCommand::CraftStop)
-        );
-        assert!(parse_input("/craft stick 0").is_err());
     }
 
     #[test]
@@ -1006,21 +932,80 @@ mod tests {
     }
 
     #[test]
-    fn craft_count_defaults_to_one() {
+    fn parses_get_resource_command() {
         assert_eq!(
-            parse_input("/craft minecraft:furnace").unwrap(),
-            ConsoleInput::Command(ConsoleCommand::Craft {
-                target: "minecraft:furnace".into(),
-                count: 1
+            parse_input("/get diamond_ore 15").unwrap(),
+            ConsoleInput::Command(ConsoleCommand::GetResource {
+                resource_id: "minecraft:diamond_ore".into(),
+                amount: 15,
             })
         );
         assert_eq!(
-            parse_input("/craft minecraft:furnace 2").unwrap(),
-            ConsoleInput::Command(ConsoleCommand::Craft {
-                target: "minecraft:furnace".into(),
-                count: 2
+            parse_input("/get minecraft:oak_log 10").unwrap(),
+            ConsoleInput::Command(ConsoleCommand::GetResource {
+                resource_id: "minecraft:oak_log".into(),
+                amount: 10,
             })
         );
+    }
+
+    #[test]
+    fn parses_get_resource_command_for_mob_drops() {
+        assert_eq!(
+            parse_input("/get leather 10").unwrap(),
+            ConsoleInput::Command(ConsoleCommand::GetResource {
+                resource_id: "minecraft:leather".into(),
+                amount: 10,
+            })
+        );
+        assert_eq!(
+            parse_input("/get porkchop 16").unwrap(),
+            ConsoleInput::Command(ConsoleCommand::GetResource {
+                resource_id: "minecraft:porkchop".into(),
+                amount: 16,
+            })
+        );
+        // A wool color is also a real block id, but resolves through the
+        // mob-drop table (sheep) -- see `mobs::resolve_resource`.
+        assert_eq!(
+            parse_input("/get white_wool 20").unwrap(),
+            ConsoleInput::Command(ConsoleCommand::GetResource {
+                resource_id: "minecraft:white_wool".into(),
+                amount: 20,
+            })
+        );
+    }
+
+    #[test]
+    fn rejects_invalid_get_resource_arguments() {
+        assert!(matches!(
+            parse_input("/get"),
+            Err(AppError::MissingConsoleArgument(_))
+        ));
+        assert!(matches!(
+            parse_input("/get diamond_ore"),
+            Err(AppError::MissingConsoleArgument(_))
+        ));
+        assert!(matches!(
+            parse_input("/get diamond_ore 0"),
+            Err(AppError::InvalidConsoleSyntax(_))
+        ));
+        assert!(matches!(
+            parse_input("/get diamond_ore -5"),
+            Err(AppError::InvalidConsoleSyntax(_))
+        ));
+        assert!(matches!(
+            parse_input("/get diamond_ore abc"),
+            Err(AppError::InvalidConsoleSyntax(_))
+        ));
+        assert!(matches!(
+            parse_input("/get diamond_ore 15 extra"),
+            Err(AppError::InvalidConsoleSyntax(_))
+        ));
+        assert!(matches!(
+            parse_input("/get not_a_real_thing 5"),
+            Err(AppError::UnknownResourceIdentifier(_))
+        ));
     }
 
     #[test]

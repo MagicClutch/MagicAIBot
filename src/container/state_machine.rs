@@ -1,19 +1,10 @@
 use super::model::*;
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Default)]
 pub struct ContainerMachine {
     pub status: ContainerStatus,
     owned: bool,
     expected_revision: Option<u32>,
-}
-impl Default for ContainerMachine {
-    fn default() -> Self {
-        Self {
-            status: ContainerStatus::default(),
-            owned: false,
-            expected_revision: None,
-        }
-    }
 }
 impl ContainerMachine {
     pub fn begin(

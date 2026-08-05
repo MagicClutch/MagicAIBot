@@ -17,12 +17,6 @@ use crate::{
     movement::{NavigationMode, logger},
 };
 
-/// Azalea starts path calculation asynchronously. Immediately after
-/// `start_goto_with_opts` its status can still describe the previous goal (or
-/// report no active calculation at all), so do not reject a freshly submitted
-/// destination until the pathfinder has had a chance to observe it.
-const PATHFINDER_STARTUP_GRACE: Duration = Duration::from_secs(2);
-
 #[derive(Clone)]
 pub struct MovementService {
     config: MovementConfig,
@@ -32,6 +26,7 @@ pub struct MovementService {
     suppress_terminal_log: Arc<Mutex<bool>>,
     navigation_mode: Arc<Mutex<NavigationMode>>,
     last_goal_submission: Arc<Mutex<Option<SystemTime>>>,
+    last_goal_destination: Arc<Mutex<Option<PositionSnapshot>>>,
 }
 
 impl MovementService {
@@ -44,6 +39,7 @@ impl MovementService {
             suppress_terminal_log: Arc::new(Mutex::new(false)),
             navigation_mode: Arc::new(Mutex::new(NavigationMode::MovementOnly)),
             last_goal_submission: Arc::new(Mutex::new(None)),
+            last_goal_destination: Arc::new(Mutex::new(None)),
         }
     }
     pub async fn snapshot(&self) -> MovementSnapshot {
@@ -102,6 +98,7 @@ impl MovementService {
             .start_navigation_to(destination, None, mode)
             .await?;
         *self.last_goal_submission.lock().await = Some(SystemTime::now());
+        *self.last_goal_destination.lock().await = Some(destination);
         if log_start {
             logger::going_to(destination);
         }
@@ -150,6 +147,7 @@ impl MovementService {
             .await?;
         *self.navigation_mode.lock().await = NavigationMode::AllowMining;
         *self.last_goal_submission.lock().await = Some(SystemTime::now());
+        *self.last_goal_destination.lock().await = Some(destination);
         logger::following(&player.username);
         self.replace_and_publish(
             minecraft,
@@ -240,28 +238,62 @@ impl MovementService {
         follow_distance: Option<f64>,
         mode: NavigationMode,
     ) -> Result<(), AppError> {
-        if !self.goal_resubmission_due().await {
+        let status = minecraft.navigation_status().await;
+        // Never resubmit while a build move's placement or mining action is
+        // physically in flight (a server round-trip is pending), no matter
+        // how much the destination has changed -- see
+        // `NavigationStatus::mid_build_action`'s doc comment. This has to be
+        // checked unconditionally, before the destination-drift check below:
+        // `/follow` re-reads the target player's live position every tick, so
+        // the destination is essentially always "changed" by some amount
+        // while chasing a moving player, which would otherwise bypass every
+        // other guard here on nearly every tick and tear down an in-progress
+        // pillar/bridge step the instant the tracked player so much as
+        // breathes -- reintroducing the same endless place/break oscillation
+        // these guards exist to prevent, just reachable through `/follow`
+        // instead of a static `/goto` (typically once the target is far
+        // enough away that reaching them needs a build move at all, e.g.
+        // crossing a gap or climbing to catch up).
+        if status.as_ref().is_ok_and(|status| status.mid_build_action) {
             return Ok(());
         }
-        // A new goto event replaces (and cancels) Azalea's in-flight
-        // background path computation -- see `goto_listener`'s `ComputePath`
-        // component replacement in the vendored pathfinder. Resubmitting on
-        // this fixed `repath_interval_ms` timer (as short as 150ms by
-        // default) while a longer search is still running -- a distant
-        // target, or one that needs the more expensive build-move successors
-        // (pillar/bridge/staircase) -- would keep restarting that search
-        // forever without ever letting it finish, so the bot never gets a
-        // new route and appears stuck. Skip resubmission while a
-        // calculation is already in progress; it always resolves within
-        // Azalea's own `max_timeout` (5s by default) even in the worst case,
-        // so this can't itself introduce a stall, and the very next repath
-        // tick after it finishes resubmits with the latest destination.
-        if minecraft
-            .navigation_status()
-            .await
-            .is_ok_and(|status| status.calculating)
-        {
-            return Ok(());
+        // Beyond that immediate in-flight check, only a genuinely meaningful
+        // move -- more than a stride between repath ticks -- counts as
+        // "changed" enough to justify redirecting toward a still-executing
+        // route; a static `/goto` destination never moves at all, so it
+        // always compares as unchanged here regardless of the threshold.
+        const GOAL_DRIFT_TOLERANCE: f64 = 1.5;
+        let destination_changed = {
+            let mut last = self.last_goal_destination.lock().await;
+            let changed =
+                last.is_none_or(|previous| distance(previous, destination) > GOAL_DRIFT_TOLERANCE);
+            *last = Some(destination);
+            changed
+        };
+        if !destination_changed {
+            if !self.goal_resubmission_due().await {
+                return Ok(());
+            }
+            // A new goto event replaces (and cancels) Azalea's in-flight
+            // background path computation -- see `goto_listener`'s `ComputePath`
+            // component replacement in the vendored pathfinder. Resubmitting on
+            // this fixed `repath_interval_ms` timer (as short as 150ms by
+            // default) while a longer search is still running -- a distant
+            // target, or one that needs the more expensive build-move successors
+            // (pillar/bridge/staircase) -- would keep restarting that search
+            // forever without ever letting it finish, so the bot never gets a
+            // new route and appears stuck. The same is true once a route *is*
+            // executing: skip resubmission while a calculation is already in
+            // progress or a path is already executing toward this same,
+            // unchanged destination; Azalea's own `max_timeout` (5s by
+            // default) bounds calculation, and
+            // `maximum_navigation_seconds`/`stuck_timeout_seconds` bound a
+            // stalled execution, so this can't itself introduce an unbounded
+            // stall -- it only stops us from interrupting progress that is
+            // already being made.
+            if status.is_ok_and(|status| status.calculating || status.executing) {
+                return Ok(());
+            }
         }
         minecraft
             .start_navigation_to(destination, follow_distance, mode)
@@ -412,34 +444,5 @@ impl MovementService {
         let travel_yaw = (-dx).atan2(dz).to_degrees() as f32;
         *self.local_input.lock().await =
             local_input_for_direction(travel_yaw, camera_yaw, explicit_look, &self.multitasking);
-    }
-}
-
-fn pathfinder_startup_grace_elapsed(snapshot: &MovementSnapshot) -> bool {
-    snapshot
-        .started_at
-        .is_none_or(|started| started.elapsed().unwrap_or_default() >= PATHFINDER_STARTUP_GRACE)
-}
-
-#[cfg(test)]
-mod startup_tests {
-    use super::*;
-
-    #[test]
-    fn waits_for_fresh_pathfinder_goal_to_start() {
-        let snapshot = MovementSnapshot {
-            started_at: Some(SystemTime::now()),
-            ..MovementSnapshot::default()
-        };
-        assert!(!pathfinder_startup_grace_elapsed(&snapshot));
-    }
-
-    #[test]
-    fn eventually_treats_inactive_pathfinder_as_failure() {
-        let snapshot = MovementSnapshot {
-            started_at: Some(SystemTime::now() - PATHFINDER_STARTUP_GRACE),
-            ..MovementSnapshot::default()
-        };
-        assert!(pathfinder_startup_grace_elapsed(&snapshot));
     }
 }

@@ -117,6 +117,19 @@ impl LookController {
     pub async fn snapshot(&self) -> LookSnapshot {
         self.inner.lock().await.snapshot.clone()
     }
+    /// Whether this controller is currently driving (or still correcting) a
+    /// precise interaction aim and must therefore keep being ticked
+    /// regardless of what the pathfinder is doing -- see [`keeps_ticking`].
+    /// `LookSnapshot::precision` alone is not enough to answer this: it is
+    /// only ever replaced by the next `look_at_with_precision` call, never
+    /// cleared by `cancel()`/`release_precise()`, so it keeps reporting
+    /// whatever precision the *last* look used even long after that look
+    /// finished -- checking it without also checking `state` would treat
+    /// every tick after any past precise interaction as still precise.
+    pub async fn is_precise_active(&self) -> bool {
+        let inner = self.inner.lock().await;
+        keeps_ticking(inner.snapshot.state, inner.snapshot.precision)
+    }
     pub async fn look_at(
         &self,
         minecraft: &MinecraftClient,
@@ -231,14 +244,28 @@ impl LookController {
         Ok(true)
     }
     pub async fn tick(&self, minecraft: &MinecraftClient) {
-        let generation = {
+        let (generation, already_completed) = {
             let inner = self.inner.lock().await;
-            if inner.snapshot.state != LookState::Looking {
+            if !keeps_ticking(inner.snapshot.state, inner.snapshot.precision) {
                 return;
             }
-            inner.snapshot.generation
+            (
+                inner.snapshot.generation,
+                inner.snapshot.state == LookState::Completed,
+            )
         };
         if let Err(error) = self.tick_generation(minecraft, generation).await {
+            if already_completed {
+                // This generation already reached its target once and is
+                // only still ticking to hold the aim steady during mining
+                // (see `keeps_ticking`). The interaction controller is about
+                // to call `release_precise` the moment it observes the same
+                // world change (e.g. the target block finally breaking) --
+                // that is success, not failure, so don't overwrite a
+                // completed look with `Failed` or log a misleading warning
+                // for it.
+                return;
+            }
             self.fail(generation, error.to_string()).await;
             logging::warning(format!("Look failed: {error}"));
         }
@@ -251,7 +278,8 @@ impl LookController {
     ) -> Result<(), AppError> {
         let (target, precision) = {
             let inner = self.inner.lock().await;
-            if inner.snapshot.generation != generation || inner.snapshot.state != LookState::Looking
+            if inner.snapshot.generation != generation
+                || !keeps_ticking(inner.snapshot.state, inner.snapshot.precision)
             {
                 return Err(AppError::LookCancelled);
             }
@@ -380,8 +408,19 @@ impl LookController {
         inner.snapshot.pitch_speed = Some(pitch_speed.abs());
         inner.snapshot.target_point = Some(aim_label);
         if completed {
+            // Edge-triggered: a `Precise` target keeps ticking (and
+            // therefore keeps recomputing `completed = true`) for as long as
+            // the caller holds it, well past the moment it first reached the
+            // target -- see `keeps_ticking`'s doc comment. Logging
+            // unconditionally here used to print "Rotation completed" on
+            // every single tick for the entire hold duration of any caller
+            // that holds a precise look for a while. Only the first tick
+            // that reaches it is newsworthy.
+            let already_completed = inner.snapshot.state == LookState::Completed;
             inner.snapshot.state = LookState::Completed;
-            logging::success("Rotation completed");
+            if !already_completed {
+                logging::success("Rotation completed");
+            }
         }
         Ok(())
     }
@@ -392,6 +431,23 @@ impl LookController {
             inner.snapshot.failure_reason = Some(reason);
         }
     }
+}
+
+/// Whether the controller should still be actively re-aiming this tick.
+/// Ordinarily ticking stops the moment a look reaches `Completed` -- correct
+/// for a one-shot `/look`, which is done at that point. A precise
+/// interaction target (block-breaking, placing, tilling) is different: the
+/// caller keeps mining/interacting for as long as it likes *after* seeing
+/// this controller reach `Completed` once, and nothing else re-derives the
+/// yaw/pitch needed to stay on the exact hit point during that whole time.
+/// Without this, any movement correction while mining (a knockback tick, a
+/// stumble on uneven terrain) leaves the camera frozen at a stale rotation
+/// that no longer points at the block at all -- so a `Precise` target keeps
+/// ticking (and therefore keeps correcting for drift) past `Completed`,
+/// until the caller cancels or replaces it.
+fn keeps_ticking(state: LookState, precision: Option<LookPrecision>) -> bool {
+    state == LookState::Looking
+        || (state == LookState::Completed && precision == Some(LookPrecision::Precise))
 }
 
 #[derive(Clone)]

@@ -26,8 +26,11 @@ use azalea::{
         metadata::{Health, Item, ItemItem},
     },
     pathfinder::{
-        PathfinderClientExt, PathfinderOpts, custom_state::CustomPathfinderState,
-        goals::RadiusGoal, moves::combined_move, policy::PathfindingPolicy,
+        PathfinderClientExt, PathfinderOpts,
+        custom_state::CustomPathfinderState,
+        goals::RadiusGoal,
+        moves::{Placing, combined_move},
+        policy::PathfindingPolicy,
         vertical::ScaffoldPolicy,
     },
     player::GameProfileComponent,
@@ -143,6 +146,19 @@ pub struct NavigationStatus {
     pub calculating: bool,
     pub executing: bool,
     pub reached: bool,
+    /// A block placement or mining action dispatched by the pathfinder's own
+    /// build moves (pillaring, bridging, staircasing) is physically in
+    /// flight -- a server round-trip is pending, not just plain walking.
+    /// Resubmitting a goal here (a fresh `GotoEvent`) is not guarded by
+    /// Azalea's own `Placing`/`Mining` timeout carve-outs the way its
+    /// internal path-patching is; it always tears down and restarts
+    /// planning, which would cancel the action mid-sequence and, if a new
+    /// goal keeps arriving before the current step ever finishes, prevent
+    /// the build move from ever completing at all. Callers that periodically
+    /// refresh a destination (`/goto`, and especially `/follow`, where the
+    /// destination itself keeps moving) must not resubmit while this is
+    /// true, regardless of how much the destination has changed.
+    pub mid_build_action: bool,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -378,17 +394,6 @@ impl MinecraftClient {
             .set_incoming_player_chat_capacity(capacity);
     }
 
-    pub(crate) async fn block_id_at(
-        &self,
-        position: BlockPosition,
-    ) -> Result<Option<String>, AppError> {
-        Ok(self
-            .block_ids_at(&[position])
-            .await?
-            .remove(&position)
-            .flatten())
-    }
-
     pub(crate) async fn scan_loaded_blocks(
         &self,
         query: &BlockSearchQuery,
@@ -550,42 +555,6 @@ impl MinecraftClient {
         Ok(result)
     }
 
-    /// Reads the exact block kind and its generated property map while the
-    /// chunk read lock is held. A missing entry means the observation is not
-    /// reliable enough to act on.
-    pub(crate) async fn block_state_at(
-        &self,
-        position: BlockPosition,
-    ) -> Result<Option<(String, HashMap<String, String>)>, AppError> {
-        if self.connection_state() != ConnectionState::Connected {
-            return Err(AppError::BlockSearchCancelled);
-        }
-        let client = self
-            .current_client
-            .lock()
-            .await
-            .clone()
-            .ok_or(AppError::BlockSearchUnavailable)?;
-        let world = client
-            .world()
-            .map_err(|e| AppError::WorldStateUpdateFailure(e.to_string()))?;
-        let guard = world.read();
-        let Some(state) =
-            guard.get_block_state(azalea::BlockPos::new(position.x, position.y, position.z))
-        else {
-            return Ok(None);
-        };
-        let block = state.to_trait();
-        Ok(Some((
-            format!("minecraft:{}", block.id()),
-            block
-                .property_map()
-                .into_iter()
-                .map(|(k, v)| (k.to_owned(), v.to_owned()))
-                .collect(),
-        )))
-    }
-
     pub(crate) async fn look_data(&self) -> Result<([f64; 3], f32, f32), AppError> {
         let client = self
             .current_client
@@ -634,6 +603,32 @@ impl MinecraftClient {
                 }
             })
             .map_err(|_| AppError::LookTargetDisappeared)
+    }
+
+    /// Dispatches Azalea's attack packet at a tracked entity, identified by
+    /// its Minecraft entity id (the same id `EntitySnapshot::entity_id`
+    /// exposes). Reuses `entity_id_by_minecraft_id` exactly like
+    /// `entity_hitbox` above to resolve the live ECS entity, then
+    /// `azalea::Client::attack`, which does not itself perform any
+    /// range/visibility check -- callers are expected to have already
+    /// confirmed reach (see `mobs::combat::CombatController`) and to have
+    /// looked at the target, the same division of responsibility
+    /// `interact_block` has with its callers.
+    pub(crate) async fn attack_entity(&self, entity_id: u32) -> Result<(), AppError> {
+        let client = self
+            .current_client
+            .lock()
+            .await
+            .clone()
+            .ok_or(AppError::MovementUnavailable)?;
+        let Some(entity) = client
+            .entity_id_by_minecraft_id(MinecraftEntityId(entity_id as i32))
+            .map_err(|error| AppError::LookUnavailableWithReason(error.to_string()))?
+        else {
+            return Err(AppError::LookTargetDisappeared);
+        };
+        client.attack(entity);
+        Ok(())
     }
 
     pub(crate) async fn player_hitbox(&self, uuid: uuid::Uuid) -> Result<HitboxSnapshot, AppError> {
@@ -795,54 +790,6 @@ impl MinecraftClient {
         }))
     }
 
-    /// Maps whichever menu is currently active (the always-open player
-    /// inventory, or an external crafting-table window) into slots usable by
-    /// live crafting execution. Unlike [`Self::chest_menu_snapshot`], this
-    /// never returns `None` for the player's own inventory -- window id 0
-    /// with no `container_menu` is exactly the "player menu is active" state.
-    pub(crate) async fn crafting_menu_snapshot(
-        &self,
-    ) -> Result<crate::crafting::CraftingMenuSnapshot, AppError> {
-        use azalea::inventory::item::MaxStackSizeExt;
-        let client = self
-            .current_client
-            .lock()
-            .await
-            .clone()
-            .ok_or(AppError::InventoryUnavailable)?;
-        let inventory = client
-            .component::<Inventory>()
-            .map_err(|_| AppError::InventoryUnavailable)?;
-        let menu = client.menu().map_err(|_| AppError::InventoryUnavailable)?;
-        let (result_slot, inventory_slots): (usize, Vec<usize>) = match &menu {
-            azalea::inventory::Menu::Player(_) => (0, (9..45).collect()),
-            azalea::inventory::Menu::Crafting { .. } => (0, (10..46).collect()),
-            _ => return Err(AppError::InventoryUnavailable),
-        };
-        let map = |item: &azalea::inventory::ItemStack| {
-            item.as_present()
-                .map(|item| crate::container::model::StackSnapshot {
-                    item_id: item.kind.to_string(),
-                    count: item.count.max(0) as u32,
-                    max_count: item.kind.max_stack_size().max(1) as u32,
-                })
-        };
-        let slots: Vec<_> = menu.slots().iter().map(map).collect();
-        let result = slots
-            .get(result_slot)
-            .cloned()
-            .flatten()
-            .map(|s| (s.item_id, s.count));
-        Ok(crate::crafting::CraftingMenuSnapshot {
-            window_id: inventory.id,
-            revision: inventory.state_id,
-            result_slot,
-            inventory_slots,
-            slots,
-            result,
-        })
-    }
-
     pub(crate) async fn container_click(
         &self,
         window_id: i32,
@@ -885,31 +832,6 @@ impl MinecraftClient {
         Ok(())
     }
 
-    /// Reads whatever the inventory cursor is currently "holding" between
-    /// clicks (`Inventory::carried`). A left-click pickup/place can leave
-    /// this non-empty if the destination couldn't take the full stack (e.g.
-    /// hit its max stack size) -- callers doing multi-click sequences (like
-    /// `move_inventory_item`) use this to detect and recover a stuck item
-    /// rather than silently leaving it invisible on the cursor.
-    pub(crate) async fn carried_item(&self) -> Result<Option<(String, u32)>, AppError> {
-        let client = self
-            .current_client
-            .lock()
-            .await
-            .clone()
-            .ok_or(AppError::InventoryUnavailable)?;
-        let inventory = client
-            .component::<Inventory>()
-            .map_err(|_| AppError::InventoryUnavailable)?;
-        if inventory.carried.is_empty() {
-            return Ok(None);
-        }
-        Ok(Some((
-            inventory.carried.kind().to_string(),
-            inventory.carried.count().max(0) as u32,
-        )))
-    }
-
     pub(crate) async fn close_container(&self) -> Result<(), AppError> {
         let client = self
             .current_client
@@ -927,113 +849,6 @@ impl MinecraftClient {
                 .close();
         }
         Ok(())
-    }
-
-    /// Queues a single jump for the next tick. Used by vertical-construction
-    /// maneuvers (pillaring) that need to briefly vacate the bot's own block
-    /// before placing into it; ordinary pathfinding never needs this since
-    /// Azalea's own executor handles jumping during normal movement.
-    pub(crate) async fn jump(&self) -> Result<(), AppError> {
-        let client = self
-            .current_client
-            .lock()
-            .await
-            .clone()
-            .ok_or(AppError::MovementUnavailable)?;
-        client.jump();
-        Ok(())
-    }
-
-    pub(crate) async fn use_item_at_look_target(&self) -> Result<(), AppError> {
-        let client = self
-            .current_client
-            .lock()
-            .await
-            .clone()
-            .ok_or(AppError::MovementUnavailable)?;
-        client.start_use_item();
-        Ok(())
-    }
-
-    pub(crate) async fn attack_entity(&self, entity_id: i32) -> Result<(), AppError> {
-        use azalea::core::entity_id::MinecraftEntityId;
-        let client = self
-            .current_client
-            .lock()
-            .await
-            .clone()
-            .ok_or(AppError::MovementUnavailable)?;
-        if let Some(entity) = client
-            .entity_id_by_minecraft_id(MinecraftEntityId(entity_id))
-            .map_err(|_| AppError::MovementUnavailable)?
-        {
-            client.attack(entity);
-            Ok(())
-        } else {
-            Err(AppError::MovementUnavailable)
-        }
-    }
-
-    pub(crate) async fn interact_with_entity(&self, entity_id: i32) -> Result<(), AppError> {
-        use azalea::core::entity_id::MinecraftEntityId;
-        let client = self
-            .current_client
-            .lock()
-            .await
-            .clone()
-            .ok_or(AppError::MovementUnavailable)?;
-        if let Some(entity) = client
-            .entity_id_by_minecraft_id(MinecraftEntityId(entity_id))
-            .map_err(|_| AppError::MovementUnavailable)?
-        {
-            client.entity_interact(entity);
-            Ok(())
-        } else {
-            Err(AppError::MovementUnavailable)
-        }
-    }
-
-    /// Drops `count` of `item_id`, or the entire stack when `count` is 0
-    /// (an omitted `count` argument from the AI also normalizes to 0 --
-    /// see `tool_call_to_action`). Returns how many were actually dropped.
-    pub(crate) async fn drop_item(&self, item_id: &str, count: u16) -> Result<u16, AppError> {
-        use azalea::inventory::operations::ThrowClick;
-        self.inventory_actions
-            .mutate(|| async {
-                let client = self
-                    .current_client
-                    .lock()
-                    .await
-                    .clone()
-                    .ok_or(AppError::InventoryUnavailable)?;
-                let menu = client.menu().map_err(|_| AppError::InventoryUnavailable)?;
-                let slots = menu.slots();
-                let slot = slots
-                    .iter()
-                    .position(|item| !item.is_empty() && item.kind().to_string() == item_id)
-                    .ok_or(AppError::InventoryUnavailable)?;
-                let available = slots[slot].count().max(0) as u16;
-                let handle = client
-                    .get_inventory()
-                    .map_err(|_| AppError::InventoryUnavailable)?;
-                // `ThrowClick::All` drops the whole stack in one packet;
-                // `Single` drops exactly one. There is no "drop exactly N"
-                // click, so a specific count below the full stack means
-                // clicking `Single` that many times -- previously any
-                // `count > 1` dropped the *entire* stack regardless of how
-                // many were actually requested.
-                let dropped = if count == 0 || count >= available {
-                    handle.click(ThrowClick::All { slot: slot as u16 });
-                    available
-                } else {
-                    for _ in 0..count {
-                        handle.click(ThrowClick::Single { slot: slot as u16 });
-                    }
-                    count
-                };
-                Ok(dropped)
-            })
-            .await
     }
 
     pub(crate) async fn select_item_in_hotbar(&self, item_id: &str) -> Result<bool, AppError> {
@@ -1330,6 +1145,8 @@ impl MinecraftClient {
             calculating: client.is_calculating_path(),
             executing: client.is_executing_path(),
             reached: client.is_goto_target_reached(),
+            mid_build_action: client.component::<Placing>().is_ok()
+                || client.component::<azalea_client::mining::Mining>().is_ok(),
         })
     }
 

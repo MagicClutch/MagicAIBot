@@ -12,7 +12,6 @@ use crate::{
     config::InteractionConfig,
     error::AppError,
     interaction::{
-        block_placement::BlockPlacementRequest,
         faces::{BlockFace, BlockFacePurpose, best_face, face_hit_points},
         placement_rules::{has_support, is_air, is_replaceable},
         progress::estimated_progress,
@@ -27,7 +26,7 @@ use crate::{
     },
     movement::MovementService,
     navigation::{BlockNavigationService, navigation_state::BlockNavigationState},
-    tasks::{ActionFailure, Invalidation, OperationId},
+    tasks::{ActionFailure, Invalidation},
 };
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -48,7 +47,6 @@ pub enum InteractionState {
 }
 #[derive(Clone, Debug, Default)]
 pub struct InteractionSnapshot {
-    pub operation_id: Option<OperationId>,
     pub state: InteractionState,
     pub target: Option<String>,
     pub progress_percent: Option<u8>,
@@ -400,37 +398,6 @@ impl InteractionController {
         .await
     }
 
-    /// Starts a typed single-block request. Substitution is deliberately
-    /// limited to an explicitly supplied accepted-item list.
-    pub async fn place_request(
-        &self,
-        minecraft: &MinecraftClient,
-        movement: &MovementService,
-        look: &LookController,
-        request: BlockPlacementRequest,
-    ) -> Result<(), AppError> {
-        if request.cancellation.is_cancelled() {
-            return Err(AppError::InteractionCancelled);
-        }
-        let world = minecraft.world_state_snapshot().await;
-        if request
-            .dimension
-            .as_deref()
-            .is_some_and(|dimension| world.bot.dimension.as_deref() != Some(dimension))
-        {
-            return Err(AppError::CannotPlaceBlock(
-                "target dimension does not match the bot".into(),
-            ));
-        }
-        let item = request
-            .accepted_items
-            .iter()
-            .find(|item| world.inventory.has_item(item, 1))
-            .cloned()
-            .ok_or_else(|| AppError::InteractionItemMissing(request.accepted_items.join(" or ")))?;
-        self.place_at(minecraft, movement, look, request.target, item)
-            .await
-    }
     async fn replace(
         &self,
         operation: Operation,
@@ -466,7 +433,6 @@ impl InteractionController {
             .map(|position| distance_to_block_center(position, block_position));
         let mut inner = self.inner.lock().await;
         inner.snapshot = InteractionSnapshot {
-            operation_id: Some(OperationId::new()),
             state: InteractionState::Preparing,
             target: Some(target),
             distance,

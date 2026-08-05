@@ -51,7 +51,7 @@ pub fn normalize_block_id(input: &str) -> Result<String, AppError> {
     Ok(normalized)
 }
 
-fn valid_identifier_part(value: &str, namespace: bool) -> bool {
+pub(crate) fn valid_identifier_part(value: &str, namespace: bool) -> bool {
     value.chars().all(|character| {
         character.is_ascii_lowercase()
             || character.is_ascii_digit()

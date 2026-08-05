@@ -313,6 +313,14 @@ impl BlockNavigationService {
             return;
         }
 
+        // Tracks the last tick that made *positional* progress, separate
+        // from `maximum_navigation_seconds`'s much longer overall ceiling --
+        // defaults to `start_time` so a target that never moves at all from
+        // the very first tick is still caught. Updated locally (not just via
+        // the shared snapshot write below) so a meaningful change observed
+        // on *this* tick is reflected in the stuck check on *this* same
+        // tick, rather than one tick late.
+        let mut effective_last_progress = snapshot.last_progress_time.or(snapshot.start_time);
         if let Some(position) = world.bot.position {
             if arrival_valid(
                 Some(position),
@@ -334,10 +342,37 @@ impl BlockNavigationService {
                 .last_position
                 .is_none_or(|previous| distance(previous, position) >= 0.1);
             if meaningful_change {
+                let now = SystemTime::now();
                 let mut inner = self.inner.lock().await;
                 inner.snapshot.last_position = Some(position);
-                inner.snapshot.last_progress_time = Some(SystemTime::now());
+                inner.snapshot.last_progress_time = Some(now);
+                drop(inner);
+                effective_last_progress = Some(now);
             }
+        }
+        // `stuck_timeout_seconds` (much shorter than
+        // `maximum_navigation_seconds`) exists specifically so a target that
+        // stops making positional progress -- Azalea's pathfinder genuinely
+        // stalled, not just slow -- gets abandoned for the next candidate
+        // quickly instead of occupying the whole `#get`/`/gotoblock` attempt
+        // for the full navigation ceiling while visibly doing nothing. Note
+        // this only tracks *position*: a single mining move that takes a
+        // few seconds to break one block is well within the default 12s and
+        // won't false-positive, but an unusually slow multi-block dig could;
+        // that's a tuning question for `stuck_timeout_seconds`, not a reason
+        // to skip detecting a genuine stall.
+        if timed_out(effective_last_progress, self.config.stuck_timeout_seconds) {
+            self.mark_approach_failed(snapshot.generation, target, approach)
+                .await;
+            self.retry_or_fail(
+                minecraft,
+                movement,
+                snapshot.generation,
+                &block_id,
+                "no progress toward target",
+            )
+            .await;
+            return;
         }
 
         let movement_snapshot = movement.snapshot().await;

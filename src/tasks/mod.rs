@@ -6,4 +6,4 @@
 //! `await_*_terminal` pollers and `*_and_wait` helpers in `src/app.rs`).
 
 pub mod lifecycle;
-pub use lifecycle::{ActionFailure, Invalidation, OperationId};
+pub use lifecycle::{ActionFailure, Invalidation};
