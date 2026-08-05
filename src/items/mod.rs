@@ -30,6 +30,8 @@
 
 use crate::error::AppError;
 
+pub mod drop_plan;
+
 /// `(alias, canonical bare item id)`. Both sides are bare -- no `minecraft:`
 /// namespace, matching the path Azalea's registry macro parses. An alias
 /// fires only when it is *itself* not a valid item id (checked by

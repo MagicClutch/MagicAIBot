@@ -26,6 +26,9 @@ pub enum ConsoleCommand {
         y: i32,
         z: i32,
     },
+    GotoPlayer {
+        player: String,
+    },
     GotoMine {
         x: i32,
         y: i32,
@@ -60,6 +63,11 @@ pub enum ConsoleCommand {
     Mine {
         block_ids: Vec<String>,
         amount: u32,
+    },
+    Drop {
+        item_id: String,
+        amount: u32,
+        player: Option<String>,
     },
     Look {
         x: i32,
@@ -187,14 +195,7 @@ pub fn parse_input(input: &str) -> Result<ConsoleInput, AppError> {
             }
             ConsoleCommand::Entities { radius }
         }
-        "goto" => {
-            let destination = parse_coordinates(arguments)?;
-            ConsoleCommand::Goto {
-                x: destination.x as i32,
-                y: destination.y as i32,
-                z: destination.z as i32,
-            }
-        }
+        "goto" => parse_goto(arguments)?,
         "goto-mine" => {
             let destination = parse_coordinates(arguments)?;
             ConsoleCommand::GotoMine {
@@ -216,6 +217,7 @@ pub fn parse_input(input: &str) -> Result<ConsoleInput, AppError> {
         "cancelgotoblock" => no_arguments(command, arguments, ConsoleCommand::CancelGotoBlock)?,
         "get" => parse_get(arguments)?,
         "mine" => parse_mine(arguments)?,
+        "drop" => parse_drop(arguments)?,
         "look" | "lookat" => {
             let position = parse_coordinates(arguments)?;
             ConsoleCommand::Look {
@@ -404,6 +406,31 @@ fn parse_placeblock(arguments: &str) -> Result<ConsoleCommand, AppError> {
         _ => Err(AppError::InvalidConsoleSyntax(
             "/placeblock <block> or /placeblock <block> <x> <y> <z>".into(),
         )),
+    }
+}
+
+/// `/goto <x> <y> <z>` or `/goto <player>` (also reachable as `#goto ...`).
+/// A single token can never be a valid 3-coordinate destination, so token
+/// count alone disambiguates: exactly one token is always a player name --
+/// whether or not it happens to look numeric, since Minecraft usernames may
+/// themselves be all-digits (e.g. `5cat`) -- everything else is handed to
+/// `parse_coordinates`, which enforces the `<x> <y> <z>` shape and reports
+/// its own usage error otherwise. Unlike `/follow`, this is a one-shot walk
+/// to the player's current position and stop, not a continuous chase --
+/// see `App::goto_player_and_wait`.
+fn parse_goto(arguments: &str) -> Result<ConsoleCommand, AppError> {
+    match arguments.split_whitespace().collect::<Vec<_>>().as_slice() {
+        [player] => Ok(ConsoleCommand::GotoPlayer {
+            player: (*player).to_owned(),
+        }),
+        _ => {
+            let destination = parse_coordinates(arguments)?;
+            Ok(ConsoleCommand::Goto {
+                x: destination.x as i32,
+                y: destination.y as i32,
+                z: destination.z as i32,
+            })
+        }
     }
 }
 
@@ -603,6 +630,39 @@ fn parse_mine(arguments: &str) -> Result<ConsoleCommand, AppError> {
     Ok(ConsoleCommand::Mine { block_ids, amount })
 }
 
+/// Baritone-style item dropping: `/drop <item> <amount> [player]` (also
+/// reachable as `#drop <item> <amount> [player]` from Minecraft chat).
+/// Unlike `/get`, `item` is always a single token -- there is no multi-word
+/// item name support here, since a trailing token is ambiguous between "the
+/// last word of the item name" and "an optional player name" (and Minecraft
+/// usernames may themselves look like plain words, e.g. `5cat`). The
+/// optional player name is always the third token when present; its
+/// existence (not just spelling) is checked later against currently loaded
+/// players (see `App::run_drop`), not here.
+fn parse_drop(arguments: &str) -> Result<ConsoleCommand, AppError> {
+    const USAGE: &str = "/drop <item> <amount> [player]";
+    let parts: Vec<&str> = arguments.split_whitespace().collect();
+    let (item_token, amount_token, player) = match parts.as_slice() {
+        [item, amount] => (*item, *amount, None),
+        [item, amount, player] => (*item, *amount, Some((*player).to_owned())),
+        [] | [_] => return Err(AppError::MissingConsoleArgument(USAGE.into())),
+        _ => return Err(AppError::InvalidConsoleSyntax(USAGE.into())),
+    };
+    let amount: u32 = amount_token
+        .parse()
+        .map_err(|_| AppError::InvalidConsoleSyntax("amount must be a positive integer".into()))?;
+    if amount == 0 {
+        return Err(AppError::InvalidConsoleSyntax(
+            "amount must be greater than zero".into(),
+        ));
+    }
+    Ok(ConsoleCommand::Drop {
+        item_id: normalize_item_id(item_token)?,
+        amount,
+        player,
+    })
+}
+
 fn no_arguments(
     command: &str,
     arguments: &str,
@@ -718,6 +778,52 @@ mod tests {
         let input = ConsoleInput::ChatMessage("hello".to_owned());
         assert_eq!(plain_chat_message(&input, false), None);
         assert_eq!(plain_chat_message(&input, true), Some("hello"));
+    }
+
+    #[test]
+    fn parses_goto_with_coordinates() {
+        assert_eq!(
+            parse_input("/goto 100 64 -20").unwrap(),
+            ConsoleInput::Command(ConsoleCommand::Goto {
+                x: 100,
+                y: 64,
+                z: -20
+            })
+        );
+    }
+
+    #[test]
+    fn parses_goto_with_a_player_name() {
+        assert_eq!(
+            parse_input("/goto Steve").unwrap(),
+            ConsoleInput::Command(ConsoleCommand::GotoPlayer {
+                player: "Steve".into()
+            })
+        );
+        // Minecraft usernames may be all-digits -- token count alone (not
+        // whether it looks numeric) decides player vs. coordinates.
+        assert_eq!(
+            parse_input("/goto 5cat").unwrap(),
+            ConsoleInput::Command(ConsoleCommand::GotoPlayer {
+                player: "5cat".into()
+            })
+        );
+    }
+
+    #[test]
+    fn rejects_invalid_goto_arguments() {
+        assert!(matches!(
+            parse_input("/goto"),
+            Err(AppError::InvalidCoordinates(_))
+        ));
+        assert!(matches!(
+            parse_input("/goto 1 2"),
+            Err(AppError::InvalidCoordinates(_))
+        ));
+        assert!(matches!(
+            parse_input("/goto 1 2 3 4"),
+            Err(AppError::InvalidCoordinates(_))
+        ));
     }
 
     #[test]
@@ -1174,6 +1280,78 @@ mod tests {
         assert!(matches!(
             parse_input("/mine not_a_real_block 10"),
             Err(AppError::UnknownBlockIdentifier(_))
+        ));
+    }
+
+    #[test]
+    fn parses_drop_command_without_player() {
+        assert_eq!(
+            parse_input("/drop cobblestone 64").unwrap(),
+            ConsoleInput::Command(ConsoleCommand::Drop {
+                item_id: "minecraft:cobblestone".into(),
+                amount: 64,
+                player: None,
+            })
+        );
+        assert_eq!(
+            parse_input("/drop oak_log 32").unwrap(),
+            ConsoleInput::Command(ConsoleCommand::Drop {
+                item_id: "minecraft:oak_log".into(),
+                amount: 32,
+                player: None,
+            })
+        );
+    }
+
+    #[test]
+    fn parses_drop_command_with_player() {
+        assert_eq!(
+            parse_input("/drop diamond 5 5cat").unwrap(),
+            ConsoleInput::Command(ConsoleCommand::Drop {
+                item_id: "minecraft:diamond".into(),
+                amount: 5,
+                player: Some("5cat".into()),
+            })
+        );
+        assert_eq!(
+            parse_input("/drop iron_ingot 16 Steve").unwrap(),
+            ConsoleInput::Command(ConsoleCommand::Drop {
+                item_id: "minecraft:iron_ingot".into(),
+                amount: 16,
+                player: Some("Steve".into()),
+            })
+        );
+    }
+
+    #[test]
+    fn rejects_invalid_drop_arguments() {
+        assert!(matches!(
+            parse_input("/drop"),
+            Err(AppError::MissingConsoleArgument(_))
+        ));
+        assert!(matches!(
+            parse_input("/drop diamond"),
+            Err(AppError::MissingConsoleArgument(_))
+        ));
+        assert!(matches!(
+            parse_input("/drop diamond 0"),
+            Err(AppError::InvalidConsoleSyntax(_))
+        ));
+        assert!(matches!(
+            parse_input("/drop diamond -5"),
+            Err(AppError::InvalidConsoleSyntax(_))
+        ));
+        assert!(matches!(
+            parse_input("/drop diamond abc"),
+            Err(AppError::InvalidConsoleSyntax(_))
+        ));
+        assert!(matches!(
+            parse_input("/drop diamond 5 5cat extra"),
+            Err(AppError::InvalidConsoleSyntax(_))
+        ));
+        assert!(matches!(
+            parse_input("/drop not_a_real_item 5"),
+            Err(AppError::UnknownItemIdentifier(_))
         ));
     }
 

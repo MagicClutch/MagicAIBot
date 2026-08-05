@@ -195,11 +195,9 @@ pub fn should_replace(mode: ArmorMode, worn: Option<&EquipmentItem>, candidate: 
     let worn_material = worn.and_then(|item| classify(&item.item_id).map(|(_, material)| material));
     match mode {
         ArmorMode::Score => {
-            let worn_score = worn
-                .zip(worn_material)
-                .map_or(0.0, |(item, material)| {
-                    score(material, item.current_durability, item.max_durability)
-                });
+            let worn_score = worn.zip(worn_material).map_or(0.0, |(item, material)| {
+                score(material, item.current_durability, item.max_durability)
+            });
             rank_score(candidate) >= worn_score + 0.2
         }
         ArmorMode::Rarity => worn_material.is_none_or(|material| candidate.material > material),

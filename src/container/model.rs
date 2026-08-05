@@ -39,6 +39,17 @@ pub struct InventoryClick {
     pub button: ClickButton,
 }
 
+/// A single "throw" click (`#drop`): drops a stack out of a slot directly
+/// into the world, without needing to first pick it up onto the cursor.
+/// `whole_stack` selects the protocol's throw-stack action (mirrors
+/// ctrl+Q) over throw-one (mirrors Q) -- see `items::drop_plan::plan_drop`
+/// for how a requested amount is split across these.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct DropClick {
+    pub slot: usize,
+    pub whole_stack: bool,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct TransferPlan {
     pub direction: TransferDirection,

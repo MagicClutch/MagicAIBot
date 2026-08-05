@@ -89,6 +89,10 @@ pub enum AppError {
     UnknownResourceIdentifier(String),
     #[error("unknown item identifier: {0}")]
     UnknownItemIdentifier(String),
+    #[error("Not enough {item} in inventory (have {have}, need {need})")]
+    InsufficientItemsForDrop { item: String, have: u32, need: u32 },
+    #[error("Item not found: {0}")]
+    ItemNotFoundForDrop(String),
     #[error("combat was cancelled")]
     CombatCancelled,
     #[error("no valid approach position")]

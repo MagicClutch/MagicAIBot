@@ -5,6 +5,7 @@ use crate::minecraft::world_state::{MovementSnapshot, MovementStatus, PositionSn
 pub fn moving_snapshot(
     destination: PositionSnapshot,
     start: Option<PositionSnapshot>,
+    arrival_distance_override: Option<f64>,
 ) -> MovementSnapshot {
     MovementSnapshot {
         status: MovementStatus::MovingToPosition,
@@ -15,6 +16,7 @@ pub fn moving_snapshot(
         estimated_distance: start.map(|position| distance(position, destination)),
         last_movement_update: Some(SystemTime::now()),
         failure_reason: None,
+        arrival_distance_override,
     }
 }
 
@@ -32,6 +34,7 @@ pub fn following_snapshot(
         estimated_distance: start.map(|position| distance(position, destination)),
         last_movement_update: Some(SystemTime::now()),
         failure_reason: None,
+        arrival_distance_override: None,
     }
 }
 
@@ -61,9 +64,27 @@ mod tests {
                 z: 10.,
             },
             None,
+            None,
         );
         assert_eq!(snapshot.status, MovementStatus::MovingToPosition);
         assert_eq!(snapshot.destination.unwrap().x, 10.);
+    }
+
+    #[test]
+    fn moving_snapshot_carries_an_arrival_distance_override() {
+        let destination = PositionSnapshot {
+            x: 10.,
+            y: 64.,
+            z: 10.,
+        };
+        assert_eq!(
+            moving_snapshot(destination, None, Some(2.0)).arrival_distance_override,
+            Some(2.0)
+        );
+        assert_eq!(
+            moving_snapshot(destination, None, None).arrival_distance_override,
+            None
+        );
     }
 
     #[test]

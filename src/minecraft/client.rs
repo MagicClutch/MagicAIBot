@@ -758,7 +758,9 @@ impl MinecraftClient {
     ) -> Result<crate::equipment::model::EquipmentSnapshot, AppError> {
         use crate::equipment::{
             armor::ArmorSlot,
-            model::{EquipmentItem, EquipmentSnapshot, INVENTORY_PROTOCOL_SLOTS, OFFHAND_PROTOCOL_SLOT},
+            model::{
+                EquipmentItem, EquipmentSnapshot, INVENTORY_PROTOCOL_SLOTS, OFFHAND_PROTOCOL_SLOT,
+            },
         };
         let client = self
             .current_client
@@ -891,6 +893,54 @@ impl MinecraftClient {
             ClickButton::Right => PickupClick::Right {
                 slot: Some(click.slot as u16),
             },
+        });
+        Ok(())
+    }
+
+    /// Throws an item stack out of a slot directly into the world (`#drop`),
+    /// without needing to first pick it up onto the cursor -- the protocol's
+    /// throw-one (`ThrowClick::Single`, mirrors pressing Q) or throw-stack
+    /// (`ThrowClick::All`, mirrors ctrl+Q) click type, chosen per
+    /// `click.whole_stack` by `items::drop_plan::plan_drop`. Shares
+    /// `container_click`'s window-id checks: window id 0 is always the
+    /// player's own inventory, so dropping never requires a container to be
+    /// open.
+    pub(crate) async fn drop_click(
+        &self,
+        window_id: i32,
+        click: crate::container::model::DropClick,
+    ) -> Result<(), AppError> {
+        use azalea::inventory::operations::ThrowClick;
+        let client = self
+            .current_client
+            .lock()
+            .await
+            .clone()
+            .ok_or(AppError::InventoryUnavailable)?;
+        let inventory = client
+            .component::<Inventory>()
+            .map_err(|_| AppError::InventoryUnavailable)?;
+        if inventory.id != window_id {
+            return Err(AppError::InventoryUnavailable);
+        }
+        if window_id != 0 && inventory.container_menu.is_none() {
+            return Err(AppError::InventoryUnavailable);
+        }
+        // See `container_click`'s doc comment: the read guard must be
+        // dropped before `.click()` below takes its own write lock on the
+        // same ECS, or this self-deadlocks.
+        drop(inventory);
+        let handle = client
+            .get_inventory()
+            .map_err(|_| AppError::InventoryUnavailable)?;
+        handle.click(if click.whole_stack {
+            ThrowClick::All {
+                slot: click.slot as u16,
+            }
+        } else {
+            ThrowClick::Single {
+                slot: click.slot as u16,
+            }
         });
         Ok(())
     }

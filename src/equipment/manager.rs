@@ -101,11 +101,18 @@ impl EquipmentService {
         if already_worn {
             return;
         }
-        let Some(source) = snapshot.inventory.iter().find(|item| item.item_id == desired) else {
+        let Some(source) = snapshot
+            .inventory
+            .iter()
+            .find(|item| item.item_id == desired)
+        else {
             return;
         };
         let source_slot = source.slot;
-        if self.equip(minecraft, source_slot, OFFHAND_PROTOCOL_SLOT).await {
+        if self
+            .equip(minecraft, source_slot, OFFHAND_PROTOCOL_SLOT)
+            .await
+        {
             logging::info(format!("Equipped {desired} in offhand"));
         }
     }

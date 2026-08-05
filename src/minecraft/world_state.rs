@@ -216,6 +216,16 @@ pub struct MovementSnapshot {
     pub estimated_distance: Option<f64>,
     pub last_movement_update: Option<SystemTime>,
     pub failure_reason: Option<String>,
+    /// Per-goal override for "how close counts as arrived", used instead of
+    /// `MovementConfig::arrival_distance` for the duration of this goal --
+    /// e.g. a player approach that should stop a couple of blocks short
+    /// rather than walking up against them. `None` means "use the configured
+    /// default", which is what every plain `/goto`/mining-approach goal
+    /// still gets. Also passed straight through to Azalea's own pathfinder
+    /// as its stop distance (see `MovementService::goto_internal`), so the
+    /// app-level arrival check and the pathfinder's own idea of "reached"
+    /// never disagree.
+    pub arrival_distance_override: Option<f64>,
 }
 
 #[derive(Clone, Debug)]
@@ -261,6 +271,25 @@ impl WorldStateSnapshot {
         self.players
             .iter()
             .find(|player| player.username.eq_ignore_ascii_case(name))
+    }
+    /// Like [`Self::find_player_by_name`], but only considers players Azalea
+    /// currently has a loaded entity/position for (`loaded == true`) --
+    /// `#drop <item> <amount> <player>` must not path toward a stale
+    /// last-seen record for someone who has since logged off or moved out
+    /// of range. Prefers an exact-case match over a case-insensitive one, so
+    /// `Steve` and `steve` being online simultaneously resolves
+    /// deterministically to whichever name was actually typed.
+    pub fn find_loaded_player_by_name(&self, name: &str) -> Option<&PlayerSnapshot> {
+        let mut case_insensitive = None;
+        for player in self.players.iter().filter(|player| player.loaded) {
+            if player.username == name {
+                return Some(player);
+            }
+            if case_insensitive.is_none() && player.username.eq_ignore_ascii_case(name) {
+                case_insensitive = Some(player);
+            }
+        }
+        case_insensitive
     }
 }
 
@@ -776,6 +805,45 @@ mod tests {
         state.upsert_player(p.clone());
         assert_eq!(state.find_player_by_name("aLeX").unwrap().username, "Alex");
         assert_eq!(state.find_player_by_uuid(uuid(1)).unwrap().username, "Alex");
+    }
+    #[test]
+    fn loaded_player_lookup_prefers_exact_case_over_case_insensitive() {
+        let mut low = player(1, "steve", 0.);
+        low.loaded = true;
+        let mut high = player(2, "Steve", 0.);
+        high.loaded = true;
+        let snapshot = WorldStateSnapshot {
+            players: vec![low, high],
+            ..Default::default()
+        };
+        assert_eq!(
+            snapshot.find_loaded_player_by_name("Steve").unwrap().uuid,
+            uuid(2)
+        );
+    }
+    #[test]
+    fn loaded_player_lookup_falls_back_to_case_insensitive_match() {
+        let snapshot = WorldStateSnapshot {
+            players: vec![player(1, "5cat", 0.)],
+            ..Default::default()
+        };
+        assert_eq!(
+            snapshot
+                .find_loaded_player_by_name("5CAT")
+                .unwrap()
+                .username,
+            "5cat"
+        );
+    }
+    #[test]
+    fn loaded_player_lookup_ignores_unloaded_players() {
+        let mut unloaded = player(1, "Ghost", 0.);
+        unloaded.loaded = false;
+        let snapshot = WorldStateSnapshot {
+            players: vec![unloaded],
+            ..Default::default()
+        };
+        assert!(snapshot.find_loaded_player_by_name("Ghost").is_none());
     }
     #[test]
     fn nearest_player_and_entities_are_sorted_and_filtered() {

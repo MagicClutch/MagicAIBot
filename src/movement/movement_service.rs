@@ -66,7 +66,8 @@ impl MovementService {
         destination: PositionSnapshot,
         mode: NavigationMode,
     ) -> Result<(), AppError> {
-        self.goto_internal(minecraft, destination, mode, true).await
+        self.goto_internal(minecraft, destination, mode, true, None)
+            .await
     }
 
     pub(crate) async fn goto_for_block_navigation(
@@ -75,7 +76,26 @@ impl MovementService {
         destination: PositionSnapshot,
         mode: NavigationMode,
     ) -> Result<(), AppError> {
-        self.goto_internal(minecraft, destination, mode, false)
+        self.goto_internal(minecraft, destination, mode, false, None)
+            .await
+    }
+
+    /// Like [`Self::goto_for_block_navigation`], but stops `stop_distance`
+    /// blocks short of `destination` rather than walking all the way up to
+    /// it -- used for approaching a player (`#goto <player>`, `#drop <item>
+    /// <amount> <player>`) so the bot doesn't crowd or try to stand on top
+    /// of them. `stop_distance` is used both as Azalea's own pathfinder stop
+    /// distance and as the app-level "have I arrived" threshold (see
+    /// `MovementSnapshot::arrival_distance_override`), so the two can never
+    /// disagree about whether the goal is reached.
+    pub(crate) async fn goto_player_approach(
+        &self,
+        minecraft: &MinecraftClient,
+        destination: PositionSnapshot,
+        mode: NavigationMode,
+        stop_distance: f64,
+    ) -> Result<(), AppError> {
+        self.goto_internal(minecraft, destination, mode, false, Some(stop_distance))
             .await
     }
 
@@ -85,6 +105,7 @@ impl MovementService {
         destination: PositionSnapshot,
         mode: NavigationMode,
         log_start: bool,
+        arrival_distance_override: Option<f64>,
     ) -> Result<(), AppError> {
         if !destination.x.is_finite() || !destination.y.is_finite() || !destination.z.is_finite() {
             return Err(AppError::InvalidCoordinates(
@@ -95,15 +116,18 @@ impl MovementService {
         *self.suppress_terminal_log.lock().await = !log_start;
         *self.navigation_mode.lock().await = mode;
         minecraft
-            .start_navigation_to(destination, None, mode)
+            .start_navigation_to(destination, arrival_distance_override, mode)
             .await?;
         *self.last_goal_submission.lock().await = Some(SystemTime::now());
         *self.last_goal_destination.lock().await = Some(destination);
         if log_start {
             logger::going_to(destination);
         }
-        self.replace_and_publish(minecraft, moving_snapshot(destination, world.bot.position))
-            .await;
+        self.replace_and_publish(
+            minecraft,
+            moving_snapshot(destination, world.bot.position, arrival_distance_override),
+        )
+        .await;
         Ok(())
     }
 
@@ -177,6 +201,9 @@ impl MovementService {
         explicit_look: bool,
     ) {
         let world = minecraft.world_state_snapshot().await;
+        let arrival_distance = snapshot
+            .arrival_distance_override
+            .unwrap_or(self.config.arrival_distance);
         self.update_local_input(
             world.bot.position,
             snapshot.destination,
@@ -184,11 +211,7 @@ impl MovementService {
             explicit_look,
         )
         .await;
-        if arrived(
-            world.bot.position,
-            snapshot.destination,
-            self.config.arrival_distance,
-        ) {
+        if arrived(world.bot.position, snapshot.destination, arrival_distance) {
             let _ = minecraft.stop_navigation().await;
             snapshot.status = MovementStatus::Completed;
             snapshot.last_movement_update = Some(SystemTime::now());
@@ -198,7 +221,12 @@ impl MovementService {
         if let Some(destination) = snapshot.destination {
             let mode = *self.navigation_mode.lock().await;
             if let Err(error) = self
-                .refresh_navigation_goal(minecraft, destination, None, mode)
+                .refresh_navigation_goal(
+                    minecraft,
+                    destination,
+                    snapshot.arrival_distance_override,
+                    mode,
+                )
                 .await
             {
                 self.fail(minecraft, snapshot, error.to_string()).await;
@@ -208,11 +236,7 @@ impl MovementService {
         match minecraft.navigation_status().await {
             Ok(status)
                 if status.reached
-                    && arrived(
-                        world.bot.position,
-                        snapshot.destination,
-                        self.config.arrival_distance,
-                    ) =>
+                    && arrived(world.bot.position, snapshot.destination, arrival_distance) =>
             {
                 snapshot.status = MovementStatus::Completed;
                 snapshot.last_movement_update = Some(SystemTime::now());

@@ -9,12 +9,18 @@ pub const SHIELD: &str = "minecraft:shield";
 /// and/or shield exist anywhere in the main inventory. `None` means "leave
 /// the offhand exactly as it is" -- neither preferred item is available, so
 /// whatever's already there (a torch, nothing, anything else) stays put.
-pub fn desired_item(priority: OffhandPriority, has_totem: bool, has_shield: bool) -> Option<&'static str> {
+pub fn desired_item(
+    priority: OffhandPriority,
+    has_totem: bool,
+    has_shield: bool,
+) -> Option<&'static str> {
     let order: [(bool, &str); 2] = match priority {
         OffhandPriority::Totem => [(has_totem, TOTEM_OF_UNDYING), (has_shield, SHIELD)],
         OffhandPriority::Shield => [(has_shield, SHIELD), (has_totem, TOTEM_OF_UNDYING)],
     };
-    order.into_iter().find_map(|(present, id)| present.then_some(id))
+    order
+        .into_iter()
+        .find_map(|(present, id)| present.then_some(id))
 }
 
 #[cfg(test)]

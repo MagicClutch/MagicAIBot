@@ -19,8 +19,12 @@ use crate::{
     equipment::EquipmentService,
     error::AppError,
     interaction::{InteractionController, interaction_controller::InteractionState},
+    items::drop_plan::{self, DropPlanError},
     logging,
-    look::{LookController, LookTarget, look_controller::LookState},
+    look::{
+        LookController, LookTarget,
+        look_controller::{LookPriority, LookSnapshot, LookState},
+    },
     minecraft::{
         client::MinecraftClient,
         world_state::{MovementStatus, TaskSnapshot},
@@ -55,6 +59,20 @@ use tokio_util::sync::CancellationToken;
 // anything else interrupts it and is handed back to `execute_console_input`.
 
 type InputReceiver = mpsc::Receiver<Result<ConsoleInput, AppError>>;
+
+/// How close `#goto <player>` and `#drop <item> <amount> <player>` stop to
+/// the target player -- close enough to interact/throw, far enough not to
+/// crowd or try to stand on top of them. Passed to
+/// `MovementService::goto_player_approach` as both Azalea's own pathfinder
+/// stop distance and the app-level arrival threshold.
+const PLAYER_APPROACH_DISTANCE: f64 = 2.0;
+
+/// Bound on how long `#drop <item> <amount> <player>` waits for its aim to
+/// settle before dropping anyway. A `LookTarget::Player` aim tracks
+/// movement, so `LookState` never reaches `Completed` for it (see
+/// `look_at_player_briefly`'s doc comment) -- without a bound, waiting for
+/// that state would hang forever.
+const PLAYER_LOOK_SETTLE_TIMEOUT: Duration = Duration::from_millis(800);
 
 /// Outcome of a blocking wait: either it ran to completion, or new console
 /// input arrived that must be handled by the caller instead.
@@ -551,6 +569,24 @@ impl App {
                             }
                         }
                     }
+                    ConsoleCommand::GotoPlayer { player } => {
+                        self.interaction
+                            .cancel(&self.minecraft, &self.movement, &self.look)
+                            .await;
+                        self.block_navigation
+                            .cancel(&self.minecraft, &self.movement)
+                            .await;
+                        match self.goto_player_and_wait(player, input_rx).await {
+                            WaitOutcome::Finished(Ok(())) => {}
+                            WaitOutcome::Finished(Err(_)) => {
+                                // Already reported inside `goto_player_and_wait`.
+                            }
+                            WaitOutcome::Interrupted(next) => {
+                                input = next;
+                                continue;
+                            }
+                        }
+                    }
                     ConsoleCommand::GotoMine { x, y, z } => {
                         self.interaction
                             .cancel(&self.minecraft, &self.movement, &self.look)
@@ -584,13 +620,23 @@ impl App {
                     }
                     ConsoleCommand::PathStatus => self.print_path_status().await,
                     ConsoleCommand::Stop => {
-                        // `/stop` is the movement channel's stop command. A
-                        // separate look task remains active, even when it is
-                        // tracking a target while the bot walks.
+                        // `/stop` is primarily the movement channel's stop
+                        // command, but it also cancels any active
+                        // explicit-priority look (a plain `/look`/
+                        // `/lookplayer`, or a task's own "look at" step,
+                        // e.g. `#drop <item> <amount> <player>`'s "Looking
+                        // at player" phase) -- see `interruptible_look`.
+                        // A `PreciseInteraction`-priority look is left
+                        // alone; that belongs to `InteractionController`'s
+                        // own break/place lifecycle and is only released by
+                        // finishing or by `/stopinteraction`.
                         let description = self.active_stop_description().await;
                         self.block_navigation
                             .cancel(&self.minecraft, &self.movement)
                             .await;
+                        if self.interruptible_look().await.is_some() {
+                            self.look.cancel().await;
+                        }
                         match self.movement.stop(&self.minecraft).await {
                             Ok(()) => match description {
                                 Some(description) => {
@@ -707,6 +753,32 @@ impl App {
                             WaitOutcome::Finished(Ok(())) => {}
                             WaitOutcome::Finished(Err(_)) => {
                                 // Already reported inside `run_mine`.
+                            }
+                            WaitOutcome::Interrupted(next) => {
+                                input = next;
+                                continue;
+                            }
+                        }
+                    }
+                    ConsoleCommand::Drop {
+                        item_id,
+                        amount,
+                        player,
+                    } => {
+                        self.interaction
+                            .cancel(&self.minecraft, &self.movement, &self.look)
+                            .await;
+                        self.combat
+                            .cancel(&self.minecraft, &self.movement, &self.look)
+                            .await;
+                        self.block_navigation
+                            .cancel(&self.minecraft, &self.movement)
+                            .await;
+                        match self.drop_and_wait(item_id, amount, player, input_rx).await {
+                            WaitOutcome::Finished(Ok(())) => {}
+                            WaitOutcome::Finished(Err(_)) => {
+                                // Already reported inside `run_drop_without_player` /
+                                // `run_drop_to_player`.
                             }
                             WaitOutcome::Interrupted(next) => {
                                 input = next;
@@ -1070,7 +1142,27 @@ impl App {
             });
         }
 
+        if let Some(look) = self.interruptible_look().await {
+            return Some(match look.target {
+                Some(target) => format!("looking at {target}"),
+                None => "looking".to_owned(),
+            });
+        }
+
         None
+    }
+
+    /// The current look, if it is one `/stop` is allowed to cancel: an
+    /// active, `ExplicitCommand`-priority look (a plain `/look`/
+    /// `/lookplayer`/`/lookblock`/`/lookentity`, or a task's own "look at"
+    /// step). A `PreciseInteraction`-priority look -- `InteractionController`
+    /// driving a precise aim mid-break/place -- is never returned here; that
+    /// lifecycle is only ever ended by finishing or by `/stopinteraction`.
+    async fn interruptible_look(&self) -> Option<LookSnapshot> {
+        let snapshot = self.look.snapshot().await;
+        (snapshot.state == LookState::Looking
+            && snapshot.priority != LookPriority::PreciseInteraction)
+            .then_some(snapshot)
     }
 
     async fn print_container_status(&self) {
@@ -1738,6 +1830,84 @@ impl App {
         result
     }
 
+    /// `/goto <player>` (also reachable as `#goto <player>`): a one-shot
+    /// walk to wherever the named player currently is, then stop -- unlike
+    /// `/follow`, this never re-tracks them after arriving. Shares
+    /// `approach_player` with `#drop <item> <amount> <player>`'s approach
+    /// step.
+    async fn goto_player_and_wait(
+        &self,
+        player: String,
+        input_rx: &mut InputReceiver,
+    ) -> WaitOutcome {
+        self.minecraft
+            .set_current_task(task_snapshot(format!("Go to player {player}")))
+            .await;
+        let result = async {
+            match self.approach_player(player, input_rx).await {
+                Ok(resolved_name) => {
+                    logging::success(format!("Reached player {resolved_name}"));
+                    WaitOutcome::Finished(Ok(()))
+                }
+                Err(outcome) => outcome,
+            }
+        }
+        .await;
+        self.minecraft.clear_current_task().await;
+        result
+    }
+
+    /// Resolves `player` among currently loaded players
+    /// (`WorldStateSnapshot::find_loaded_player_by_name`) and walks to
+    /// within `PLAYER_APPROACH_DISTANCE` blocks of them -- close enough to
+    /// interact, never all the way onto their exact tile. Shared by
+    /// `#goto <player>` and `#drop <item> <amount> <player>`. On success,
+    /// returns the resolved (correct-case) username; on failure, the
+    /// `WaitOutcome` the caller should return directly (already logged).
+    async fn approach_player(
+        &self,
+        player: String,
+        input_rx: &mut InputReceiver,
+    ) -> Result<String, WaitOutcome> {
+        logging::info(format!("Searching for player {player}..."));
+        let world = self.minecraft.world_state_snapshot().await;
+        let target = world
+            .find_loaded_player_by_name(&player)
+            .filter(|target| target.position.is_some());
+        let Some(target) = target else {
+            logging::error(format!("Player not found: {player}"));
+            return Err(WaitOutcome::Finished(Err(AppError::UnknownPlayer(player))));
+        };
+        let resolved_name = target.username.clone();
+        let destination = target.position.expect("checked by filter above");
+
+        logging::info(format!(
+            "Going to player {resolved_name} at ({:.0}, {:.0}, {:.0})",
+            destination.x, destination.y, destination.z
+        ));
+        if let Err(error) = self
+            .movement
+            .goto_player_approach(
+                &self.minecraft,
+                destination,
+                NavigationMode::AllowMining,
+                PLAYER_APPROACH_DISTANCE,
+            )
+            .await
+        {
+            logging::error(format!("Could not reach {resolved_name}: {error}"));
+            return Err(WaitOutcome::Finished(Err(error)));
+        }
+        match await_movement_terminal(self, input_rx).await {
+            WaitOutcome::Finished(Ok(())) => Ok(resolved_name),
+            WaitOutcome::Finished(Err(error)) => {
+                logging::error(format!("Could not reach {resolved_name}: {error}"));
+                Err(WaitOutcome::Finished(Err(error)))
+            }
+            interrupted @ WaitOutcome::Interrupted(_) => Err(interrupted),
+        }
+    }
+
     async fn goto_block_and_wait(
         &self,
         block_id: String,
@@ -2080,6 +2250,242 @@ impl App {
         logging::error(format!("Block not found: {label}"));
         logging::info("Mine task cancelled");
         WaitOutcome::Finished(Err(error))
+    }
+
+    /// Baritone-style `/drop <item> <amount> [player]` (also reachable as
+    /// `#drop <item> <amount> [player]` from Minecraft chat). Reuses the
+    /// same inventory (`world_state_snapshot().inventory`), pathfinding
+    /// (`MovementService::goto_for_block_navigation` -- the same one-shot
+    /// "walk to a fixed destination and stop" primitive `/goto` uses), and
+    /// look (`LookController` via `look_and_wait`) systems as every other
+    /// command; only `items::drop_plan::plan_drop` (which slots to throw
+    /// from, whole-stack vs single-item) and `MinecraftClient::drop_click`
+    /// (the actual throw) are new. See `run_drop_without_player` and
+    /// `run_drop_to_player` for the two branches.
+    async fn drop_and_wait(
+        &self,
+        item_id: String,
+        amount: u32,
+        player: Option<String>,
+        input_rx: &mut InputReceiver,
+    ) -> WaitOutcome {
+        let label = blocks::bare_id(&item_id).to_owned();
+        self.minecraft
+            .set_current_task(task_snapshot(format!("Drop {amount} {label}")))
+            .await;
+        logging::info(format!("Drop task started: {label} x{amount}"));
+        let result = match player {
+            Some(player) => {
+                self.run_drop_to_player(&item_id, &label, amount, player, input_rx)
+                    .await
+            }
+            None => self.run_drop_without_player(&item_id, &label, amount).await,
+        };
+        self.minecraft.clear_current_task().await;
+        result
+    }
+
+    /// `#drop <item> <amount>`: no navigation or look involved at all --
+    /// just count, verify, and throw straight out of wherever the bot is
+    /// currently standing.
+    async fn run_drop_without_player(
+        &self,
+        item_id: &str,
+        label: &str,
+        amount: u32,
+    ) -> WaitOutcome {
+        let have = self
+            .minecraft
+            .world_state_snapshot()
+            .await
+            .inventory
+            .count_item(item_id);
+        logging::info(format!("Inventory: {have} {label}"));
+        match self.execute_drop(item_id, label, amount).await {
+            Ok(()) => {
+                logging::success(format!("Dropped {amount} {label}"));
+                WaitOutcome::Finished(Ok(()))
+            }
+            Err(error) => {
+                logging::error(&error);
+                WaitOutcome::Finished(Err(error))
+            }
+        }
+    }
+
+    /// `#drop <item> <amount> <player>`: bails out before doing anything else
+    /// if the inventory can't satisfy `amount` (see `check_drop_available`
+    /// -- no point walking anywhere first), then locates the player and
+    /// walks to within `PLAYER_APPROACH_DISTANCE` of them (`approach_player`,
+    /// shared with `#goto <player>`), aims at them (`look_at_player_briefly`
+    /// -- bounded, since a player look target never reaches a terminal
+    /// "aimed" state on its own), then throws. Bails out with the exact
+    /// `Player not found: {name}` message the contract requires the moment
+    /// the player can't be resolved -- never guessing a stale/unloaded
+    /// position.
+    async fn run_drop_to_player(
+        &self,
+        item_id: &str,
+        label: &str,
+        amount: u32,
+        player: String,
+        input_rx: &mut InputReceiver,
+    ) -> WaitOutcome {
+        if let Err(error) = self.check_drop_available(item_id, label, amount).await {
+            logging::error(&error);
+            return WaitOutcome::Finished(Err(error));
+        }
+
+        let resolved_name = match self.approach_player(player, input_rx).await {
+            Ok(name) => name,
+            Err(outcome) => return outcome,
+        };
+
+        match self.look_at_player_briefly(&resolved_name, input_rx).await {
+            WaitOutcome::Finished(Ok(())) => {}
+            WaitOutcome::Finished(Err(error)) => {
+                logging::error(format!("Could not look at {resolved_name}: {error}"));
+                return WaitOutcome::Finished(Err(error));
+            }
+            WaitOutcome::Interrupted(next) => return WaitOutcome::Interrupted(next),
+        }
+
+        match self.execute_drop(item_id, label, amount).await {
+            Ok(()) => {
+                logging::success(format!("Dropped {amount} {label} to {resolved_name}"));
+                WaitOutcome::Finished(Ok(()))
+            }
+            Err(error) => {
+                logging::error(&error);
+                WaitOutcome::Finished(Err(error))
+            }
+        }
+    }
+
+    /// Aims at `player` for up to `PLAYER_LOOK_SETTLE_TIMEOUT` and then
+    /// proceeds regardless. A player look target tracks movement, so
+    /// `LookState` never reaches `Completed` for it --
+    /// `look_controller::tick_generation`'s `completed` computation is
+    /// gated on `!context.tracks_movement`, which is false for a player.
+    /// Waiting for that terminal state the way `look_and_wait` does for a
+    /// fixed target (block/position) would hang forever: this is exactly
+    /// what made `#drop <item> <amount> <player>` freeze the whole
+    /// console/chat command pipeline (the wait never completed on its own,
+    /// and chat-issued `#stop` can't reach a pipeline stuck awaiting inside
+    /// a chat-issued command). The aim itself is still live and keeps
+    /// refining every subsequent tick regardless of this bound.
+    async fn look_at_player_briefly(
+        &self,
+        player: &str,
+        input_rx: &mut InputReceiver,
+    ) -> WaitOutcome {
+        self.minecraft
+            .set_current_task(task_snapshot("Look at player"))
+            .await;
+        let result = async {
+            if let Err(error) = self
+                .look
+                .look_at(&self.minecraft, LookTarget::Player(player.to_owned()))
+                .await
+            {
+                return WaitOutcome::Finished(Err(error));
+            }
+            let deadline = Instant::now() + PLAYER_LOOK_SETTLE_TIMEOUT;
+            loop {
+                self.look.tick(&self.minecraft).await;
+                let snapshot = self.look.snapshot().await;
+                match snapshot.state {
+                    LookState::Completed | LookState::Idle => {
+                        return WaitOutcome::Finished(Ok(()));
+                    }
+                    LookState::Cancelled => {
+                        return WaitOutcome::Finished(Err(AppError::LookCancelled));
+                    }
+                    LookState::Failed => {
+                        return WaitOutcome::Finished(Err(AppError::LookUnavailableWithReason(
+                            snapshot
+                                .failure_reason
+                                .unwrap_or_else(|| "look failed".into()),
+                        )));
+                    }
+                    LookState::Looking => {}
+                }
+                if Instant::now() >= deadline {
+                    return WaitOutcome::Finished(Ok(()));
+                }
+                if let Some(input) = wait_tick(self, input_rx, Duration::from_millis(50)).await {
+                    return WaitOutcome::Interrupted(input);
+                }
+            }
+        }
+        .await;
+        self.minecraft.clear_current_task().await;
+        result
+    }
+
+    /// Fails fast with the exact `Item not found: {label}` (nothing held at
+    /// all) or `Not enough {label} in inventory (have X, need Y)` (held,
+    /// but not enough) message the contract requires -- checked against a
+    /// live inventory read, without planning or throwing anything.
+    async fn check_drop_available(
+        &self,
+        item_id: &str,
+        label: &str,
+        amount: u32,
+    ) -> Result<(), AppError> {
+        let inventory = self.minecraft.world_state_snapshot().await.inventory;
+        match drop_plan::plan_drop(&inventory.slots, item_id, amount) {
+            Ok(_) => Ok(()),
+            Err(DropPlanError::Insufficient { available }) => {
+                Err(drop_insufficient_error(label, amount, available))
+            }
+        }
+    }
+
+    /// Shared final step for both `#drop` branches: plans the exact throw
+    /// clicks for `amount` of `item_id` against a fresh inventory read (so a
+    /// player-drop's walk-and-look never operates on a stale count from
+    /// before it moved), fires them via `MinecraftClient::drop_click`, and
+    /// polls briefly for the inventory count to confirm the drop actually
+    /// landed. Never drops a partial amount -- an insufficient inventory is
+    /// rejected by `items::drop_plan::plan_drop` before anything is thrown.
+    async fn execute_drop(&self, item_id: &str, label: &str, amount: u32) -> Result<(), AppError> {
+        let inventory = self.minecraft.world_state_snapshot().await.inventory;
+        let have_before = inventory.count_item(item_id);
+        let clicks = drop_plan::plan_drop(&inventory.slots, item_id, amount).map_err(
+            |DropPlanError::Insufficient { available }| {
+                drop_insufficient_error(label, amount, available)
+            },
+        )?;
+
+        logging::info(format!("Dropping {amount} {label}"));
+        for click in clicks {
+            self.minecraft.drop_click(0, click).await?;
+        }
+
+        // Client-side prediction applies each throw immediately against the
+        // live ECS (see `MinecraftClient::drop_click`'s doc comment), but
+        // `world_state_snapshot` only mirrors that once per external tick --
+        // give it a few ticks to catch up rather than reporting success
+        // before the cached count actually reflects it.
+        let expected = have_before.saturating_sub(amount);
+        for _ in 0..10 {
+            if self
+                .minecraft
+                .world_state_snapshot()
+                .await
+                .inventory
+                .count_item(item_id)
+                <= expected
+            {
+                return Ok(());
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        logging::warning(format!(
+            "Dropped {amount} {label}, but inventory has not confirmed it yet"
+        ));
+        Ok(())
     }
 
     /// Scans for the dropped item entity the just-broken block spawned and
@@ -2604,6 +3010,22 @@ fn join_labels(ids: &[String], separator: &str) -> String {
         .join(separator)
 }
 
+/// Maps a `#drop`-planning shortfall to the exact wording the contract
+/// requires: nothing held at all is `Item not found: {label}`, distinct
+/// from holding *some* but not enough (`Not enough {label} in inventory
+/// (have X, need Y)`).
+fn drop_insufficient_error(label: &str, amount: u32, available: u32) -> AppError {
+    if available == 0 {
+        AppError::ItemNotFoundForDrop(label.to_owned())
+    } else {
+        AppError::InsufficientItemsForDrop {
+            item: label.to_owned(),
+            have: available,
+            need: amount,
+        }
+    }
+}
+
 fn task_snapshot(name: impl Into<String>) -> TaskSnapshot {
     TaskSnapshot {
         name: name.into(),
@@ -2825,5 +3247,26 @@ mod get_resource_tests {
             ),
             None
         );
+    }
+}
+
+#[cfg(test)]
+mod drop_tests {
+    use super::*;
+
+    #[test]
+    fn zero_available_reports_item_not_found() {
+        assert!(matches!(
+            drop_insufficient_error("diamond", 5, 0),
+            AppError::ItemNotFoundForDrop(item) if item == "diamond"
+        ));
+    }
+
+    #[test]
+    fn partial_availability_reports_have_and_need() {
+        assert!(matches!(
+            drop_insufficient_error("diamond", 5, 3),
+            AppError::InsufficientItemsForDrop { item, have: 3, need: 5 } if item == "diamond"
+        ));
     }
 }
