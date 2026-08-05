@@ -4,6 +4,7 @@ mod bridging;
 mod config;
 mod console;
 mod container;
+mod equipment;
 mod error;
 mod interaction;
 mod items;

@@ -42,6 +42,8 @@ pub struct Config {
     pub multitasking: MultitaskingConfig,
     #[serde(default)]
     pub chat_commands: ChatCommandsConfig,
+    #[serde(default)]
+    pub equipment: EquipmentConfig,
 }
 
 /// Access control and rate limiting for the `#`-prefixed direct console
@@ -89,6 +91,45 @@ fn default_chat_command_rate_limit_requests() -> usize {
 }
 fn default_chat_command_rate_limit_window() -> u64 {
     30
+}
+
+/// Everything the fully automatic equipment system needs -- see
+/// `crate::equipment` for the scoring/selection logic this configures.
+#[derive(Clone, Debug, Default, Deserialize)]
+pub struct EquipmentConfig {
+    #[serde(default)]
+    pub armor: EquipmentArmorConfig,
+    #[serde(default)]
+    pub offhand: EquipmentOffhandConfig,
+}
+#[derive(Clone, Debug, Default, Deserialize)]
+pub struct EquipmentArmorConfig {
+    #[serde(default)]
+    pub mode: ArmorMode,
+}
+#[derive(Clone, Debug, Default, Deserialize)]
+pub struct EquipmentOffhandConfig {
+    #[serde(default)]
+    pub priority: OffhandPriority,
+}
+/// `score` weighs material and durability together
+/// (`crate::equipment::armor::score`); `rarity` ignores durability entirely
+/// and ranks by material alone.
+#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq)]
+#[serde(rename_all = "lowercase")]
+pub enum ArmorMode {
+    #[default]
+    Score,
+    Rarity,
+}
+/// Which of a Totem of Undying or a Shield the offhand prefers when both
+/// are available (see `crate::equipment::offhand::desired_item`).
+#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq)]
+#[serde(rename_all = "lowercase")]
+pub enum OffhandPriority {
+    #[default]
+    Totem,
+    Shield,
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -1026,6 +1067,47 @@ mod tests {
         assert_eq!(config.interaction.maximum_reach, 4.5);
         assert_eq!(config.multitasking.normal_forward_angle, 35.0);
         assert_eq!(config.multitasking.extreme_angle, 160.0);
+        assert_eq!(config.equipment.armor.mode, ArmorMode::Score);
+        assert_eq!(config.equipment.offhand.priority, OffhandPriority::Totem);
+    }
+
+    #[test]
+    fn parses_equipment_settings_from_one_section() {
+        let config: Config = toml::from_str(
+            r#"
+                [minecraft]
+                server = "localhost"
+                username = "MagicBot"
+                account_mode = "offline"
+
+                [reconnect]
+                enabled = false
+                delay_seconds = 10
+                maximum_attempts = 5
+
+                [logging]
+                level = "info"
+
+                [equipment.armor]
+                mode = "rarity"
+
+                [equipment.offhand]
+                priority = "shield"
+            "#,
+        )
+        .expect("test configuration should parse");
+
+        assert_eq!(config.equipment.armor.mode, ArmorMode::Rarity);
+        assert_eq!(config.equipment.offhand.priority, OffhandPriority::Shield);
+    }
+
+    #[test]
+    fn example_config_file_parses_and_validates() {
+        let config: Config = toml::from_str(include_str!("../config.toml.example"))
+            .expect("config.toml.example should parse");
+        config
+            .validate()
+            .expect("config.toml.example should be a valid configuration");
     }
 
     #[test]

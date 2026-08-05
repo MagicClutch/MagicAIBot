@@ -745,6 +745,56 @@ impl MinecraftClient {
             .is_ok_and(|inventory| inventory.container_menu.is_some())
     }
 
+    /// Reads armor, offhand, and main-inventory contents for
+    /// `crate::equipment::manager::EquipmentService`, straight from
+    /// `Inventory::inventory_menu` -- the player's own menu, which (unlike
+    /// `Client::menu()`) stays `Menu::Player` even while a chest is open, so
+    /// scoring/decision work never has to wait for a container to close.
+    /// Only the resulting *clicks* need window id 0 (see
+    /// `EquipmentService::equip`), since armor/offhand slots aren't part of
+    /// whatever menu is actually open at click time.
+    pub(crate) async fn equipment_snapshot(
+        &self,
+    ) -> Result<crate::equipment::model::EquipmentSnapshot, AppError> {
+        use crate::equipment::{
+            armor::ArmorSlot,
+            model::{EquipmentItem, EquipmentSnapshot, INVENTORY_PROTOCOL_SLOTS, OFFHAND_PROTOCOL_SLOT},
+        };
+        let client = self
+            .current_client
+            .lock()
+            .await
+            .clone()
+            .ok_or(AppError::InventoryUnavailable)?;
+        let menu = client
+            .component::<Inventory>()
+            .map_err(|_| AppError::InventoryUnavailable)?
+            .inventory_menu
+            .clone();
+        let slots = menu.slots();
+        let read = |index: usize| -> Option<EquipmentItem> {
+            let item = slots.get(index)?;
+            let data = item.as_present()?;
+            let max_durability = item
+                .get_component::<MaxDamage>()
+                .map_or(0, |component| component.amount.max(0) as u32);
+            let damage = item
+                .get_component::<Damage>()
+                .map_or(0, |component| component.amount.max(0) as u32);
+            Some(EquipmentItem {
+                slot: index,
+                item_id: data.kind.to_string(),
+                current_durability: max_durability.saturating_sub(damage),
+                max_durability,
+            })
+        };
+        Ok(EquipmentSnapshot {
+            armor_worn: ArmorSlot::ALL.map(|slot| read(slot.protocol_slot())),
+            offhand_worn: read(OFFHAND_PROTOCOL_SLOT),
+            inventory: INVENTORY_PROTOCOL_SLOTS.filter_map(read).collect(),
+        })
+    }
+
     /// Maps Azalea's authoritative active menu into the application model.
     pub(crate) async fn chest_menu_snapshot(
         &self,
@@ -818,6 +868,19 @@ impl MinecraftClient {
         if window_id != 0 && inventory.container_menu.is_none() {
             return Err(AppError::InventoryUnavailable);
         }
+        // `component::<Inventory>()` (Azalea's own doc comment on it) hands
+        // back a live read guard on the ECS, not an owned clone -- holding
+        // it any longer than this would self-deadlock the moment `.click()`
+        // below needs a write lock on the same ECS to apply and send the
+        // click (`ContainerHandleRef::click` triggers `ContainerClickEvent`
+        // via `ecs.write()`). This was always a latent hazard here, but
+        // harmless in practice while this function was only reached from
+        // manual chest transfers; `equipment::manager::EquipmentService`
+        // calls it automatically and repeatedly, which turned the same
+        // deadlock into the bot freezing solid (no physics either, since
+        // Azalea's own per-tick systems need that same ECS lock) shortly
+        // after joining.
+        drop(inventory);
         let handle = client
             .get_inventory()
             .map_err(|_| AppError::InventoryUnavailable)?;
@@ -842,7 +905,13 @@ impl MinecraftClient {
         let inventory = client
             .component::<Inventory>()
             .map_err(|_| AppError::InventoryUnavailable)?;
-        if inventory.container_menu.is_some() {
+        let should_close = inventory.container_menu.is_some();
+        // See the matching comment in `container_click`: this guard is a
+        // live ECS read lock, and `.close()` below needs a write lock on
+        // the same ECS to send the close packet -- holding both at once
+        // self-deadlocks.
+        drop(inventory);
+        if should_close {
             client
                 .get_inventory()
                 .map_err(|_| AppError::InventoryUnavailable)?

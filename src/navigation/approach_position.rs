@@ -53,12 +53,23 @@ pub fn required_cells(approach: BlockPosition) -> [BlockPosition; 3] {
     ]
 }
 
+/// `allow_mining` must mirror whatever `NavigationMode` the caller is
+/// actually pathfinding with. When true, a solid-but-minable foot/head cell
+/// is accepted even though it isn't open air yet -- Azalea's pathfinder (see
+/// `PathfinderOpts::allow_mining`) digs it out en route and already owns the
+/// real feasibility check (hardness/tool cost, unbreakable blocks, liquids
+/// above/adjacent -- see `CachedWorld::uncached_cost_for_breaking_block`).
+/// Requiring the cell to *already* be air here -- as this function used to,
+/// unconditionally -- rejected every fully buried ore candidate before
+/// Azalea ever got a chance to tunnel to it, since none of its neighboring
+/// cells are exposed.
 pub fn is_valid_approach(
     target: BlockPosition,
     approach: BlockPosition,
     target_id: &str,
     cells: &HashMap<BlockPosition, Option<String>>,
     interaction_distance: f64,
+    allow_mining: bool,
 ) -> bool {
     if approach == target || interaction_distance <= 0.0 {
         return false;
@@ -85,7 +96,7 @@ pub fn is_valid_approach(
     let Some(Some(floor)) = cells.get(&required[2]) else {
         return false;
     };
-    is_passable(foot) && is_passable(head) && is_safe_floor(floor)
+    is_traversable(foot, allow_mining) && is_traversable(head, allow_mining) && is_safe_floor(floor)
 }
 
 pub fn is_passable(block_id: &str) -> bool {
@@ -95,8 +106,23 @@ pub fn is_passable(block_id: &str) -> bool {
     )
 }
 
+/// A cell a mining-enabled route can stand in: already open air, or a solid
+/// block that isn't a liquid/hazard the bot would need to dig through first.
+/// Whether it's actually *breakable* (bedrock, etc.) is left to Azalea's own
+/// mining-cost check rather than duplicated here.
+fn is_traversable(block_id: &str, allow_mining: bool) -> bool {
+    is_passable(block_id) || (allow_mining && !is_hazard(block_id) && !is_liquid(block_id))
+}
+
 pub fn is_safe_floor(block_id: &str) -> bool {
     !is_passable(block_id) && !is_hazard(block_id)
+}
+
+pub fn is_liquid(block_id: &str) -> bool {
+    matches!(
+        block_id,
+        "minecraft:water" | "minecraft:lava" | "minecraft:flowing_water" | "minecraft:flowing_lava"
+    )
 }
 
 pub fn is_hazard(block_id: &str) -> bool {
@@ -147,7 +173,8 @@ mod tests {
             approach,
             "minecraft:stone",
             &cells(target, approach),
-            4.5
+            4.5,
+            false
         ));
     }
 
@@ -165,7 +192,8 @@ mod tests {
             approach,
             "minecraft:stone",
             &values,
-            4.5
+            4.5,
+            false
         ));
         values.remove(&BlockPosition { x: -1, y: 63, z: 0 });
         assert!(!is_valid_approach(
@@ -173,7 +201,71 @@ mod tests {
             approach,
             "minecraft:stone",
             &values,
-            4.5
+            4.5,
+            false
+        ));
+    }
+
+    /// The bug this fixes: a fully buried ore (every approach cell solid
+    /// stone, not air) must be reachable once mining is allowed, since
+    /// Azalea's pathfinder can dig the approach cell out itself.
+    #[test]
+    fn allows_solid_foot_and_head_when_mining_is_enabled() {
+        let target = BlockPosition { x: 0, y: 64, z: 0 };
+        let approach = BlockPosition { x: -1, y: 64, z: 0 };
+        let mut values = HashMap::new();
+        values.insert(target, Some("minecraft:diamond_ore".into()));
+        let required = required_cells(approach);
+        values.insert(required[0], Some("minecraft:stone".into()));
+        values.insert(required[1], Some("minecraft:stone".into()));
+        values.insert(required[2], Some("minecraft:stone".into()));
+
+        assert!(!is_valid_approach(
+            target,
+            approach,
+            "minecraft:diamond_ore",
+            &values,
+            4.5,
+            false
+        ));
+        assert!(is_valid_approach(
+            target,
+            approach,
+            "minecraft:diamond_ore",
+            &values,
+            4.5,
+            true
+        ));
+    }
+
+    /// Mining mode must not turn a liquid- or hazard-filled cell into a
+    /// stand-on-able node just because it's "solid enough to dig" -- Azalea
+    /// itself refuses to mine adjacent to liquids, and standing in lava
+    /// isn't something digging it out first would fix.
+    #[test]
+    fn mining_mode_still_rejects_liquid_and_hazard_cells() {
+        let target = BlockPosition { x: 0, y: 64, z: 0 };
+        let approach = BlockPosition { x: -1, y: 64, z: 0 };
+        let mut values = cells(target, approach);
+        values.insert(required_cells(approach)[0], Some("minecraft:lava".into()));
+        assert!(!is_valid_approach(
+            target,
+            approach,
+            "minecraft:stone",
+            &values,
+            4.5,
+            true
+        ));
+
+        let mut values = cells(target, approach);
+        values.insert(required_cells(approach)[0], Some("minecraft:water".into()));
+        assert!(!is_valid_approach(
+            target,
+            approach,
+            "minecraft:stone",
+            &values,
+            4.5,
+            true
         ));
     }
 }

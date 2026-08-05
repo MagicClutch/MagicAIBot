@@ -338,6 +338,7 @@ impl BlockNavigationService {
             &selected_block_id,
             &cells,
             self.config.interaction_distance,
+            snapshot.mode.allows_mining(),
         ) {
             self.mark_approach_failed(snapshot.generation, target, approach)
                 .await;
@@ -455,6 +456,7 @@ impl BlockNavigationService {
                 inner.snapshot.candidates_checked += 1;
                 candidate
             };
+            let mode = self.inner.lock().await.snapshot.mode;
             for approach in approach_positions(candidate.position) {
                 let approach_key = (candidate.position, approach);
                 if self
@@ -475,6 +477,7 @@ impl BlockNavigationService {
                     &candidate.block_id,
                     &cells,
                     self.config.interaction_distance,
+                    mode.allows_mining(),
                 ) {
                     self.mark_approach_failed(generation, candidate.position, approach)
                         .await;
@@ -485,7 +488,6 @@ impl BlockNavigationService {
                     inner.snapshot.current_attempt += 1;
                     inner.snapshot.current_attempt
                 };
-                let mode = self.inner.lock().await.snapshot.mode;
                 if mode == NavigationMode::AllowMining {
                     logging::info("Pathfinding with mining enabled");
                 }

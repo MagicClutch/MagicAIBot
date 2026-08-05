@@ -159,3 +159,22 @@ face_inset = 0.001
 edge_margin = 0.12
 maximum_face_attempts = 6
 maximum_hit_points_per_face = 5
+
+# Fully automatic equipment: always wear the best available armor and keep
+# the offhand stocked with a Totem of Undying (or a Shield, if preferred/no
+# totem is held). Re-evaluated continuously, but only actually swaps when
+# the change clears the threshold below -- see src/equipment for the
+# scoring/selection rules.
+[equipment.armor]
+# score: ranks each piece 1.0-10.0 from material + current durability, so a
+#   badly damaged higher-tier piece can lose to a fully-repaired lower-tier
+#   one. Only swaps when the replacement scores at least 0.2 higher.
+# rarity: ignores durability and ranks by material alone
+#   (Netherite > Diamond > Iron > Chainmail > Copper > Gold > Leather). Only swaps
+#   on a strictly higher material tier.
+mode = "score"   # score | rarity
+
+[equipment.offhand]
+# Which item the offhand prefers when both are available; the other is used
+# as a fallback, and the offhand is left alone if neither is held.
+priority = "totem"   # totem | shield

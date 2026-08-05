@@ -16,6 +16,7 @@ use crate::{
         commands::{ConsoleCommand, ConsoleInput, plain_chat_message},
     },
     container::{model::TransferDirection, service::ContainerService},
+    equipment::EquipmentService,
     error::AppError,
     interaction::{InteractionController, interaction_controller::InteractionState},
     logging,
@@ -286,6 +287,7 @@ pub struct App {
     interaction: InteractionController,
     combat: CombatController,
     container: ContainerService,
+    equipment: EquipmentService,
     chat_rate_limits: HashMap<String, VecDeque<Instant>>,
     session_ready: bool,
     started_at: Instant,
@@ -351,6 +353,7 @@ impl App {
             ),
             combat: CombatController::new(),
             container: ContainerService::default(),
+            equipment: EquipmentService::new(config.equipment.clone()),
             chat_rate_limits: HashMap::new(),
             session_ready: false,
             config,
@@ -441,6 +444,7 @@ impl App {
                     self.interaction.tick(&self.minecraft, &self.movement, &self.look).await;
                     self.combat.tick(&self.minecraft, &self.movement, &self.look).await;
                     self.container.tick(&self.minecraft, &self.movement, &self.block_navigation, &self.look).await;
+                    self.equipment.tick(&self.minecraft).await;
                 },
                 input = input_rx.recv() => match input {
                     Some(Ok(ConsoleInput::Empty)) => {}
