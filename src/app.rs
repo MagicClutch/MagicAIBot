@@ -1916,7 +1916,7 @@ impl App {
             match await_interaction_terminal(self, input_rx).await {
                 WaitOutcome::Finished(Ok(())) => {
                     consecutive_failures = 0;
-                    if let Some(next) = self.collect_drop_at(target, input_rx).await {
+                    if let Some(next) = self.collect_drop_at(target, resource_id, input_rx).await {
                         return WaitOutcome::Interrupted(next);
                     }
                     let new_count = self
@@ -2078,27 +2078,41 @@ impl App {
         WaitOutcome::Finished(Err(error))
     }
 
-    /// Walks onto the just-broken block's position so vanilla's proximity
-    /// item pickup actually triggers before the next search starts.
-    /// Breaking happens from pickaxe reach (up to `interaction_distance`,
-    /// ~4.5 blocks), which is well beyond the pickup radius -- without this,
-    /// the drop is frequently left sitting on the ground uncollected, the
-    /// inventory count never advances, and every subsequent iteration has to
-    /// search further and further outward for still-unmined ore instead of
-    /// registering the progress that already happened. Bounded by its own
-    /// short timeout (not `MovementConfig::maximum_navigation_seconds`,
-    /// which is far too generous for a one-or-two-block walk) so a pickup
-    /// that can't complete for some reason -- another player grabs it first,
-    /// the item despawns, the spot is unreachable -- can't stall the whole
-    /// `#get` run; the caller just moves on and re-checks inventory as
-    /// usual. Returns `Some` only if the wait was interrupted by new console
-    /// input, mirroring the `WaitOutcome::Interrupted` contract.
+    /// Scans for the dropped item entity the just-broken block spawned and
+    /// walks onto wherever it actually landed, so vanilla's proximity item
+    /// pickup triggers before the next search starts. Breaking happens from
+    /// pickaxe reach (up to `interaction_distance`, ~4.5 blocks), which is
+    /// well beyond the pickup radius -- without walking over, the drop is
+    /// frequently left sitting on the ground uncollected, the inventory
+    /// count never advances, and every subsequent iteration has to search
+    /// further and further outward for still-unmined ore instead of
+    /// registering the progress that already happened.
+    ///
+    /// The walk targets the drop's own live position
+    /// (`nearest_dropped_item_position`), not the mined block's center --
+    /// physics can carry an item off the block entirely (it rolls, bounces
+    /// off a neighboring block, or falls into an opening the break just
+    /// exposed), and standing over an empty block while the item sits a
+    /// pace away never collects it. Re-scanned every loop iteration so the
+    /// destination tracks the item while it's still settling; falls back to
+    /// the block's own center only when no matching drop has been observed
+    /// yet (the entity's spawn packet simply hasn't arrived this tick).
+    ///
+    /// Bounded by its own short timeout (not
+    /// `MovementConfig::maximum_navigation_seconds`, which is far too
+    /// generous for a one-or-two-block walk) so a pickup that can't
+    /// complete for some reason -- another player grabs it first, the item
+    /// despawns, the spot is unreachable -- can't stall the whole `#get`
+    /// run; the caller just moves on and re-checks inventory as usual.
+    /// Returns `Some` only if the wait was interrupted by new console input,
+    /// mirroring the `WaitOutcome::Interrupted` contract.
     async fn collect_drop_at(
         &self,
         target: crate::minecraft::world_state::BlockPosition,
+        resource_id: &str,
         input_rx: &mut InputReceiver,
     ) -> Option<ConsoleInput> {
-        let destination = crate::minecraft::world_state::PositionSnapshot {
+        let block_center = crate::minecraft::world_state::PositionSnapshot {
             x: f64::from(target.x) + 0.5,
             y: f64::from(target.y),
             z: f64::from(target.z) + 0.5,
@@ -2111,17 +2125,24 @@ impl App {
         // is frequently still too far away to actually trigger pickup --
         // the walk would report "done" while the drop stays on the ground.
         // Poll the bot's live position against a tight threshold instead of
-        // trusting `MovementStatus::Completed`, and re-issue the goto
-        // whenever movement gives up (or never started moving) while still
-        // outside it, bounded by `COLLECT_TIMEOUT` so a spot that's genuinely
-        // unreachable this close (an item wedged out of reach, despawned,
-        // taken by someone else) can't stall the run.
+        // trusting `MovementStatus::Completed`.
         const PICKUP_DISTANCE: f64 = 0.6;
         const COLLECT_TIMEOUT: Duration = Duration::from_secs(5);
+        const ITEM_SCAN_RADIUS: f64 = 3.0;
+        // Re-issue movement once the drop's live position has moved more
+        // than this from the last goto -- avoids fighting Azalea's
+        // in-flight path computation by resubmitting a goto every single
+        // tick while the item is still settling.
+        const DESTINATION_DRIFT_TOLERANCE: f64 = 0.5;
         let started = Instant::now();
         let mut dispatched = false;
+        let mut last_goto_destination: Option<crate::minecraft::world_state::PositionSnapshot> =
+            None;
         loop {
             let world = self.minecraft.world_state_snapshot().await;
+            let destination =
+                nearest_dropped_item_position(&world, block_center, resource_id, ITEM_SCAN_RADIUS)
+                    .unwrap_or(block_center);
             let close_enough = world
                 .bot
                 .position
@@ -2131,7 +2152,11 @@ impl App {
                 return None;
             }
             let status = self.movement.snapshot().await.status;
+            let drifted = last_goto_destination.is_none_or(|previous| {
+                collect_distance(previous, destination) > DESTINATION_DRIFT_TOLERANCE
+            });
             if !dispatched
+                || drifted
                 || matches!(
                     status,
                     MovementStatus::Completed | MovementStatus::Idle | MovementStatus::Failed
@@ -2146,6 +2171,7 @@ impl App {
                     return None;
                 }
                 dispatched = true;
+                last_goto_destination = Some(destination);
             }
             self.movement.tick(&self.minecraft, false).await;
             if let Some(input) = wait_tick(self, input_rx, Duration::from_millis(75)).await {
@@ -2537,6 +2563,33 @@ fn collect_distance(
     ((a.x - b.x).powi(2) + (a.y - b.y).powi(2) + (a.z - b.z).powi(2)).sqrt()
 }
 
+/// Nearest dropped-item entity to `near` (the block just broken) within
+/// `radius`, preferring an exact match on `resource_id` -- what this `#get`
+/// run actually wants -- but falling back to any dropped item in range so a
+/// block whose observed drop id doesn't exactly match what
+/// `mobs::resolve_resource` predicted (fortune, an unmodeled secondary
+/// drop) still gets walked to rather than ignored. `None` means nothing has
+/// been observed near the block yet -- the entity's spawn packet may
+/// simply not have arrived this tick -- and the caller falls back to the
+/// block's own position.
+fn nearest_dropped_item_position(
+    world: &crate::minecraft::world_state::WorldStateSnapshot,
+    near: crate::minecraft::world_state::PositionSnapshot,
+    resource_id: &str,
+    radius: f64,
+) -> Option<crate::minecraft::world_state::PositionSnapshot> {
+    let nearest = |only_matching_id: bool| {
+        world
+            .dropped_items
+            .iter()
+            .filter(|item| !only_matching_id || item.stack.item_id == resource_id)
+            .map(|item| item.position)
+            .filter(|position| collect_distance(*position, near) <= radius)
+            .min_by(|a, b| collect_distance(*a, near).total_cmp(&collect_distance(*b, near)))
+    };
+    nearest(true).or_else(|| nearest(false))
+}
+
 /// Bare (non-namespaced), `separator`-joined console label for a set of
 /// block/item ids, e.g. `["minecraft:diamond_ore", "minecraft:deepslate_diamond_ore"]`
 /// with `"/"` -> `"diamond_ore/deepslate_diamond_ore"`.
@@ -2674,6 +2727,99 @@ mod get_resource_tests {
                 ", "
             ),
             "diamond_ore, deepslate_diamond_ore"
+        );
+    }
+
+    fn dropped_item(
+        item_id: &str,
+        position: crate::minecraft::world_state::PositionSnapshot,
+    ) -> crate::minecraft::dropped_items::DroppedItemObservation {
+        crate::minecraft::dropped_items::DroppedItemObservation {
+            session_id: 0,
+            entity_id: 0,
+            uuid: None,
+            stack: crate::minecraft::dropped_items::ObservableItemStack {
+                item_id: item_id.into(),
+                count: 1,
+                components: serde_json::json!({}),
+            },
+            position,
+            distance: 0.0,
+            dimension: "minecraft:overworld".into(),
+            last_seen: SystemTime::now(),
+        }
+    }
+
+    fn position(x: f64, y: f64, z: f64) -> crate::minecraft::world_state::PositionSnapshot {
+        crate::minecraft::world_state::PositionSnapshot { x, y, z }
+    }
+
+    #[test]
+    fn walks_to_the_matching_drop_even_when_it_rolled_off_the_mined_block() {
+        let block_center = position(0.5, 64.0, 0.5);
+        let world = crate::minecraft::world_state::WorldStateSnapshot {
+            dropped_items: vec![dropped_item("minecraft:diamond", position(2.0, 64.0, 0.5))],
+            ..Default::default()
+        };
+        assert_eq!(
+            nearest_dropped_item_position(&world, block_center, "minecraft:diamond", 3.0),
+            Some(position(2.0, 64.0, 0.5))
+        );
+    }
+
+    #[test]
+    fn prefers_the_matching_item_id_over_a_closer_unrelated_drop() {
+        let block_center = position(0.5, 64.0, 0.5);
+        let world = crate::minecraft::world_state::WorldStateSnapshot {
+            dropped_items: vec![
+                dropped_item("minecraft:cobblestone", position(0.6, 64.0, 0.5)),
+                dropped_item("minecraft:diamond", position(1.5, 64.0, 0.5)),
+            ],
+            ..Default::default()
+        };
+        assert_eq!(
+            nearest_dropped_item_position(&world, block_center, "minecraft:diamond", 3.0),
+            Some(position(1.5, 64.0, 0.5))
+        );
+    }
+
+    #[test]
+    fn falls_back_to_any_drop_when_no_id_matches() {
+        let block_center = position(0.5, 64.0, 0.5);
+        let world = crate::minecraft::world_state::WorldStateSnapshot {
+            dropped_items: vec![dropped_item("minecraft:flint", position(1.0, 64.0, 0.5))],
+            ..Default::default()
+        };
+        assert_eq!(
+            nearest_dropped_item_position(&world, block_center, "minecraft:gravel", 3.0),
+            Some(position(1.0, 64.0, 0.5))
+        );
+    }
+
+    #[test]
+    fn ignores_drops_outside_the_scan_radius() {
+        let block_center = position(0.5, 64.0, 0.5);
+        let world = crate::minecraft::world_state::WorldStateSnapshot {
+            dropped_items: vec![dropped_item("minecraft:diamond", position(50.0, 64.0, 0.5))],
+            ..Default::default()
+        };
+        assert_eq!(
+            nearest_dropped_item_position(&world, block_center, "minecraft:diamond", 3.0),
+            None
+        );
+    }
+
+    #[test]
+    fn no_observations_yet_returns_none() {
+        let world = crate::minecraft::world_state::WorldStateSnapshot::default();
+        assert_eq!(
+            nearest_dropped_item_position(
+                &world,
+                position(0.5, 64.0, 0.5),
+                "minecraft:diamond",
+                3.0
+            ),
+            None
         );
     }
 }

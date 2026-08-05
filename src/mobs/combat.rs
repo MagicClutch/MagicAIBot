@@ -25,7 +25,7 @@ use crate::{
     look::{LookController, LookTarget},
     minecraft::{
         client::MinecraftClient,
-        world_state::{InventorySnapshot, MovementStatus, PositionSnapshot},
+        world_state::{InventorySnapshot, MovementStatus, PositionSnapshot, WorldStateSnapshot},
     },
     movement::{MovementService, NavigationMode},
 };
@@ -68,6 +68,8 @@ const COLLECT_TIMEOUT: Duration = Duration::from_secs(5);
 /// `MovementStatus::Completed`, re-issuing the walk if movement gives up
 /// early while still outside it.
 const COLLECT_ARRIVAL_DISTANCE: f64 = 0.6;
+/// How far from the mob's death position to look for its dropped item(s).
+const DROP_SCAN_RADIUS: f64 = 3.0;
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub enum CombatState {
@@ -440,8 +442,11 @@ impl CombatController {
         death_position: Option<PositionSnapshot>,
     ) {
         if let Some(position) = death_position {
+            let world = minecraft.world_state_snapshot().await;
+            let destination = nearest_dropped_item_position(&world, position, DROP_SCAN_RADIUS)
+                .unwrap_or(position);
             let _ = movement
-                .goto(minecraft, position, NavigationMode::AllowMining)
+                .goto(minecraft, destination, NavigationMode::AllowMining)
                 .await;
         }
         let mut inner = self.inner.lock().await;
@@ -455,10 +460,18 @@ impl CombatController {
             (inner.snapshot.target_position, inner.collecting_started_at)
         };
         let world = minecraft.world_state_snapshot().await;
+        // Physics can carry the drop off the mob's exact death spot -- walk
+        // to wherever it actually landed, re-scanned every tick since it
+        // can still be settling, falling back to the death position itself
+        // only when nothing has been observed there yet.
+        let destination = death_position.map(|death_position| {
+            nearest_dropped_item_position(&world, death_position, DROP_SCAN_RADIUS)
+                .unwrap_or(death_position)
+        });
         let arrived = world
             .bot
             .position
-            .zip(death_position)
+            .zip(destination)
             .is_some_and(|(position, target)| {
                 distance(position, target) <= COLLECT_ARRIVAL_DISTANCE
             });
@@ -477,7 +490,7 @@ impl CombatController {
         if matches!(
             movement_status,
             MovementStatus::Completed | MovementStatus::Idle | MovementStatus::Failed
-        ) && let Some(target) = death_position
+        ) && let Some(target) = destination
         {
             let _ = movement
                 .goto(minecraft, target, NavigationMode::AllowMining)
@@ -570,6 +583,27 @@ impl CombatController {
 
 fn distance(a: PositionSnapshot, b: PositionSnapshot) -> f64 {
     ((a.x - b.x).powi(2) + (a.y - b.y).powi(2) + (a.z - b.z).powi(2)).sqrt()
+}
+
+/// Nearest dropped-item entity to `near` (the mob's death position) within
+/// `radius`. Unlike the block-mining collection path
+/// (`App::collect_drop_at`), a kill can drop several different items at
+/// once and there is no single expected id to prefer, so this simply walks
+/// to whichever dropped item landed closest. `None` means nothing has been
+/// observed near the death position yet (the entity's spawn packet may not
+/// have arrived this tick), and the caller falls back to the death position
+/// itself.
+fn nearest_dropped_item_position(
+    world: &WorldStateSnapshot,
+    near: PositionSnapshot,
+    radius: f64,
+) -> Option<PositionSnapshot> {
+    world
+        .dropped_items
+        .iter()
+        .map(|item| item.position)
+        .filter(|position| distance(*position, near) <= radius)
+        .min_by(|a, b| distance(*a, near).total_cmp(&distance(*b, near)))
 }
 
 /// Best available sword already sitting in the hotbar (this bot has no way
@@ -670,6 +704,67 @@ mod tests {
         assert_eq!(distance(a, a), 0.0);
         assert!((distance(a, b) - 5.0).abs() < 1e-9);
         assert!((distance(a, b) - distance(b, a)).abs() < 1e-9);
+    }
+
+    fn dropped_item(
+        position: PositionSnapshot,
+    ) -> crate::minecraft::dropped_items::DroppedItemObservation {
+        crate::minecraft::dropped_items::DroppedItemObservation {
+            session_id: 0,
+            entity_id: 0,
+            uuid: None,
+            stack: crate::minecraft::dropped_items::ObservableItemStack {
+                item_id: "minecraft:leather".into(),
+                count: 1,
+                components: serde_json::json!({}),
+            },
+            position,
+            distance: 0.0,
+            dimension: "minecraft:overworld".into(),
+            last_seen: std::time::SystemTime::now(),
+        }
+    }
+
+    fn position(x: f64, y: f64, z: f64) -> PositionSnapshot {
+        PositionSnapshot { x, y, z }
+    }
+
+    #[test]
+    fn finds_the_nearest_drop_within_the_scan_radius() {
+        let death_position = position(0.5, 64.0, 0.5);
+        let world = WorldStateSnapshot {
+            dropped_items: vec![
+                dropped_item(position(10.0, 64.0, 0.5)),
+                dropped_item(position(1.5, 64.0, 0.5)),
+            ],
+            ..Default::default()
+        };
+        assert_eq!(
+            nearest_dropped_item_position(&world, death_position, 3.0),
+            Some(position(1.5, 64.0, 0.5))
+        );
+    }
+
+    #[test]
+    fn ignores_drops_outside_the_scan_radius() {
+        let death_position = position(0.5, 64.0, 0.5);
+        let world = WorldStateSnapshot {
+            dropped_items: vec![dropped_item(position(50.0, 64.0, 0.5))],
+            ..Default::default()
+        };
+        assert_eq!(
+            nearest_dropped_item_position(&world, death_position, 3.0),
+            None
+        );
+    }
+
+    #[test]
+    fn no_observations_yet_returns_none() {
+        let world = WorldStateSnapshot::default();
+        assert_eq!(
+            nearest_dropped_item_position(&world, position(0.5, 64.0, 0.5), 3.0),
+            None
+        );
     }
 
     fn inventory_with_hotbar(items: &[Option<&str>; 9]) -> InventorySnapshot {

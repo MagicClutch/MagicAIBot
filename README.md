@@ -85,16 +85,21 @@ They differ only in what the argument means and what gets counted:
   data-pack content, not part of the client protocol/registry), so `BLOCK_DROPS` is a hand-maintained
   table covering every vanilla block whose deterministic primary drop differs from the block itself;
   anything not listed defaults to "drops itself", correct for the overwhelming majority of blocks.
-  After breaking, the block path walks onto the broken position to trigger vanilla's proximity item
-  pickup (mining reach is well beyond the pickup radius, so without this the drop is often left on
-  the ground and the count never advances) before checking inventory again -- inventory is always
-  counted against the resolved item, never the mined block. The mob path
+  After breaking, the block path scans currently-observed dropped-item entities
+  (`App::nearest_dropped_item_position`) and walks onto wherever the drop actually landed -- not the
+  mined block's own position, since physics can carry an item off the block entirely (it rolls,
+  bounces off a neighbor, or falls into an opening the break just exposed) -- re-scanning every tick
+  so the destination tracks the item while it's still settling, and falling back to the block's center
+  only when nothing has been observed there yet. Mining reach is well beyond the pickup radius, so
+  without walking over, the drop is often left on the ground and the count never advances; inventory
+  is always counted against the resolved item, never the mined block. The mob path
   (`src/mobs/combat.rs`'s `CombatController`) mirrors the same "fresh search every iteration, never
   retry a proven-unreachable candidate" shape over entities instead of blocks: walks to melee range
   with `MovementService::goto` re-aimed at the mob's live position, looks at it with the existing
   `LookTarget::Entity` support `/lookentity` already uses, attacks with the one genuinely new
-  primitive this added (`MinecraftClient::attack_entity`), and walks onto the drop location
-  afterward for the same proximity-pickup reason.
+  primitive this added (`MinecraftClient::attack_entity`), then applies the same dropped-item scan
+  (`CombatController::nearest_dropped_item_position`) to walk onto whichever drop the kill actually
+  produced, for the same proximity-pickup reason.
 - **`/mine <block> [block...] <amount>`** (`#mine` from chat) takes one or more *blocks* literally --
   no resolution of any kind. `#mine diamond_ore deepslate_diamond_ore 10` mines whichever of the two
   is nearer each iteration and stops once 10 blocks (either kind) have been destroyed; `#mine stone
