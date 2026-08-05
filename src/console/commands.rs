@@ -302,18 +302,16 @@ pub fn parse_input(input: &str) -> Result<ConsoleInput, AppError> {
     Ok(ConsoleInput::Command(parsed))
 }
 
+/// Normalizes and registry-validates an item id via the central item
+/// registry (`items::normalize_item_id`/`items::validate_item_id`) -- used
+/// by every console command that names an item to hold, equip, or transfer
+/// (`/equip`, `/take-item`, `/store-item`, `/interact`'s item list), so none
+/// of them can silently accept a guessed id (`raw_beef`) that can never
+/// match a real inventory slot.
 fn normalize_item_id(value: &str) -> Result<String, AppError> {
-    if value.is_empty() || value.chars().any(char::is_whitespace) || value.matches(':').count() > 1
-    {
-        return Err(AppError::InvalidConsoleSyntax(
-            "invalid namespaced identifier".into(),
-        ));
-    }
-    Ok(if value.contains(':') {
-        value.to_ascii_lowercase()
-    } else {
-        format!("minecraft:{}", value.to_ascii_lowercase())
-    })
+    let normalized = crate::items::normalize_item_id(value)?;
+    crate::items::validate_item_id(&normalized)?;
+    Ok(normalized)
 }
 
 fn parse_container_transfer(arguments: &str, take: bool) -> Result<ConsoleCommand, AppError> {
@@ -532,7 +530,11 @@ fn parse_goto_block(arguments: &str) -> Result<ConsoleCommand, AppError> {
 }
 
 /// Item-based resource gathering: `/get <item> <amount>` (also reachable
-/// from Minecraft chat as `#get <item> <amount>`). `item` is resolved --
+/// from Minecraft chat as `#get <item> <amount>`). `item` may be more than
+/// one word (`/get raw beef 10`) -- Minecraft's display names routinely are,
+/// even though the underlying identifier collapses them (`items::normalize_item_id`
+/// handles the collapsing and corrects known wrong guesses, e.g. `raw beef`
+/// -> `minecraft:beef`, not a literal `raw_beef`). `item` is resolved --
 /// never used directly as a mining target -- via `crate::mobs::resolve_resource`,
 /// which tries, in order: the ore/conversion table (`blocks::drop_blocks_for_item`,
 /// e.g. `diamond` -> mine `diamond_ore` or `deepslate_diamond_ore`, whichever
@@ -544,13 +546,13 @@ fn parse_goto_block(arguments: &str) -> Result<ConsoleCommand, AppError> {
 /// itself and never resolves anything.
 fn parse_get(arguments: &str) -> Result<ConsoleCommand, AppError> {
     const USAGE: &str = "/get <item> <amount>";
-    let mut parts = arguments.split_whitespace();
-    let resource = parts
-        .next()
-        .ok_or_else(|| AppError::MissingConsoleArgument(USAGE.into()))?;
-    let amount_raw = parts
-        .next()
-        .ok_or_else(|| AppError::MissingConsoleArgument(USAGE.into()))?;
+    let tokens: Vec<&str> = arguments.split_whitespace().collect();
+    let Some((amount_raw, item_tokens)) = tokens.split_last() else {
+        return Err(AppError::MissingConsoleArgument(USAGE.into()));
+    };
+    if item_tokens.is_empty() {
+        return Err(AppError::MissingConsoleArgument(USAGE.into()));
+    }
     let amount: u32 = amount_raw
         .parse()
         .map_err(|_| AppError::InvalidConsoleSyntax("amount must be a positive integer".into()))?;
@@ -559,10 +561,8 @@ fn parse_get(arguments: &str) -> Result<ConsoleCommand, AppError> {
             "amount must be greater than zero".into(),
         ));
     }
-    if parts.next().is_some() {
-        return Err(AppError::InvalidConsoleSyntax(USAGE.into()));
-    }
-    let resource_id = match crate::mobs::resolve_resource(resource)? {
+    let item_name = item_tokens.join(" ");
+    let resource_id = match crate::mobs::resolve_resource(&item_name)? {
         crate::mobs::ResourceKind::Ore { resource_id, .. } => resource_id,
         crate::mobs::ResourceKind::Mob { resource_id, .. } => resource_id,
     };
@@ -892,6 +892,21 @@ mod tests {
             })
         );
         assert!(parse_input("/take-item diamond 0").is_err());
+        // `raw_beef` is not a real item id (vanilla drops the "raw_"
+        // prefix) -- take-item must correct it to what will actually match
+        // an inventory slot, not search for the guessed id verbatim.
+        assert_eq!(
+            parse_input("/take-item raw_beef 1").unwrap(),
+            ConsoleInput::Command(ConsoleCommand::TakeItem {
+                item_id: "minecraft:beef".into(),
+                count: 1
+            })
+        );
+        // A genuinely nonexistent item id must still be rejected.
+        assert!(matches!(
+            parse_input("/take-item not_a_real_item 1"),
+            Err(AppError::UnknownItemIdentifier(_))
+        ));
     }
 
     #[test]
@@ -965,10 +980,15 @@ mod tests {
 
     #[test]
     fn parses_get_resource_command() {
+        // Naming the *block* (`diamond_ore`) whose drop differs from itself
+        // still resolves `resource_id` to what mining it actually yields
+        // (`diamond`, never an uncollectible `diamond_ore` item) -- see
+        // `mobs::resolve_resource`'s `a_block_name_whose_drop_differs_...`
+        // test for the general rule.
         assert_eq!(
             parse_input("/get diamond_ore 15").unwrap(),
             ConsoleInput::Command(ConsoleCommand::GetResource {
-                resource_id: "minecraft:diamond_ore".into(),
+                resource_id: "minecraft:diamond".into(),
                 amount: 15,
             })
         );
@@ -1033,6 +1053,27 @@ mod tests {
             ConsoleInput::Command(ConsoleCommand::GetResource {
                 resource_id: "minecraft:white_wool".into(),
                 amount: 20,
+            })
+        );
+    }
+
+    #[test]
+    fn parses_get_resource_command_with_a_multi_word_item_name() {
+        // "Raw Beef" is not `minecraft:raw_beef` -- both the multi-word
+        // display-name spelling and its underscored equivalent must resolve
+        // to the real id, `minecraft:beef`.
+        assert_eq!(
+            parse_input("/get raw beef 10").unwrap(),
+            ConsoleInput::Command(ConsoleCommand::GetResource {
+                resource_id: "minecraft:beef".into(),
+                amount: 10,
+            })
+        );
+        assert_eq!(
+            parse_input("/get raw_beef 10").unwrap(),
+            ConsoleInput::Command(ConsoleCommand::GetResource {
+                resource_id: "minecraft:beef".into(),
+                amount: 10,
             })
         );
     }

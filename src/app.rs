@@ -299,6 +299,14 @@ impl App {
         println!("Loading configuration...\n");
         let config = Config::load(Path::new("config.toml"))?;
         crate::config::init_logging(&config.logging)?;
+        // Catches a hand-maintained table entry naming an item Minecraft
+        // doesn't have (the "Raw Beef" != `raw_beef` bug class) before it
+        // can surface later as "#get never finishes" -- non-fatal, since a
+        // bad entry for a resource this session never requests shouldn't
+        // block startup.
+        for problem in crate::items::audit_registered_items() {
+            logging::warning(format!("Invalid item registration: {problem}"));
+        }
         let block_navigation = BlockNavigationService::new(
             config.block_navigation.clone(),
             crate::blocks::BlockSearchService::new(

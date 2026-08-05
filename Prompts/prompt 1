@@ -1,250 +1,75 @@
-Optimize the Minecraft AI bot's block searching and mining system based on the current implementation analysis.
+Optimize the Minecraft AI bot block searching algorithm.
 
-Current behavior:
-- Every mining/gathering iteration performs a completely new radius-limited scan.
-- The bot searches chunks inside a radius around its current position.
-- It collects nearest candidates, moves to one, mines it, then throws away all previous candidates.
-- The next ore requires another full search from scratch.
+Important:
+Do NOT add long-term candidate caching or persistent target lists.
 
-This works, but it causes unnecessary repeated scanning, especially for commands like:
+The desired behavior is a fresh reactive mining system.
 
-#get diamond 10
+Current problem:
+The bot scans a radius, stores many candidates, mines one, and can potentially work with outdated information.
 
-where the bot repeatedly scans the same area after every diamond mined.
+New behavior:
 
-Goal:
-Optimize the system without changing the existing behavior or breaking navigation.
+For mining/getting resources:
 
-==================================================
-1. Candidate List Reuse
-==================================================
+1. Start a fresh search from the bot's current position.
 
-Implement candidate caching/reuse between mining iterations.
+2. Search outward from the bot:
+- Prioritize closer chunks/blocks first.
+- Use distance sorting or spiral/radius expansion.
+- Do not scan the entire radius if a valid target is already found.
 
-Current:
-1. Scan for ores.
-2. Pick closest ore.
-3. Mine ore.
-4. Clear candidates.
-5. Scan everything again.
+3. As soon as a valid reachable target block is found:
+- Stop searching immediately.
+- Navigate to that block.
+- Mine it.
 
-Optimized:
-1. Scan for ores.
-2. Store candidate list.
-3. Pick closest ore.
-4. Mine ore.
-5. Remove mined block from candidate list.
-6. Continue using remaining valid candidates.
-7. Only perform a new scan when:
-   - Candidate list is empty.
-   - All remaining candidates are invalid.
-   - The bot moved far enough that the search radius changed significantly.
-   - A block update invalidates stored data.
-
-The bot should not rescan after every single block.
-
-==================================================
-2. Chunk-Level Search Cache
-==================================================
-
-Add a cache for block search results.
-
-Cache key example:
-
-(chunk_x, chunk_z, block_type)
-
-Store:
-- Found block positions.
-- Time of scan.
-- Chunk state/version if available.
+4. After mining:
+- Discard the previous search result.
+- Start a completely new search from the bot's updated position.
 
 Example:
 
-Chunk 10,20:
-- diamond_ore:
-  - x100 y12 z320
-  - x105 y8 z315
-
-- deepslate_diamond_ore:
-  - x98 y5 z310
-
-
-When searching again:
-- Use cached chunk data first.
-- Only rescan chunks that changed.
-
-==================================================
-3. Block Change Invalidation
-==================================================
-
-The cache must stay accurate.
-
-Invalidate cached entries when:
-- The bot mines a block.
-- A block update packet is received.
-- A nearby block changes.
-
-Example:
-
-Diamond ore at:
-100,12,320
-
-Bot mines it.
-
-Remove:
-100,12,320
-
-from cache immediately.
-
-Do not keep outdated blocks.
-
-==================================================
-4. Multi-Ore Search Optimization
-==================================================
-
-Currently:
-
-#get diamond
-
-searches:
-- diamond_ore
-- deepslate_diamond_ore
-
-separately.
-
-Optimize:
-
-Search all requested block types in one chunk scan.
-
-Instead of:
-
-Scan chunk for diamond_ore.
-Scan chunk again for deepslate_diamond_ore.
-
-Do:
-
-Scan chunk once:
-- Check all target block IDs.
-- Add matching blocks.
-- Tag each candidate with its block type.
-
-This should also work for future ore groups.
-
-==================================================
-5. Smart Rescan Logic
-==================================================
-
-Add intelligent conditions.
-
-Do not immediately rescan after mining.
-
-Example:
-
-#get diamond 10
+#get iron 10
 
 Flow:
 
-Scan radius:
-32 blocks
+Search nearby area.
+↓
+Find iron_ore.
+↓
+Stop scanning.
+↓
+Walk to iron_ore.
+↓
+Mine iron_ore.
+↓
+Check inventory.
+↓
+Start a completely new search.
 
-Find:
-20 candidates
+Repeat until enough iron is collected.
 
-Mine closest.
+Important:
+The world is dynamic:
+- Blocks can change.
+- Other entities/players can mine blocks.
+- Fluids can update.
+- Previous targets can become invalid.
 
-Remaining:
-19 candidates.
+Therefore:
+- Do not keep old candidates between mining operations.
+- Do not rely on cached block positions.
 
-Continue.
-
-Only scan again if:
-- No candidates remain.
-- The bot traveled outside the original search area.
-- The player requests more resources.
-- Cache timeout is reached.
-
-==================================================
-6. Preserve Current Pathfinding Behavior
-==================================================
-
-Do NOT change:
-- Movement logic.
-- Reachability checks.
-- Approach position calculation.
-- Failed block handling.
-- Mining interaction.
-
-The optimization should only improve searching.
+Optimization goals:
+- Avoid unnecessary full-radius scans.
+- Find the nearest valid target quickly.
+- Keep the search reactive and accurate.
 
 Keep:
-- nearest reachable target selection.
-- fallback candidates.
-- failed_blocks logic.
+- Reachability checks.
+- Failed block handling.
+- Pathfinding logic.
+- Ore resolver system.
 
-==================================================
-7. Performance Logging
-
-Add optional debug logging:
-
-Example:
-
-Before:
-
-"Searching 25 chunks for diamond"
-"Found 20 candidates"
-
-After optimization:
-
-"Using cached search results"
-"19 valid candidates remaining"
-"Skipped redundant chunk scan"
-
-When rescanning:
-
-"Cache expired, performing fresh search"
-
-==================================================
-8. Testing Requirements
-
-Test:
-
-#get diamond 10
-
-Expected:
-- Initial scan happens.
-- Multiple diamonds are mined without repeated scans.
-
-Test:
-
-#get iron 50
-
-Expected:
-- Iron ore and deepslate iron ore share the same optimized search.
-
-Test:
-
-Mine an ore:
-- Cache removes the mined position.
-
-Test:
-
-Move into a new area:
-- New chunks are scanned.
-
-Test:
-
-Block update:
-- Changed chunks are refreshed.
-
-==================================================
-
-Final goal:
-
-Create a smart mining search system that behaves like an intelligent miner:
-
-- Scan once.
-- Remember useful targets.
-- Reuse valid information.
-- Update only when necessary.
-- Avoid scanning the same chunks repeatedly.
-- Maintain all existing mining and navigation features.
+Only optimize the search strategy.

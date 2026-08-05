@@ -6,6 +6,7 @@ mod console;
 mod container;
 mod error;
 mod interaction;
+mod items;
 mod logging;
 mod look;
 pub mod minecraft;

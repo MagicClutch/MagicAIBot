@@ -92,6 +92,31 @@ pub fn drop_blocks_for_item(item_id: &str) -> Vec<&'static str> {
         .collect()
 }
 
+/// The forward direction of [`BLOCK_DROPS`]: what item mining `block_id`
+/// actually yields, when that differs from the block's own id. `None` means
+/// the block is not in the table -- it drops itself, and the caller should
+/// use the block's own id as the item id.
+///
+/// This is what corrects `mobs::resolve_resource`'s fallback path: a caller
+/// typing a block name whose drop differs from itself (`iron_ore`, `stone`,
+/// `carrots`, `sea_lantern`, ...) must have inventory counted against the
+/// item it actually receives, not against the block's name -- `minecraft:
+/// iron_ore` and `minecraft:carrots` are not obtainable items, and even
+/// where a same-named item *does* exist (silk-touch-only block items), it is
+/// never what plain mining produces.
+pub fn drop_item_for_block(block_id: &str) -> Option<&'static str> {
+    BLOCK_DROPS
+        .iter()
+        .find(|(block, _)| *block == block_id)
+        .map(|(_, item)| *item)
+}
+
+/// Every item id referenced by [`BLOCK_DROPS`], for startup registry
+/// validation (`items::audit_registered_items`).
+pub(crate) fn registered_drop_items() -> impl Iterator<Item = &'static str> {
+    BLOCK_DROPS.iter().map(|(_, item)| *item)
+}
+
 /// Bare (non-namespaced) id for concise console output, e.g. `iron_ore` from
 /// `minecraft:iron_ore`.
 pub fn bare_id(id: &str) -> &str {
@@ -217,5 +242,31 @@ mod tests {
     fn bare_id_strips_the_namespace() {
         assert_eq!(bare_id("minecraft:iron_ore"), "iron_ore");
         assert_eq!(bare_id("iron_ore"), "iron_ore");
+    }
+
+    #[test]
+    fn drop_item_for_block_resolves_the_forward_direction() {
+        assert_eq!(
+            drop_item_for_block("minecraft:iron_ore"),
+            Some("minecraft:raw_iron")
+        );
+        assert_eq!(
+            drop_item_for_block("minecraft:deepslate_diamond_ore"),
+            Some("minecraft:diamond")
+        );
+        assert_eq!(
+            drop_item_for_block("minecraft:carrots"),
+            Some("minecraft:carrot")
+        );
+        assert_eq!(
+            drop_item_for_block("minecraft:stone"),
+            Some("minecraft:cobblestone")
+        );
+    }
+
+    #[test]
+    fn drop_item_for_block_is_none_for_self_dropping_blocks() {
+        assert_eq!(drop_item_for_block("minecraft:oak_log"), None);
+        assert_eq!(drop_item_for_block("minecraft:cobblestone"), None);
     }
 }

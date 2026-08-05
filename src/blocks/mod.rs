@@ -4,4 +4,4 @@ pub mod block_snapshot;
 pub mod drops;
 
 pub use block_search::BlockSearchService;
-pub use drops::{bare_id, drop_blocks_for_item};
+pub use drops::{bare_id, drop_blocks_for_item, drop_item_for_block};

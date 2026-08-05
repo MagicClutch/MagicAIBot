@@ -45,8 +45,10 @@ pub enum ResourceKind {
     Mob { resource_id: String, mob_id: String },
 }
 
-/// Normalizes `input` the same way block identifiers are (trim, lowercase,
-/// default `minecraft:` namespace, single-colon vanilla-namespace syntax)
+/// Normalizes `input` through the central item registry
+/// (`items::normalize_item_id`: trim, lowercase, whitespace-collapsing so
+/// multi-word input like `"raw beef"` works, default `minecraft:` namespace,
+/// and correction of known wrong guesses such as `raw_beef` -> `beef`)
 /// without requiring it to be a *block* -- `#get`'s argument may equally be
 /// an item obtained only from ore (`raw_iron`) or only from a mob
 /// (`leather`).
@@ -65,13 +67,27 @@ pub enum ResourceKind {
 ///    wins whenever step 1 matches at all.
 /// 3. **Plain block fallback** -- if step 1 found nothing at all (not even
 ///    the item's own block form) and step 2 found no mob either, the
-///    identifier is unknown. Note this means a mob-drop item that also
-///    happens to be an unrelated placeable block (the wool colors) still
-///    resolves to farming the mob: step 1 is empty for wool (no block
-///    *converts* into it), so step 2 is reached before any block-identity
-///    fallback would apply.
+///    identifier is unknown, *unless* it names a valid block. Note this
+///    means a mob-drop item that also happens to be an unrelated placeable
+///    block (the wool colors) still resolves to farming the mob: step 1 is
+///    empty for wool (no block *converts* into it), so step 2 is reached
+///    before this fallback would apply.
+///
+///    Critically, this fallback does not assume a block's own id is the
+///    item id mining it produces (that assumption is exactly the "Raw Beef
+///    is not raw_beef" bug class this module exists to avoid) -- it checks
+///    `blocks::drop_item_for_block` first, so typing a block name whose
+///    drop differs from itself (`iron_ore`, `stone`, `carrots`,
+///    `sea_lantern`, ...) still resolves `resource_id` to what mining it
+///    actually yields (`raw_iron`, `cobblestone`, `carrot`,
+///    `prismarine_crystals`), not to the block's own (uncollectible or
+///    simply wrong) name.
+///
+/// Every path validates the final `resource_id` against Azalea's item
+/// registry (`items::validate_item_id`) before returning, so a resolution
+/// can never hand back an id that cannot exist in an inventory.
 pub fn resolve_resource(input: &str) -> Result<ResourceKind, AppError> {
-    let normalized = normalize_item_syntax(input)?;
+    let normalized = crate::items::normalize_item_id(input)?;
     let mut ore_blocks: Vec<String> = drop_blocks_for_item(&normalized)
         .into_iter()
         .map(str::to_owned)
@@ -82,58 +98,34 @@ pub fn resolve_resource(input: &str) -> Result<ResourceKind, AppError> {
         {
             ore_blocks.push(block_id);
         }
+        crate::items::validate_item_id(&normalized)?;
         return Ok(ResourceKind::Ore {
             resource_id: normalized,
             blocks: ore_blocks,
         });
     }
     if let Some(mob_id) = mob_for_resource(&normalized) {
+        crate::items::validate_item_id(&normalized)?;
         return Ok(ResourceKind::Mob {
             resource_id: normalized,
             mob_id: mob_id.to_owned(),
         });
     }
     match normalize_block_id(input) {
-        Ok(block_id) => Ok(ResourceKind::Ore {
-            resource_id: normalized,
-            blocks: vec![block_id],
-        }),
+        Ok(block_id) => {
+            // The block's own id is only the right `resource_id` when
+            // mining it drops itself. When it doesn't (see the doc comment
+            // above), use what it actually drops instead.
+            let resource_id = crate::blocks::drop_item_for_block(&block_id)
+                .map_or_else(|| normalized.clone(), str::to_owned);
+            crate::items::validate_item_id(&resource_id)?;
+            Ok(ResourceKind::Ore {
+                resource_id,
+                blocks: vec![block_id],
+            })
+        }
         Err(_) => Err(AppError::UnknownResourceIdentifier(normalized)),
     }
-}
-
-/// The same structural validation `normalize_block_id` applies (trim,
-/// lowercase, single `minecraft:` namespace, allowed charset) without the
-/// final block-registry check -- the caller already tried that path via
-/// `normalize_block_id` itself.
-fn normalize_item_syntax(input: &str) -> Result<String, AppError> {
-    let input = input.trim().to_ascii_lowercase();
-    if input.is_empty() || input.chars().any(char::is_whitespace) {
-        return Err(AppError::InvalidBlockIdentifier(
-            "resource identifier must not be empty or contain spaces".into(),
-        ));
-    }
-    let normalized = if input.contains(':') {
-        input
-    } else {
-        format!("minecraft:{input}")
-    };
-    let Some((namespace, path)) = normalized.split_once(':') else {
-        return Err(AppError::InvalidBlockIdentifier(
-            "resource identifier must contain a valid namespace and path".into(),
-        ));
-    };
-    if namespace != "minecraft"
-        || path.is_empty()
-        || normalized.matches(':').count() != 1
-        || !crate::blocks::block_query::valid_identifier_part(namespace, true)
-        || !crate::blocks::block_query::valid_identifier_part(path, false)
-    {
-        return Err(AppError::InvalidBlockIdentifier(format!(
-            "malformed resource identifier: {normalized}"
-        )));
-    }
-    Ok(normalized)
 }
 
 #[cfg(test)]
@@ -261,9 +253,71 @@ mod tests {
             resolve_resource(""),
             Err(AppError::InvalidBlockIdentifier(_))
         ));
+        // A space is now a legal word separator (`items::normalize_item_id`
+        // collapses it to `_`), so this is rejected for being *unknown*, not
+        // for its syntax.
         assert!(matches!(
             resolve_resource("has space"),
-            Err(AppError::InvalidBlockIdentifier(_))
+            Err(AppError::UnknownResourceIdentifier(_))
         ));
+    }
+
+    #[test]
+    fn corrects_wrong_item_guesses_for_mob_drops() {
+        // "Raw Beef" is not `minecraft:raw_beef` -- vanilla's id is
+        // `minecraft:beef`. Both the underscored and literal multi-word
+        // spelling must resolve identically.
+        for input in ["raw_beef", "raw beef", "RAW BEEF"] {
+            assert_eq!(
+                resolve_resource(input).unwrap(),
+                ResourceKind::Mob {
+                    resource_id: "minecraft:beef".into(),
+                    mob_id: "minecraft:cow".into(),
+                },
+                "{input}"
+            );
+        }
+        assert_eq!(
+            resolve_resource("raw salmon").unwrap(),
+            ResourceKind::Mob {
+                resource_id: "minecraft:salmon".into(),
+                mob_id: "minecraft:polar_bear".into(),
+            }
+        );
+        assert_eq!(
+            resolve_resource("fish").unwrap(),
+            ResourceKind::Mob {
+                resource_id: "minecraft:cod".into(),
+                mob_id: "minecraft:polar_bear".into(),
+            }
+        );
+    }
+
+    #[test]
+    fn a_block_name_whose_drop_differs_resolves_to_the_actual_drop_item() {
+        // Typing the *block*'s name (not the item it drops) must still
+        // count inventory against what mining it actually yields --
+        // `minecraft:iron_ore` is not an item that plain mining produces.
+        assert_eq!(
+            resolve_resource("iron_ore").unwrap(),
+            ResourceKind::Ore {
+                resource_id: "minecraft:raw_iron".into(),
+                blocks: vec!["minecraft:iron_ore".into()],
+            }
+        );
+        assert_eq!(
+            resolve_resource("carrots").unwrap(),
+            ResourceKind::Ore {
+                resource_id: "minecraft:carrot".into(),
+                blocks: vec!["minecraft:carrots".into()],
+            }
+        );
+        assert_eq!(
+            resolve_resource("stone").unwrap(),
+            ResourceKind::Ore {
+                resource_id: "minecraft:cobblestone".into(),
+                blocks: vec!["minecraft:stone".into()],
+            }
+        );
     }
 }

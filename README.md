@@ -106,6 +106,33 @@ Both stop and report `[ERROR] Block not found: <block>` / `[ERROR] Mob not found
 candidate exists in the loaded world, and abort after 5 consecutive failures rather than retrying
 forever. `/stop` cancels an in-progress run like any other movement/navigation.
 
+### Item identifier registry
+
+`src/items/mod.rs` is the single place that turns free-form item input into a canonical, registry-
+checked id. It exists because Minecraft's item ids do not always follow "display name, lowercased,
+spaces to underscores" -- Raw Beef is `minecraft:beef`, not `raw_beef`; Raw Cod is `minecraft:cod`,
+not `raw_cod` or the pre-1.13 `fish`; mining `iron_ore` without Silk Touch yields `minecraft:raw_iron`,
+never an item called `iron_ore`. A resolver that assumes otherwise doesn't fail loudly -- it silently
+asks `InventorySnapshot::count_item` for something the server can never report, which looks like
+"`#get` mines forever and inventory never updates."
+
+- `items::normalize_item_id` collapses whitespace (so `#get raw beef 10` parses as the single item
+  `raw beef`, not two arguments) and corrects known wrong guesses via a hand-maintained alias table
+  (`raw_beef` -> `beef`, `fish`/`raw_cod` -> `cod`, `scute` -> `turtle_scute`, `lapis` ->
+  `lapis_lazuli`, ...).
+- `items::validate_item_id` confirms the result actually exists in Azalea's item registry
+  (`azalea::registry::builtin::ItemKind`) before anything is allowed to search inventory for it.
+- `items::audit_registered_items` walks every id referenced by `blocks::drops::BLOCK_DROPS`,
+  `mobs::drops::MOB_DROPS`, and the alias table, checks each against the registry, and is called once
+  at startup (`App::initialize`) -- any bad hand-maintained table entry is logged as a warning
+  immediately instead of surfacing later as an unexplained stuck `#get`.
+- `mobs::resolve_resource` uses the registry for every path, including one direction that used to be
+  silently wrong: naming a *block* whose drop differs from itself (`#get iron_ore`, `#get carrots`,
+  `#get stone`) now resolves `resource_id` to what mining it actually yields (`raw_iron`, `carrot`,
+  `cobblestone`) via `blocks::drop_item_for_block`, not to the block's own (uncollectible) name.
+- `/equip`, `/take-item`, `/store-item`, and `/interact`'s item list all normalize through the same
+  registry, so none of them can accept a guessed id that can never match a real inventory slot.
+
 ## Architecture and tests
 
 See [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) for ownership, lease order, cleanup, and the
@@ -155,6 +182,8 @@ src/
 ├── look/         # Rotation and look controllers
 ├── interaction/  # Block break/place, tool selection
 ├── blocks/       # Loaded-block search
+├── mobs/         # Mob-drop resolution, combat
+├── items/        # Central item-identifier registry and validation
 ├── tasks/        # Shared action-failure/identity types used by interaction
 └── container/    # Chest interaction
 ```

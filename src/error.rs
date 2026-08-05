@@ -87,6 +87,8 @@ pub enum AppError {
     NoMatchingMob,
     #[error("unknown resource identifier: {0}")]
     UnknownResourceIdentifier(String),
+    #[error("unknown item identifier: {0}")]
+    UnknownItemIdentifier(String),
     #[error("combat was cancelled")]
     CombatCancelled,
     #[error("no valid approach position")]

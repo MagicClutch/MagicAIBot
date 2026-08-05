@@ -2,26 +2,33 @@
 //! single source of truth for "which mob drops this item" -- extending
 //! supported mobs/drops means adding or editing a row here; nothing else in
 //! the mob-farming path needs to change.
+//!
+//! Every drop id here must be the actual Minecraft item id, not a guessed
+//! "display name -> snake_case" transform -- vanilla drops the "raw_" prefix
+//! entirely for meat (`beef`, `porkchop`, `mutton`, `chicken`, `rabbit`, not
+//! `raw_beef`/`raw_porkchop`/...) and renamed fish items at the 1.13
+//! flattening (`cod`/`salmon`, not `fish`/`raw_cod`/`raw_salmon`). A wrong id
+//! here does not fail to compile or even fail a search -- it silently makes
+//! `#get` mine or hunt forever, since `InventorySnapshot::count_item` can
+//! never find an item the server never reports. `items::audit_registered_items`
+//! (called at startup) checks every id in this table against Azalea's item
+//! registry specifically to catch this class of mistake.
 
 /// `(mob entity id, drop item ids)`. Declared in this fixed order so a
 /// resource listed under more than one mob (`spider_eye`, dropped by both
 /// Spider and Witch) resolves to a deterministic mob rather than depending on
 /// hash-map iteration order.
 const MOB_DROPS: &[(&str, &[&str])] = &[
-    (
-        "minecraft:cow",
-        &["minecraft:leather", "minecraft:beef", "minecraft:raw_beef"],
-    ),
-    (
-        "minecraft:pig",
-        &["minecraft:porkchop", "minecraft:raw_porkchop"],
-    ),
+    ("minecraft:cow", &["minecraft:leather", "minecraft:beef"]),
+    ("minecraft:pig", &["minecraft:porkchop"]),
     (
         "minecraft:sheep",
         &[
             "minecraft:mutton",
-            "minecraft:raw_mutton",
-            "minecraft:wool",
+            // No generic "wool" item/block id exists since the 1.13
+            // flattening -- every color is its own id (`white_wool`, ...).
+            // `#get wool 10` is correctly rejected as unknown; a caller must
+            // name a color.
             "minecraft:white_wool",
             "minecraft:black_wool",
             "minecraft:gray_wool",
@@ -31,11 +38,7 @@ const MOB_DROPS: &[(&str, &[&str])] = &[
     ),
     (
         "minecraft:chicken",
-        &[
-            "minecraft:chicken",
-            "minecraft:raw_chicken",
-            "minecraft:feather",
-        ],
+        &["minecraft:chicken", "minecraft:feather"],
     ),
     (
         "minecraft:skeleton",
@@ -51,7 +54,6 @@ const MOB_DROPS: &[(&str, &[&str])] = &[
         "minecraft:rabbit",
         &[
             "minecraft:rabbit",
-            "minecraft:raw_rabbit",
             "minecraft:rabbit_hide",
             "minecraft:rabbit_foot",
         ],
@@ -78,14 +80,10 @@ const MOB_DROPS: &[(&str, &[&str])] = &[
     ("minecraft:blaze", &["minecraft:blaze_rod"]),
     ("minecraft:magma_cube", &["minecraft:magma_cream"]),
     ("minecraft:slime", &["minecraft:slime_ball"]),
-    ("minecraft:turtle", &["minecraft:scute"]),
+    ("minecraft:turtle", &["minecraft:turtle_scute"]),
     (
         "minecraft:polar_bear",
-        &[
-            "minecraft:fish",
-            "minecraft:raw_cod",
-            "minecraft:raw_salmon",
-        ],
+        &["minecraft:cod", "minecraft:salmon"],
     ),
 ];
 
@@ -106,6 +104,14 @@ pub fn mob_label(mob_id: &str) -> &str {
     mob_id.rsplit(':').next().unwrap_or(mob_id)
 }
 
+/// Every item id referenced by [`MOB_DROPS`], for startup registry
+/// validation (`items::audit_registered_items`).
+pub(crate) fn registered_drop_items() -> impl Iterator<Item = &'static str> {
+    MOB_DROPS
+        .iter()
+        .flat_map(|(_, drops)| drops.iter().copied())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -122,7 +128,10 @@ mod tests {
             mob_for_resource("minecraft:mutton"),
             Some("minecraft:sheep")
         );
-        assert_eq!(mob_for_resource("minecraft:wool"), Some("minecraft:sheep"));
+        assert_eq!(
+            mob_for_resource("minecraft:white_wool"),
+            Some("minecraft:sheep")
+        );
         assert_eq!(
             mob_for_resource("minecraft:feather"),
             Some("minecraft:chicken")
@@ -168,11 +177,15 @@ mod tests {
             Some("minecraft:slime")
         );
         assert_eq!(
-            mob_for_resource("minecraft:scute"),
+            mob_for_resource("minecraft:turtle_scute"),
             Some("minecraft:turtle")
         );
         assert_eq!(
-            mob_for_resource("minecraft:raw_cod"),
+            mob_for_resource("minecraft:cod"),
+            Some("minecraft:polar_bear")
+        );
+        assert_eq!(
+            mob_for_resource("minecraft:salmon"),
             Some("minecraft:polar_bear")
         );
     }
