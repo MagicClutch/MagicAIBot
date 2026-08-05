@@ -22,10 +22,25 @@ pub enum BlockNavigationState {
 #[derive(Clone, Debug, Default)]
 pub struct BlockNavigationSnapshot {
     pub state: BlockNavigationState,
+    /// The full set of block ids this search matches against -- always at
+    /// least one entry once a search has started. `requested_block_id`
+    /// mirrors the first entry for callers that only ever cared about a
+    /// single id (existing `/gotoblock`/status-display code); anything that
+    /// needs the complete set (multi-block `#get`/`#mine`) reads this
+    /// directly.
+    pub requested_block_ids: Vec<String>,
     pub requested_block_id: Option<String>,
     pub search_radius: Option<u32>,
     pub selected_block_position: Option<BlockPosition>,
     pub selected_approach_position: Option<BlockPosition>,
+    /// The specific block id of `selected_block_position`, as observed when
+    /// it was selected -- distinct from `requested_block_id` once more than
+    /// one id is being searched for, since the two candidates picked across
+    /// separate attempts need not share an id (e.g. `diamond_ore` vs.
+    /// `deepslate_diamond_ore`). `tick`'s ongoing re-validation must key off
+    /// this, not `requested_block_id`, or it would reject a perfectly valid
+    /// target for "not matching" an id it was never supposed to match.
+    pub selected_block_id: Option<String>,
     pub candidates_checked: usize,
     pub start_time: Option<SystemTime>,
     pub last_progress_time: Option<SystemTime>,

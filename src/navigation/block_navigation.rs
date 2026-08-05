@@ -64,18 +64,43 @@ impl BlockNavigationService {
         radius: u32,
         mode: NavigationMode,
     ) -> Result<(), AppError> {
+        self.start_multi(minecraft, movement, vec![block_id], radius, mode)
+            .await
+    }
+
+    /// Same contract as `start`, generalized to a set of block ids: scans
+    /// for all of them and mines whichever candidate (of any of the
+    /// requested ids) is nearest and reachable, falling back across
+    /// candidates exactly as `start` does for a single id. This is what
+    /// lets `#get` search every ore variant that produces a requested item
+    /// (`diamond_ore` and `deepslate_diamond_ore` for `diamond`) and
+    /// `#mine` accept multiple block targets in one call, without either
+    /// duplicating this whole search/approach/retry pipeline.
+    pub async fn start_multi(
+        &self,
+        minecraft: &MinecraftClient,
+        movement: &MovementService,
+        block_ids: Vec<String>,
+        radius: u32,
+        mode: NavigationMode,
+    ) -> Result<(), AppError> {
         if radius == 0 || radius > self.config.maximum_search_radius {
             return Err(AppError::InvalidBlockSearchRadius {
                 radius,
                 maximum: self.config.maximum_search_radius,
             });
         }
+        if block_ids.is_empty() {
+            return Err(AppError::NoMatchingBlock);
+        }
+        let label = display_ids(&block_ids);
         let generation = {
             let mut inner = self.inner.lock().await;
             let generation = inner.snapshot.generation.wrapping_add(1);
             inner.snapshot = BlockNavigationSnapshot {
                 state: BlockNavigationState::Searching,
-                requested_block_id: Some(block_id.clone()),
+                requested_block_id: block_ids.first().cloned(),
+                requested_block_ids: block_ids.clone(),
                 search_radius: Some(radius),
                 start_time: Some(SystemTime::now()),
                 last_progress_time: Some(SystemTime::now()),
@@ -91,32 +116,12 @@ impl BlockNavigationService {
         };
 
         let _ = movement.stop(minecraft).await;
-        logging::info(format!("Searching for {block_id} within {radius} blocks"));
-        let query = BlockSearchQuery {
-            block_id: block_id.clone(),
-            radius,
-            maximum_results: self.config.candidate_limit,
-            vertical_range: 0,
-        };
-        let candidates = match self.search.search_raw(minecraft, query).await {
-            Ok(candidates) => candidates,
-            Err(error) => {
-                let no_loaded_chunks = matches!(error, AppError::NoLoadedChunks);
-                self.fail(generation, error.to_string()).await;
-                if no_loaded_chunks {
-                    logging::warning(format!(
-                        "No loaded {block_id} block found within {radius} blocks"
-                    ));
-                } else {
-                    logging::warning(format!("Cannot reach {block_id}: {error}"));
-                }
-                return Ok(());
-            }
-        };
+        logging::info(format!("Searching for {label} within {radius} blocks"));
+        let candidates = self.search_candidates(minecraft, &block_ids, radius).await;
         if candidates.is_empty() {
             self.fail(generation, "no matching block".into()).await;
             logging::warning(format!(
-                "No loaded {block_id} block found within {radius} blocks"
+                "No loaded {label} block found within {radius} blocks"
             ));
             return Ok(());
         }
@@ -135,10 +140,37 @@ impl BlockNavigationService {
             self.fail(generation, "no reachable approach position".into())
                 .await;
             logging::warning(format!(
-                "Cannot reach {block_id}: no reachable approach position"
+                "Cannot reach {label}: no reachable approach position"
             ));
         }
         Ok(())
+    }
+
+    /// Scans every id in `block_ids` and merges the results into one
+    /// distance-sorted candidate list. Per-id search failures (an unloaded
+    /// world, an invalid id slipping through) are treated as "no candidates
+    /// from that id" rather than aborting the whole multi-id search --
+    /// exactly one truly failing id must not prevent finding a perfectly
+    /// good candidate from another.
+    async fn search_candidates(
+        &self,
+        minecraft: &MinecraftClient,
+        block_ids: &[String],
+        radius: u32,
+    ) -> Vec<BlockSnapshot> {
+        let mut merged = Vec::new();
+        for block_id in block_ids {
+            let query = BlockSearchQuery {
+                block_id: block_id.clone(),
+                radius,
+                maximum_results: self.config.candidate_limit,
+                vertical_range: 0,
+            };
+            if let Ok(candidates) = self.search.search_raw(minecraft, query).await {
+                merged.extend(candidates);
+            }
+        }
+        crate::blocks::block_search::sort_deduplicate_limit(merged, self.config.candidate_limit)
     }
 
     /// Navigate to the existing exact block position using the same safe
@@ -161,6 +193,7 @@ impl BlockNavigationService {
             inner.snapshot = BlockNavigationSnapshot {
                 state: BlockNavigationState::SelectingTarget,
                 requested_block_id: Some(block_id.clone()),
+                requested_block_ids: vec![block_id.clone()],
                 search_radius: Some(0),
                 start_time: Some(SystemTime::now()),
                 last_progress_time: Some(SystemTime::now()),
@@ -258,15 +291,22 @@ impl BlockNavigationService {
         ) {
             return;
         }
-        let Some(block_id) = snapshot.requested_block_id.clone() else {
+        if snapshot.requested_block_ids.is_empty() {
             return;
-        };
+        }
         let Some(target) = snapshot.selected_block_position else {
             return;
         };
         let Some(approach) = snapshot.selected_approach_position else {
             return;
         };
+        // The specific id of the *currently selected* candidate, not the
+        // whole requested set -- see `BlockNavigationSnapshot::selected_block_id`'s
+        // doc comment for why re-validation must key off this one.
+        let Some(selected_block_id) = snapshot.selected_block_id.clone() else {
+            return;
+        };
+        let label = display_ids(&snapshot.requested_block_ids);
         let world = minecraft.world_state_snapshot().await;
         if world.bot.alive == Some(false) || !world.joined_world() {
             self.cancel(minecraft, movement).await;
@@ -276,7 +316,7 @@ impl BlockNavigationService {
             self.fail(snapshot.generation, "navigation timed out".into())
                 .await;
             let _ = movement.stop(minecraft).await;
-            logging::warning(format!("Cannot reach {block_id}: timeout"));
+            logging::warning(format!("Cannot reach {label}: timeout"));
             return;
         }
 
@@ -287,7 +327,6 @@ impl BlockNavigationService {
                 minecraft,
                 movement,
                 snapshot.generation,
-                &block_id,
                 "target chunk unloaded",
             )
             .await;
@@ -296,7 +335,7 @@ impl BlockNavigationService {
         if !is_valid_approach(
             target,
             approach,
-            &block_id,
+            &selected_block_id,
             &cells,
             self.config.interaction_distance,
         ) {
@@ -306,7 +345,6 @@ impl BlockNavigationService {
                 minecraft,
                 movement,
                 snapshot.generation,
-                &block_id,
                 "no reachable approach position",
             )
             .await;
@@ -333,7 +371,7 @@ impl BlockNavigationService {
                 let mut inner = self.inner.lock().await;
                 inner.snapshot.state = BlockNavigationState::Reached;
                 logging::success(format!(
-                    "Reached {block_id} at ({}, {}, {})",
+                    "Reached {selected_block_id} at ({}, {}, {})",
                     target.x, target.y, target.z
                 ));
                 return;
@@ -368,7 +406,6 @@ impl BlockNavigationService {
                 minecraft,
                 movement,
                 snapshot.generation,
-                &block_id,
                 "no progress toward target",
             )
             .await;
@@ -387,7 +424,6 @@ impl BlockNavigationService {
                 minecraft,
                 movement,
                 snapshot.generation,
-                &block_id,
                 "no reachable approach position",
             )
             .await;
@@ -466,6 +502,7 @@ impl BlockNavigationService {
                 inner.snapshot.state = BlockNavigationState::Moving;
                 inner.snapshot.selected_block_position = Some(candidate.position);
                 inner.snapshot.selected_approach_position = Some(approach);
+                inner.snapshot.selected_block_id = Some(candidate.block_id.clone());
                 inner.snapshot.last_progress_time = Some(SystemTime::now());
                 inner.snapshot.last_position = None;
                 logging::info(format!(
@@ -499,7 +536,6 @@ impl BlockNavigationService {
         minecraft: &MinecraftClient,
         movement: &MovementService,
         generation: u64,
-        _block_id: &str,
         reason: &str,
     ) {
         if self
@@ -509,21 +545,18 @@ impl BlockNavigationService {
         {
             return;
         }
-        let (block_id, radius) = {
+        let (block_ids, radius) = {
             let inner = self.inner.lock().await;
             (
-                inner.snapshot.requested_block_id.clone(),
+                inner.snapshot.requested_block_ids.clone(),
                 inner.snapshot.search_radius,
             )
         };
-        if let (Some(block_id), Some(radius)) = (block_id, radius) {
-            let query = BlockSearchQuery {
-                block_id,
-                radius,
-                maximum_results: self.config.candidate_limit,
-                vertical_range: 0,
-            };
-            if let Ok(candidates) = self.search.search_raw(minecraft, query).await {
+        if let Some(radius) = radius
+            && !block_ids.is_empty()
+        {
+            let candidates = self.search_candidates(minecraft, &block_ids, radius).await;
+            {
                 let mut inner = self.inner.lock().await;
                 for candidate in candidates {
                     if !inner.failed_blocks.contains(&candidate.position)
@@ -547,12 +580,8 @@ impl BlockNavigationService {
         {
             self.fail(generation, reason.into()).await;
             let _ = movement.stop(minecraft).await;
-            let block_id = self
-                .snapshot()
-                .await
-                .requested_block_id
-                .unwrap_or_else(|| "requested block".into());
-            logging::warning(format!("Cannot reach {block_id}: {reason}"));
+            let label = display_ids(&self.snapshot().await.requested_block_ids);
+            logging::warning(format!("Cannot reach {label}: {reason}"));
         }
     }
 
@@ -577,6 +606,14 @@ impl BlockNavigationService {
     }
 }
 
+/// Console-facing label for a set of requested block ids -- just the id
+/// itself for the (overwhelmingly common) single-id case, so every existing
+/// single-id log message is byte-for-byte unchanged; a comma-joined list
+/// once `#get`/`#mine` are searching for more than one.
+fn display_ids(block_ids: &[String]) -> String {
+    block_ids.join(", ")
+}
+
 fn center(position: BlockPosition) -> PositionSnapshot {
     PositionSnapshot {
         x: f64::from(position.x) + 0.5,
@@ -587,4 +624,32 @@ fn center(position: BlockPosition) -> PositionSnapshot {
 
 fn distance(a: PositionSnapshot, b: PositionSnapshot) -> f64 {
     ((a.x - b.x).powi(2) + (a.y - b.y).powi(2) + (a.z - b.z).powi(2)).sqrt()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn display_ids_matches_single_id_wording_exactly() {
+        // Single-id calls (the overwhelmingly common case: `/gotoblock`,
+        // `InteractionController`'s auto-navigate, a plain `#get oak_log`)
+        // must produce byte-identical log text to before multi-id support
+        // existed -- no comma, no brackets.
+        assert_eq!(
+            display_ids(&["minecraft:oak_log".to_owned()]),
+            "minecraft:oak_log"
+        );
+    }
+
+    #[test]
+    fn display_ids_joins_multiple_ids_for_multi_block_searches() {
+        assert_eq!(
+            display_ids(&[
+                "minecraft:diamond_ore".to_owned(),
+                "minecraft:deepslate_diamond_ore".to_owned(),
+            ]),
+            "minecraft:diamond_ore, minecraft:deepslate_diamond_ore"
+        );
+    }
 }

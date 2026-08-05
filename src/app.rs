@@ -672,8 +672,29 @@ impl App {
                             WaitOutcome::Finished(Ok(())) => {}
                             WaitOutcome::Finished(Err(_)) => {
                                 // Already reported with the required `#get`
-                                // message format inside `run_get_block` /
+                                // message format inside `run_get_item` /
                                 // `run_get_mob`.
+                            }
+                            WaitOutcome::Interrupted(next) => {
+                                input = next;
+                                continue;
+                            }
+                        }
+                    }
+                    ConsoleCommand::Mine { block_ids, amount } => {
+                        self.interaction
+                            .cancel(&self.minecraft, &self.movement, &self.look)
+                            .await;
+                        self.combat
+                            .cancel(&self.minecraft, &self.movement, &self.look)
+                            .await;
+                        self.block_navigation
+                            .cancel(&self.minecraft, &self.movement)
+                            .await;
+                        match self.mine_and_wait(block_ids, amount, input_rx).await {
+                            WaitOutcome::Finished(Ok(())) => {}
+                            WaitOutcome::Finished(Err(_)) => {
+                                // Already reported inside `run_mine`.
                             }
                             WaitOutcome::Interrupted(next) => {
                                 input = next;
@@ -1730,12 +1751,15 @@ impl App {
         result
     }
 
-    /// Universal Baritone-style `/get <resource> <amount>` (also reachable as
-    /// `#get <resource> <amount>` from Minecraft chat). `resource` can name
-    /// either a block or a mob drop; `resolve_and_run_get_resource` is the
-    /// single place that decides which, via `mobs::resolve_resource`, and
-    /// dispatches to `run_get_block` or `run_get_mob` accordingly -- the
-    /// caller here stays resource-kind-agnostic.
+    /// Item-based `/get <item> <amount>` (also reachable as `#get <item>
+    /// <amount>` from Minecraft chat). `item` never names a block to mine
+    /// directly -- `resolve_and_run_get_resource` is the single place that
+    /// decides how it's obtained, via `mobs::resolve_resource`, and
+    /// dispatches to `run_get_item` (ore/conversion source blocks) or
+    /// `run_get_mob` (a mob drop) accordingly -- the caller here stays
+    /// resource-kind-agnostic. Contrast with `/mine`
+    /// (`run_mine`/`mine_and_wait`), which targets a block directly and
+    /// never resolves anything.
     async fn get_resource_and_wait(
         &self,
         resource_id: String,
@@ -1760,8 +1784,12 @@ impl App {
         input_rx: &mut InputReceiver,
     ) -> WaitOutcome {
         match mobs::resolve_resource(resource_id) {
-            Ok(mobs::ResourceKind::Block(block_id)) => {
-                self.run_get_block(&block_id, amount, input_rx).await
+            Ok(mobs::ResourceKind::Ore {
+                resource_id,
+                blocks,
+            }) => {
+                self.run_get_item(&resource_id, &blocks, amount, input_rx)
+                    .await
             }
             Ok(mobs::ResourceKind::Mob { mob_id, .. }) => {
                 self.run_get_mob(resource_id, &mob_id, amount, input_rx)
@@ -1780,35 +1808,37 @@ impl App {
     }
 
     /// Deliberately not a separate gathering system: each iteration reuses
-    /// `BlockNavigationService::start` (nearest-*reachable* block, already
-    /// falling back across candidates and never retrying an approach it just
-    /// proved impossible -- see that type's `try_next_target`) to walk to a
-    /// fresh scan of loaded chunks, then `InteractionController::break_at`
-    /// (tool selection, precise look, break, verified removal) on the exact
-    /// block navigation just reached. No block list is hardcoded anywhere in
-    /// this path -- any block accepted by `normalize_block_id` (i.e. any
-    /// block in Azalea's registry) works here.
+    /// `BlockNavigationService::start_multi` (nearest-*reachable* block
+    /// among every candidate source, already falling back across candidates
+    /// and never retrying an approach it just proved impossible -- see that
+    /// type's `try_next_target`) to walk to a fresh scan of loaded chunks,
+    /// then `InteractionController::break_at` (tool selection, precise
+    /// look, break, verified removal) on the exact block navigation just
+    /// reached.
     ///
     /// Mining and inventory-counting deliberately target different ids:
-    /// `block_id` (what gets scanned for, navigated to, and broken) is
-    /// always the block the caller asked for, but many blocks drop an item
-    /// with a different registry id (`minecraft:iron_ore` -> `raw_iron`,
-    /// `minecraft:stone` -> `cobblestone`, `minecraft:deepslate_diamond_ore`
-    /// -> `diamond`, ...). `drop_item` (resolved once up front via
-    /// `blocks::drop_item_for_block` -- see that module for why this can't
-    /// come from real loot-table data) is what inventory is actually counted
-    /// against; using `block_id` there would wait on a count that can never
-    /// increase for any block with a differing drop.
-    async fn run_get_block(
+    /// `block_ids` (what gets scanned for, navigated to, and broken -- one
+    /// or more candidate source blocks, e.g. `diamond_ore` and
+    /// `deepslate_diamond_ore` for `diamond`, resolved once up front by
+    /// `mobs::resolve_resource`) is never what inventory is counted
+    /// against. `resource_id` is; using a mined block's id there would wait
+    /// on a count that can never increase for any block whose drop differs
+    /// from itself.
+    async fn run_get_item(
         &self,
-        block_id: &str,
+        resource_id: &str,
+        block_ids: &[String],
         amount: u32,
         input_rx: &mut InputReceiver,
     ) -> WaitOutcome {
         let radius = self.config.block_navigation.maximum_search_radius;
-        let drop_item = blocks::drop_item_for_block(block_id).to_owned();
-        let block_label = blocks::bare_id(block_id).to_owned();
-        let drop_label = blocks::bare_id(&drop_item).to_owned();
+        let resource_label = blocks::bare_id(resource_id).to_owned();
+        let block_label = join_labels(block_ids, "/");
+        if !(block_ids.len() == 1 && block_ids[0] == resource_id) {
+            logging::info(format!(
+                "Gathering {resource_label} by mining {block_label}"
+            ));
+        }
         let mut consecutive_failures: u32 = 0;
         loop {
             let current = self
@@ -1816,63 +1846,62 @@ impl App {
                 .world_state_snapshot()
                 .await
                 .inventory
-                .count_item(&drop_item);
+                .count_item(resource_id);
             logging::info(format!("Inventory: {current}/{amount}"));
             if get_resource_satisfied(current, amount) {
-                if drop_item == block_id {
-                    logging::success(format!("Successfully got {amount} {block_label}"));
-                } else {
-                    logging::success(format!(
-                        "Collected {amount} {drop_label} from {block_label}"
-                    ));
-                }
+                logging::success(format!("Collected {amount} {resource_label}"));
                 return WaitOutcome::Finished(Ok(()));
             }
 
             logging::info(format!("Scanning loaded chunks for {block_label}..."));
             if let Err(error) = self
                 .block_navigation
-                .start(
+                .start_multi(
                     &self.minecraft,
                     &self.movement,
-                    block_id.to_owned(),
+                    block_ids.to_vec(),
                     radius,
                     NavigationMode::AllowMining,
                 )
                 .await
             {
-                return self.fail_get_block(&block_label, error).await;
+                return self.fail_get_item(&block_label, error).await;
             }
             match await_block_navigation_terminal(self, input_rx).await {
                 WaitOutcome::Finished(Ok(())) => {}
                 WaitOutcome::Finished(Err(error)) => {
-                    return self.fail_get_block(&block_label, error).await;
+                    return self.fail_get_item(&block_label, error).await;
                 }
                 WaitOutcome::Interrupted(next) => return WaitOutcome::Interrupted(next),
             }
 
-            let target = self
-                .block_navigation
-                .snapshot()
-                .await
-                .selected_block_position;
-            let Some(target) = target else {
+            let navigation_snapshot = self.block_navigation.snapshot().await;
+            let Some(target) = navigation_snapshot.selected_block_position else {
                 return self
-                    .fail_get_block(&block_label, AppError::NoMatchingBlock)
+                    .fail_get_item(&block_label, AppError::NoMatchingBlock)
                     .await;
             };
+            // The block actually reached this iteration, not the whole
+            // candidate set -- `#mine diamond_ore deepslate_diamond_ore`-style
+            // multi-source runs must say which one is actually being broken.
+            let mined_label = navigation_snapshot
+                .selected_block_id
+                .as_deref()
+                .map(blocks::bare_id)
+                .unwrap_or(&block_label)
+                .to_owned();
 
-            logging::info(format!("Looking at {block_label}"));
-            logging::info(format!("Breaking {block_label}"));
+            logging::info(format!("Looking at {mined_label}"));
+            logging::info(format!("Breaking {mined_label}"));
             if let Err(error) = self
                 .interaction
                 .break_at(&self.minecraft, &self.movement, &self.look, target)
                 .await
             {
                 consecutive_failures += 1;
-                logging::warning(format!("Could not break {block_label}: {error}"));
+                logging::warning(format!("Could not break {mined_label}: {error}"));
                 if get_resource_should_abort(consecutive_failures) {
-                    return self.fail_get_block(&block_label, error).await;
+                    return self.fail_get_item(&block_label, error).await;
                 }
                 continue;
             }
@@ -1887,19 +1916,158 @@ impl App {
                         .world_state_snapshot()
                         .await
                         .inventory
-                        .count_item(&drop_item);
-                    logging::success(format!("Collected {drop_label} ({new_count}/{amount})"));
+                        .count_item(resource_id);
+                    logging::success(format!("Collected {resource_label} ({new_count}/{amount})"));
                 }
                 WaitOutcome::Finished(Err(error)) => {
                     consecutive_failures += 1;
-                    logging::warning(format!("Could not break {block_label}: {error}"));
+                    logging::warning(format!("Could not break {mined_label}: {error}"));
                     if get_resource_should_abort(consecutive_failures) {
-                        return self.fail_get_block(&block_label, error).await;
+                        return self.fail_get_item(&block_label, error).await;
                     }
                 }
                 WaitOutcome::Interrupted(next) => return WaitOutcome::Interrupted(next),
             }
         }
+    }
+
+    /// Common failure exit for `run_get_item`: stops movement/navigation,
+    /// reports the block-not-found message the `#get` contract requires
+    /// (naming every candidate source block that was searched for), and
+    /// hands the underlying error back to the caller.
+    async fn fail_get_item(&self, block_label: &str, error: AppError) -> WaitOutcome {
+        self.block_navigation
+            .cancel(&self.minecraft, &self.movement)
+            .await;
+        logging::error(format!("Block not found: {block_label}"));
+        logging::info("Get task cancelled");
+        WaitOutcome::Finished(Err(error))
+    }
+
+    /// Direct `/mine <block> [block...] <amount>` (also reachable as `#mine
+    /// ...` from Minecraft chat). The counterpart to `run_get_item` with
+    /// the item-resolution step removed entirely: `block_ids` is exactly
+    /// what the caller typed, searched for and broken as-is, and progress
+    /// is a plain count of blocks destroyed -- never inventory, since a
+    /// block's drop (or lack of one -- silk touch, fortune, "drops
+    /// nothing") is deliberately none of `/mine`'s concern. Otherwise
+    /// structurally identical to `run_get_item`: same fresh-search-every-
+    /// iteration loop over `BlockNavigationService::start_multi`, same
+    /// `InteractionController::break_at` mining pipeline, same bounded
+    /// consecutive-failure abort.
+    async fn mine_and_wait(
+        &self,
+        block_ids: Vec<String>,
+        amount: u32,
+        input_rx: &mut InputReceiver,
+    ) -> WaitOutcome {
+        let label = join_labels(&block_ids, ", ");
+        self.minecraft
+            .set_current_task(task_snapshot(format!("Mine {amount} {label}")))
+            .await;
+        logging::info(format!("Mining {label}"));
+        let result = self.run_mine(&block_ids, amount, input_rx).await;
+        self.minecraft.clear_current_task().await;
+        result
+    }
+
+    async fn run_mine(
+        &self,
+        block_ids: &[String],
+        amount: u32,
+        input_rx: &mut InputReceiver,
+    ) -> WaitOutcome {
+        let radius = self.config.block_navigation.maximum_search_radius;
+        let label = join_labels(block_ids, ", ");
+        let mut mined: u32 = 0;
+        let mut consecutive_failures: u32 = 0;
+        loop {
+            if mined >= amount {
+                logging::success(format!("Mined {mined} {label} blocks"));
+                return WaitOutcome::Finished(Ok(()));
+            }
+
+            logging::info(format!("Scanning loaded chunks for {label}..."));
+            if let Err(error) = self
+                .block_navigation
+                .start_multi(
+                    &self.minecraft,
+                    &self.movement,
+                    block_ids.to_vec(),
+                    radius,
+                    NavigationMode::AllowMining,
+                )
+                .await
+            {
+                return self.fail_mine(&label, mined, error).await;
+            }
+            match await_block_navigation_terminal(self, input_rx).await {
+                WaitOutcome::Finished(Ok(())) => {}
+                WaitOutcome::Finished(Err(error)) => {
+                    return self.fail_mine(&label, mined, error).await;
+                }
+                WaitOutcome::Interrupted(next) => return WaitOutcome::Interrupted(next),
+            }
+
+            let navigation_snapshot = self.block_navigation.snapshot().await;
+            let Some(target) = navigation_snapshot.selected_block_position else {
+                return self
+                    .fail_mine(&label, mined, AppError::NoMatchingBlock)
+                    .await;
+            };
+            let mined_label = navigation_snapshot
+                .selected_block_id
+                .as_deref()
+                .map(blocks::bare_id)
+                .unwrap_or(&label)
+                .to_owned();
+
+            logging::info(format!("Looking at {mined_label}"));
+            logging::info(format!("Mining {mined_label}"));
+            if let Err(error) = self
+                .interaction
+                .break_at(&self.minecraft, &self.movement, &self.look, target)
+                .await
+            {
+                consecutive_failures += 1;
+                logging::warning(format!("Could not mine {mined_label}: {error}"));
+                if get_resource_should_abort(consecutive_failures) {
+                    return self.fail_mine(&label, mined, error).await;
+                }
+                continue;
+            }
+            match await_interaction_terminal(self, input_rx).await {
+                WaitOutcome::Finished(Ok(())) => {
+                    consecutive_failures = 0;
+                    mined += 1;
+                    logging::success(format!("Mined {mined_label} ({mined}/{amount})"));
+                }
+                WaitOutcome::Finished(Err(error)) => {
+                    consecutive_failures += 1;
+                    logging::warning(format!("Could not mine {mined_label}: {error}"));
+                    if get_resource_should_abort(consecutive_failures) {
+                        return self.fail_mine(&label, mined, error).await;
+                    }
+                }
+                WaitOutcome::Interrupted(next) => return WaitOutcome::Interrupted(next),
+            }
+        }
+    }
+
+    /// Common failure exit for `run_mine`: stops movement/navigation,
+    /// reports how many blocks were actually destroyed before the failure
+    /// (if any -- a partial run is still real progress, not a total loss),
+    /// and hands the underlying error back to the caller.
+    async fn fail_mine(&self, label: &str, mined: u32, error: AppError) -> WaitOutcome {
+        self.block_navigation
+            .cancel(&self.minecraft, &self.movement)
+            .await;
+        if mined > 0 {
+            logging::warning(format!("Mined {mined} {label} blocks before stopping"));
+        }
+        logging::error(format!("Block not found: {label}"));
+        logging::info("Mine task cancelled");
+        WaitOutcome::Finished(Err(error))
     }
 
     /// Walks onto the just-broken block's position so vanilla's proximity
@@ -1927,46 +2095,58 @@ impl App {
             y: f64::from(target.y),
             z: f64::from(target.z) + 0.5,
         };
-        if self
-            .movement
-            .goto(&self.minecraft, destination, NavigationMode::AllowMining)
-            .await
-            .is_err()
-        {
-            return None;
-        }
+        // Vanilla's actual item pickup range is much tighter than
+        // `MovementConfig::arrival_distance` (1.5 blocks by default, tuned
+        // for "close enough to interact/mine" -- not "standing on top of a
+        // dropped item"). `MovementService::tick_goto` stops Azalea's
+        // pathfinder the moment *that* looser threshold is satisfied, which
+        // is frequently still too far away to actually trigger pickup --
+        // the walk would report "done" while the drop stays on the ground.
+        // Poll the bot's live position against a tight threshold instead of
+        // trusting `MovementStatus::Completed`, and re-issue the goto
+        // whenever movement gives up (or never started moving) while still
+        // outside it, bounded by `COLLECT_TIMEOUT` so a spot that's genuinely
+        // unreachable this close (an item wedged out of reach, despawned,
+        // taken by someone else) can't stall the run.
+        const PICKUP_DISTANCE: f64 = 0.6;
         const COLLECT_TIMEOUT: Duration = Duration::from_secs(5);
         let started = Instant::now();
+        let mut dispatched = false;
         loop {
-            self.movement.tick(&self.minecraft, false).await;
-            let status = self.movement.snapshot().await.status;
-            if !matches!(status, MovementStatus::MovingToPosition)
-                || started.elapsed() >= COLLECT_TIMEOUT
-            {
+            let world = self.minecraft.world_state_snapshot().await;
+            let close_enough = world
+                .bot
+                .position
+                .is_some_and(|position| collect_distance(position, destination) <= PICKUP_DISTANCE);
+            if close_enough || started.elapsed() >= COLLECT_TIMEOUT {
                 let _ = self.movement.stop(&self.minecraft).await;
                 return None;
             }
+            let status = self.movement.snapshot().await.status;
+            if !dispatched
+                || matches!(
+                    status,
+                    MovementStatus::Completed | MovementStatus::Idle | MovementStatus::Failed
+                )
+            {
+                if self
+                    .movement
+                    .goto(&self.minecraft, destination, NavigationMode::AllowMining)
+                    .await
+                    .is_err()
+                {
+                    return None;
+                }
+                dispatched = true;
+            }
+            self.movement.tick(&self.minecraft, false).await;
             if let Some(input) = wait_tick(self, input_rx, Duration::from_millis(75)).await {
                 return Some(input);
             }
         }
     }
 
-    /// Common failure exit for `run_get_block`: stops movement/navigation,
-    /// reports the block-not-found message the `#get` contract requires, and
-    /// hands the underlying error back to the caller. `block_label` is the
-    /// bare mined-block name (not the drop item) -- "not found" is about the
-    /// block search, which always operates on the block id.
-    async fn fail_get_block(&self, block_label: &str, error: AppError) -> WaitOutcome {
-        self.block_navigation
-            .cancel(&self.minecraft, &self.movement)
-            .await;
-        logging::error(format!("Block not found: {block_label}"));
-        logging::info("Get task cancelled");
-        WaitOutcome::Finished(Err(error))
-    }
-
-    /// Mob-drop counterpart of `run_get_block`, following the exact same
+    /// Mob-drop counterpart of `run_get_item`, following the exact same
     /// shape (fresh search every iteration, bounded consecutive-failure
     /// abort, same terminal messages) but over `CombatController::kill_nearest`
     /// instead of block navigation + breaking. `resource_id` is what's
@@ -2342,6 +2522,23 @@ fn get_resource_should_abort(consecutive_failures: u32) -> bool {
     consecutive_failures >= GET_RESOURCE_MAX_CONSECUTIVE_FAILURES
 }
 
+fn collect_distance(
+    a: crate::minecraft::world_state::PositionSnapshot,
+    b: crate::minecraft::world_state::PositionSnapshot,
+) -> f64 {
+    ((a.x - b.x).powi(2) + (a.y - b.y).powi(2) + (a.z - b.z).powi(2)).sqrt()
+}
+
+/// Bare (non-namespaced), `separator`-joined console label for a set of
+/// block/item ids, e.g. `["minecraft:diamond_ore", "minecraft:deepslate_diamond_ore"]`
+/// with `"/"` -> `"diamond_ore/deepslate_diamond_ore"`.
+fn join_labels(ids: &[String], separator: &str) -> String {
+    ids.iter()
+        .map(|id| blocks::bare_id(id))
+        .collect::<Vec<_>>()
+        .join(separator)
+}
+
 fn task_snapshot(name: impl Into<String>) -> TaskSnapshot {
     TaskSnapshot {
         name: name.into(),
@@ -2371,7 +2568,10 @@ fn print_help() {
     println!("  /place <block> <x> <y> <z> Place a block and wait until it is placed");
     println!("  /find <block> [radius]     Find the nearest matching block");
     println!(
-        "  /get <resource> <amount>   Gather <amount> of any loaded block or mob drop (nearest-reachable, repeats until satisfied)"
+        "  /get <item> <amount>       Gather <amount> of an item -- resolves ore/conversion sources or a mob drop automatically, mines/hunts whichever is nearest"
+    );
+    println!(
+        "  /mine <block> [block...] <amount>  Mine exactly the given block(s) (whichever is nearer), counting blocks destroyed, not items received"
     );
     println!(
         "  /interact <block> <item[,item...]> [radius]  Right-click the nearest matching block with a held item (e.g. till dirt with a hoe)"
@@ -2439,5 +2639,33 @@ mod get_resource_tests {
         assert!(get_resource_should_abort(
             GET_RESOURCE_MAX_CONSECUTIVE_FAILURES + 1
         ));
+    }
+
+    #[test]
+    fn join_labels_strips_namespaces_and_joins_with_the_given_separator() {
+        assert_eq!(
+            join_labels(&["minecraft:diamond_ore".into()], "/"),
+            "diamond_ore"
+        );
+        assert_eq!(
+            join_labels(
+                &[
+                    "minecraft:diamond_ore".into(),
+                    "minecraft:deepslate_diamond_ore".into(),
+                ],
+                "/"
+            ),
+            "diamond_ore/deepslate_diamond_ore"
+        );
+        assert_eq!(
+            join_labels(
+                &[
+                    "minecraft:diamond_ore".into(),
+                    "minecraft:deepslate_diamond_ore".into(),
+                ],
+                ", "
+            ),
+            "diamond_ore, deepslate_diamond_ore"
+        );
     }
 }

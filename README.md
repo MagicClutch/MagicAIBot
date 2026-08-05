@@ -6,9 +6,11 @@ shutdown, and module boundaries only; it does not connect to a server or perform
 gameplay actions.
 Headless Minecraft Java bot written in Rust on Azalea. The current branch implements connection,
 loaded-world snapshots, deterministic block search, movement/pathfinding, look control, and confirmed
-single-block break/place actions. `/get <resource> <amount>` (Baritone-style, also usable from chat
-as `#get <resource> <amount>`) adds bounded, universal resource gathering -- of blocks *and* mob
-drops -- built entirely from those same primitives -- see below.
+single-block break/place actions. Two Baritone-style commands add bounded, universal gathering built
+entirely from those same primitives (see below): `/get <item> <amount>` (also `#get` from chat) asks
+for an *item* and resolves how to obtain it (ore/conversion source blocks, or a mob to hunt) on its
+own, while `/mine <block> [block...] <amount>` (also `#mine`) mines the *exact* block(s) named and
+counts blocks destroyed, not items received.
 
 ## Quick start
 
@@ -37,8 +39,8 @@ Dependency upgrades are deliberate compatibility work, not routine updates.
 | Break/place one block | Yes | Exact block-state change; `/stopinteraction`. |
 | Inventory summary/tool hotbar selection | Read / limited | No menu clicks or inventory transaction service exists. |
 | Craft/eat/deposit | No | Commands are intentionally absent. |
-| Gather any loaded block by id/amount | Yes | `/get <resource> <amount>` (`#get` from chat); repeats nearest-reachable search + break until the inventory count is satisfied; `/stop` cancels. |
-| Farm a mob drop by item/amount | Yes | Same `/get <resource> <amount>`, auto-detected via a resource->mob table (leather->cow, string->spider, ...); repeats nearest-reachable search + kill + collect; `/stop` cancels. |
+| Gather an item by amount (ore/conversion or mob-drop, auto-resolved) | Yes | `/get <item> <amount>` (`#get` from chat); repeats nearest-reachable search + break/kill until the inventory count is satisfied; `/stop` cancels. |
+| Mine an exact block (or any of several) by amount | Yes | `/mine <block> [block...] <amount>` (`#mine` from chat); repeats nearest-reachable search + break until the requested number of blocks is destroyed; counts blocks, not items; `/stop` cancels. |
 
 | Container | Inspect | Transfer/click | Notes |
 |---|---:|---:|---|
@@ -59,43 +61,50 @@ automatically resumed. Logs are local and are never forwarded to Minecraft chat.
 orchestration layer -- console/chat commands call the owning service (movement, block navigation,
 look, interaction) directly and wait for it to finish.
 
-`/get <resource> <amount>` follows the same rule: it is a bounded loop over existing services
-(`src/app.rs`'s `resolve_and_run_get_resource`, dispatching to `run_get_block` or `run_get_mob`),
-not a new gathering system. `mobs::resolve_resource` decides which: it tries the mob-drop table
-(`src/mobs/drops.rs`) first, falling back to treating `resource` as a block id -- a resource id that
-is also an incidentally valid block (the wool colors) still resolves to farming the mob, since that
-is how it is actually obtained.
+`/get` and `/mine` follow the same rule: both are bounded loops over existing services
+(`src/app.rs`'s `run_get_item`/`run_get_mob`/`run_mine`), not a new gathering system, and both reuse
+`BlockNavigationService::start_multi` (search + nearest-*reachable*-of-several-block-ids + approach,
+falling back across candidates the same way `/gotoblock` does -- generalized from a single block id
+to a set so `#get diamond 10` can search `diamond_ore` *and* `deepslate_diamond_ore` in one pass) and
+`InteractionController::break_at` (tool selection, precise look, break, verified removal, same as
+`/break`).
 
-The block path re-scans loaded chunks each iteration for the nearest *reachable* matching block
-(falling back across candidates the same way `/gotoblock` does), navigates to it with mining
-allowed, breaks it with the same tool-selection/verification pipeline as `/break`, walks onto the
-broken block's position to trigger vanilla's proximity item pickup (mining reach is well beyond the
-pickup radius, so without this the drop is often left on the ground and the count never advances),
-and checks inventory again. Inventory is counted against the block's actual drop item, resolved once
-per run
-via `blocks::drop_item_for_block` (`src/blocks/drops.rs`) -- e.g. `#get diamond_ore 10` mines
-`diamond_ore` but counts `diamond`, and `#get iron_ore 10` mines `iron_ore` but counts `raw_iron`.
-There is no loot-table data bundled in Azalea to derive this from (loot tables are server-side
-data-pack content, not part of the client protocol/registry), so it's a hand-maintained table
-covering every vanilla block whose deterministic primary drop differs from the block itself (ores,
-`stone`→`cobblestone`, `grass_block`→`dirt`, mismatched crop names, ...); anything not listed
-defaults to "drops itself", which is correct for the overwhelming majority of blocks. Console output
-always names the drop item, not the mined block, once they differ (e.g. `Collected 10 raw_iron from
-iron_ore`).
+They differ only in what the argument means and what gets counted:
 
-The mob path (`src/mobs/combat.rs`'s `CombatController`) mirrors the same shape over entities
-instead of blocks: it re-scans currently loaded entities each iteration for the nearest reachable
-live mob (falling back across candidates the same way, and never re-attempting one it already
-proved unreachable within that search), walks to melee range with `MovementService::goto` re-aimed
-at the mob's live position, looks at it with the existing `LookTarget::Entity` support `/lookentity`
-already uses, attacks with the one genuinely new primitive this added
-(`MinecraftClient::attack_entity`), and walks onto the drop location afterward to trigger vanilla's
-proximity pickup. The mob-drop table is intentionally small and hand-maintained
-(`mobs::drops::MOB_DROPS`); extending it to more mobs/drops means adding a row there.
+- **`/get <item> <amount>`** (`#get` from chat) takes an *item* -- never a block to mine directly.
+  `mobs::resolve_resource` (`src/mobs/mod.rs`) decides how it's obtained, in order: the
+  ore/conversion table (`blocks::drop_blocks_for_item`, `src/blocks/drops.rs` -- e.g. `diamond` ->
+  mine `diamond_ore` or `deepslate_diamond_ore`, whichever is nearer; an item that's *also*
+  independently a valid block, like `cobblestone` or `dirt`, searches its own block form too, not
+  just its conversion sources, or existing cobblestone/dirt would never be picked up), then the
+  mob-drop table (`mobs::drops::MOB_DROPS` -- `leather` -> hunt `cow`), then finally "mine a block
+  with this exact id" for anything that drops itself (`oak_log`, `sand`, ...). A handful of items
+  are both a rare mob drop *and* an ore/crop product (`redstone`, `carrot`, `potato`,
+  `glowstone_dust`); mining/farming wins there since it's the practical source. There is no
+  loot-table data bundled in Azalea to derive any of this from (loot tables are server-side
+  data-pack content, not part of the client protocol/registry), so `BLOCK_DROPS` is a hand-maintained
+  table covering every vanilla block whose deterministic primary drop differs from the block itself;
+  anything not listed defaults to "drops itself", correct for the overwhelming majority of blocks.
+  After breaking, the block path walks onto the broken position to trigger vanilla's proximity item
+  pickup (mining reach is well beyond the pickup radius, so without this the drop is often left on
+  the ground and the count never advances) before checking inventory again -- inventory is always
+  counted against the resolved item, never the mined block. The mob path
+  (`src/mobs/combat.rs`'s `CombatController`) mirrors the same "fresh search every iteration, never
+  retry a proven-unreachable candidate" shape over entities instead of blocks: walks to melee range
+  with `MovementService::goto` re-aimed at the mob's live position, looks at it with the existing
+  `LookTarget::Entity` support `/lookentity` already uses, attacks with the one genuinely new
+  primitive this added (`MinecraftClient::attack_entity`), and walks onto the drop location
+  afterward for the same proximity-pickup reason.
+- **`/mine <block> [block...] <amount>`** (`#mine` from chat) takes one or more *blocks* literally --
+  no resolution of any kind. `#mine diamond_ore deepslate_diamond_ore 10` mines whichever of the two
+  is nearer each iteration and stops once 10 blocks (either kind) have been destroyed; `#mine stone
+  100` only ever searches for `stone`. Progress is a plain count of blocks broken, never inventory,
+  since what a block drops (or whether it drops anything at all -- silk touch, fortune, "drops
+  nothing") is deliberately none of `/mine`'s concern.
 
-Either path stops and reports `[ERROR] Block not found: <block>` / `[ERROR] Mob not found: <mob>` if
-no candidate exists in the loaded world, and aborts after 5 consecutive failures rather than
-retrying forever. `/stop` cancels an in-progress run like any other movement/navigation.
+Both stop and report `[ERROR] Block not found: <block>` / `[ERROR] Mob not found: <mob>` if no
+candidate exists in the loaded world, and abort after 5 consecutive failures rather than retrying
+forever. `/stop` cancels an in-progress run like any other movement/navigation.
 
 ## Architecture and tests
 

@@ -1,11 +1,12 @@
-//! Static block -> primary-drop-item registry for `#get`'s block-gathering
-//! path (see `App::run_get_block` in `src/app.rs`). Mining a block does not
-//! always yield an item with the same registry id as the block itself
-//! (`minecraft:iron_ore` drops `minecraft:raw_iron`, `minecraft:stone` drops
-//! `minecraft:cobblestone`, `minecraft:deepslate_diamond_ore` drops
-//! `minecraft:diamond`, ...) -- inventory must always be counted against the
-//! drop, never the block, or a `#get` run loops forever waiting for a count
-//! that can never increase.
+//! Static block -> primary-drop-item registry backing `#get`'s item
+//! resolution (see `mobs::resolve_resource` and `App::run_get_item` in
+//! `src/app.rs`). Mining a block does not always yield an item with the
+//! same registry id as the block itself (`minecraft:iron_ore` drops
+//! `minecraft:raw_iron`, `minecraft:stone` drops `minecraft:cobblestone`,
+//! `minecraft:deepslate_diamond_ore` drops `minecraft:diamond`, ...) --
+//! `#get` needs the reverse direction, item -> every block that produces
+//! it, so it can mine whichever candidate is nearer instead of hardcoding a
+//! single source per item.
 //!
 //! There is no loot-table data bundled in Azalea to resolve this from:
 //! vanilla loot tables are server-side data-pack JSON, not part of the
@@ -21,9 +22,9 @@
 //! what "not listed here" already defaults to. Extending coverage means
 //! adding a row to `BLOCK_DROPS`; nothing else needs to change.
 
-/// `(block id, drop item id)`, both fully namespaced. Every block a mined
-/// block converts to *itself* (dirt, oak_log, cobblestone once already
-/// cobblestone, ...) is intentionally absent -- see `drop_item_for_block`.
+/// `(block id, drop item id)`, both fully namespaced. Every block that
+/// simply drops itself (dirt, oak_log, cobblestone, ...) is intentionally
+/// absent -- see `drop_blocks_for_item`.
 const BLOCK_DROPS: &[(&str, &str)] = &[
     // Overworld ores -> raw materials or processed items.
     ("minecraft:iron_ore", "minecraft:raw_iron"),
@@ -74,16 +75,21 @@ const BLOCK_DROPS: &[(&str, &str)] = &[
     ("minecraft:weeping_vines_plant", "minecraft:weeping_vines"),
 ];
 
-/// The item actually obtained from mining `block_id` (already normalized,
-/// e.g. `minecraft:iron_ore`). Blocks that drop themselves -- the
-/// overwhelming majority -- are not listed in `BLOCK_DROPS` and fall
-/// through to `block_id` unchanged, so this is always safe to call
-/// unconditionally rather than only for a known ore whitelist.
-pub fn drop_item_for_block(block_id: &str) -> &str {
+/// All blocks whose primary drop is `item_id` (already normalized, e.g.
+/// `minecraft:diamond`). A single item can map back to multiple source
+/// blocks (`minecraft:diamond` comes from both `minecraft:diamond_ore` and
+/// `minecraft:deepslate_diamond_ore`), which is exactly what `#get` needs:
+/// mine whichever candidate is nearer. Empty means no block in
+/// `BLOCK_DROPS` produces this item as its differing drop -- callers fall
+/// back to treating `item_id` as a block id directly (see
+/// `mobs::resolve_resource`), which is correct for any block that simply
+/// drops itself (logs, dirt, ancient_debris, ...).
+pub fn drop_blocks_for_item(item_id: &str) -> Vec<&'static str> {
     BLOCK_DROPS
         .iter()
-        .find(|(block, _)| *block == block_id)
-        .map_or(block_id, |(_, item)| *item)
+        .filter(|(_, item)| *item == item_id)
+        .map(|(block, _)| *block)
+        .collect()
 }
 
 /// Bare (non-namespaced) id for concise console output, e.g. `iron_ore` from
@@ -96,109 +102,115 @@ pub fn bare_id(id: &str) -> &str {
 mod tests {
     use super::*;
 
+    fn sorted(mut blocks: Vec<&'static str>) -> Vec<&'static str> {
+        blocks.sort_unstable();
+        blocks
+    }
+
     #[test]
-    fn resolves_ores_to_their_documented_drops() {
+    fn resolves_item_to_every_ore_source_block() {
         assert_eq!(
-            drop_item_for_block("minecraft:iron_ore"),
-            "minecraft:raw_iron"
+            sorted(drop_blocks_for_item("minecraft:diamond")),
+            vec!["minecraft:deepslate_diamond_ore", "minecraft:diamond_ore"]
         );
         assert_eq!(
-            drop_item_for_block("minecraft:deepslate_iron_ore"),
-            "minecraft:raw_iron"
-        );
-        assert_eq!(drop_item_for_block("minecraft:coal_ore"), "minecraft:coal");
-        assert_eq!(
-            drop_item_for_block("minecraft:deepslate_coal_ore"),
-            "minecraft:coal"
+            sorted(drop_blocks_for_item("minecraft:raw_iron")),
+            vec!["minecraft:deepslate_iron_ore", "minecraft:iron_ore"]
         );
         assert_eq!(
-            drop_item_for_block("minecraft:diamond_ore"),
-            "minecraft:diamond"
+            sorted(drop_blocks_for_item("minecraft:coal")),
+            vec!["minecraft:coal_ore", "minecraft:deepslate_coal_ore"]
         );
         assert_eq!(
-            drop_item_for_block("minecraft:deepslate_diamond_ore"),
-            "minecraft:diamond"
+            sorted(drop_blocks_for_item("minecraft:raw_copper")),
+            vec!["minecraft:copper_ore", "minecraft:deepslate_copper_ore"]
         );
         assert_eq!(
-            drop_item_for_block("minecraft:copper_ore"),
-            "minecraft:raw_copper"
+            sorted(drop_blocks_for_item("minecraft:raw_gold")),
+            vec!["minecraft:deepslate_gold_ore", "minecraft:gold_ore"]
         );
         assert_eq!(
-            drop_item_for_block("minecraft:gold_ore"),
-            "minecraft:raw_gold"
+            sorted(drop_blocks_for_item("minecraft:emerald")),
+            vec!["minecraft:deepslate_emerald_ore", "minecraft:emerald_ore"]
         );
         assert_eq!(
-            drop_item_for_block("minecraft:nether_gold_ore"),
-            "minecraft:gold_nugget"
+            sorted(drop_blocks_for_item("minecraft:lapis_lazuli")),
+            vec!["minecraft:deepslate_lapis_ore", "minecraft:lapis_ore"]
         );
         assert_eq!(
-            drop_item_for_block("minecraft:emerald_ore"),
-            "minecraft:emerald"
-        );
-        assert_eq!(
-            drop_item_for_block("minecraft:lapis_ore"),
-            "minecraft:lapis_lazuli"
-        );
-        assert_eq!(
-            drop_item_for_block("minecraft:redstone_ore"),
-            "minecraft:redstone"
-        );
-        assert_eq!(
-            drop_item_for_block("minecraft:nether_quartz_ore"),
-            "minecraft:quartz"
+            sorted(drop_blocks_for_item("minecraft:redstone")),
+            vec!["minecraft:deepslate_redstone_ore", "minecraft:redstone_ore"]
         );
     }
 
     #[test]
     fn resolves_non_ore_conversions() {
         assert_eq!(
-            drop_item_for_block("minecraft:stone"),
-            "minecraft:cobblestone"
+            drop_blocks_for_item("minecraft:cobblestone"),
+            vec!["minecraft:stone"]
         );
         assert_eq!(
-            drop_item_for_block("minecraft:deepslate"),
-            "minecraft:cobbled_deepslate"
+            drop_blocks_for_item("minecraft:cobbled_deepslate"),
+            vec!["minecraft:deepslate"]
         );
         assert_eq!(
-            drop_item_for_block("minecraft:grass_block"),
-            "minecraft:dirt"
-        );
-        assert_eq!(drop_item_for_block("minecraft:farmland"), "minecraft:dirt");
-        assert_eq!(drop_item_for_block("minecraft:clay"), "minecraft:clay_ball");
-        assert_eq!(
-            drop_item_for_block("minecraft:glowstone"),
-            "minecraft:glowstone_dust"
-        );
-        assert_eq!(drop_item_for_block("minecraft:carrots"), "minecraft:carrot");
-        assert_eq!(
-            drop_item_for_block("minecraft:potatoes"),
-            "minecraft:potato"
+            sorted(drop_blocks_for_item("minecraft:dirt")),
+            vec![
+                "minecraft:dirt_path",
+                "minecraft:farmland",
+                "minecraft:grass_block",
+                "minecraft:mycelium",
+                "minecraft:podzol",
+            ]
         );
         assert_eq!(
-            drop_item_for_block("minecraft:beetroots"),
-            "minecraft:beetroot"
+            drop_blocks_for_item("minecraft:clay_ball"),
+            vec!["minecraft:clay"]
         );
         assert_eq!(
-            drop_item_for_block("minecraft:cocoa"),
-            "minecraft:cocoa_beans"
+            drop_blocks_for_item("minecraft:glowstone_dust"),
+            vec!["minecraft:glowstone"]
+        );
+        assert_eq!(
+            drop_blocks_for_item("minecraft:carrot"),
+            vec!["minecraft:carrots"]
+        );
+        assert_eq!(
+            drop_blocks_for_item("minecraft:potato"),
+            vec!["minecraft:potatoes"]
+        );
+        assert_eq!(
+            drop_blocks_for_item("minecraft:beetroot"),
+            vec!["minecraft:beetroots"]
+        );
+        assert_eq!(
+            drop_blocks_for_item("minecraft:cocoa_beans"),
+            vec!["minecraft:cocoa"]
         );
     }
 
     #[test]
-    fn blocks_that_drop_themselves_are_unaffected() {
-        for block in [
-            "minecraft:oak_log",
-            "minecraft:cobblestone",
-            "minecraft:dirt",
-            "minecraft:sand",
-            "minecraft:gravel",
-            "minecraft:obsidian",
-            "minecraft:diamond_block",
-            "minecraft:andesite",
-            "minecraft:ancient_debris",
-        ] {
-            assert_eq!(drop_item_for_block(block), block);
-        }
+    fn item_with_a_single_source_block_resolves_to_one() {
+        assert_eq!(
+            drop_blocks_for_item("minecraft:quartz"),
+            vec!["minecraft:nether_quartz_ore"]
+        );
+        assert_eq!(
+            drop_blocks_for_item("minecraft:gold_nugget"),
+            vec!["minecraft:nether_gold_ore"]
+        );
+    }
+
+    #[test]
+    fn item_with_no_ore_source_resolves_to_nothing() {
+        // Falls back to "treat the item id as a block id directly" one level
+        // up in `mobs::resolve_resource` -- correct for self-dropping blocks
+        // like logs, and for genuine non-ore items like `ancient_debris`
+        // (the block drops the identically-named item; there is no *other*
+        // block that produces it).
+        assert!(drop_blocks_for_item("minecraft:oak_log").is_empty());
+        assert!(drop_blocks_for_item("minecraft:ancient_debris").is_empty());
+        assert!(drop_blocks_for_item("minecraft:stick").is_empty());
     }
 
     #[test]

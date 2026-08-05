@@ -57,6 +57,10 @@ pub enum ConsoleCommand {
         resource_id: String,
         amount: u32,
     },
+    Mine {
+        block_ids: Vec<String>,
+        amount: u32,
+    },
     Look {
         x: i32,
         y: i32,
@@ -211,6 +215,7 @@ pub fn parse_input(input: &str) -> Result<ConsoleInput, AppError> {
         "gotoblockstatus" => no_arguments(command, arguments, ConsoleCommand::GotoBlockStatus)?,
         "cancelgotoblock" => no_arguments(command, arguments, ConsoleCommand::CancelGotoBlock)?,
         "get" => parse_get(arguments)?,
+        "mine" => parse_mine(arguments)?,
         "look" | "lookat" => {
             let position = parse_coordinates(arguments)?;
             ConsoleCommand::Look {
@@ -526,23 +531,19 @@ fn parse_goto_block(arguments: &str) -> Result<ConsoleCommand, AppError> {
     })
 }
 
-/// Universal Baritone-style resource gathering: `/get <block_id> <amount>`
-/// (also reachable from Minecraft chat as `#get <block_id> <amount>` through
-/// the existing `#`-prefixed chat-to-console forwarding). `block_id` accepts
-/// any block registered in `azalea::registry::builtin::BlockKind` -- there is
-/// no hardcoded whitelist here, `normalize_block_id` already validates
-/// against the full registry.
-/// Universal Baritone-style resource gathering: `/get <resource> <amount>`
-/// (also reachable from Minecraft chat as `#get <resource> <amount>` through
-/// the existing `#`-prefixed chat-to-console forwarding). `resource` accepts
-/// either any block registered in `azalea::registry::builtin::BlockKind`, or
-/// any item known to be a mob drop via `crate::mobs::drops` -- there is no
-/// hardcoded block whitelist, and the mob-drop table is the single place new
-/// mobs/drops get added. `crate::mobs::resolve_resource` is the shared
-/// block-or-mob decision also used at dispatch time by
-/// `App::run_get_resource`.
+/// Item-based resource gathering: `/get <item> <amount>` (also reachable
+/// from Minecraft chat as `#get <item> <amount>`). `item` is resolved --
+/// never used directly as a mining target -- via `crate::mobs::resolve_resource`,
+/// which tries, in order: the ore/conversion table (`blocks::drop_blocks_for_item`,
+/// e.g. `diamond` -> mine `diamond_ore` or `deepslate_diamond_ore`, whichever
+/// is nearer), the mob-drop table (`leather` -> hunt `cow`), and finally
+/// "just mine a block with this exact id" for anything that drops itself
+/// (`oak_log`, `cobblestone`, ...). `#get` never counts inventory against
+/// the block it mined, only against the resolved item -- see
+/// `App::run_get_item`. Contrast with `/mine`, which targets the block
+/// itself and never resolves anything.
 fn parse_get(arguments: &str) -> Result<ConsoleCommand, AppError> {
-    const USAGE: &str = "/get <resource> <amount>";
+    const USAGE: &str = "/get <item> <amount>";
     let mut parts = arguments.split_whitespace();
     let resource = parts
         .next()
@@ -562,13 +563,44 @@ fn parse_get(arguments: &str) -> Result<ConsoleCommand, AppError> {
         return Err(AppError::InvalidConsoleSyntax(USAGE.into()));
     }
     let resource_id = match crate::mobs::resolve_resource(resource)? {
-        crate::mobs::ResourceKind::Block(id) => id,
+        crate::mobs::ResourceKind::Ore { resource_id, .. } => resource_id,
         crate::mobs::ResourceKind::Mob { resource_id, .. } => resource_id,
     };
     Ok(ConsoleCommand::GetResource {
         resource_id,
         amount,
     })
+}
+
+/// Direct block mining: `/mine <block> [block...] <amount>` (also reachable
+/// as `#mine ...`). Unlike `/get`, `block` is never resolved to anything --
+/// it names the exact block(s) to mine, and `#mine` counts blocks destroyed,
+/// not items received. More than one block id may be given so a single run
+/// can target "whichever of these is closer" (e.g.
+/// `/mine diamond_ore deepslate_diamond_ore 10`); the last argument is
+/// always the amount.
+fn parse_mine(arguments: &str) -> Result<ConsoleCommand, AppError> {
+    const USAGE: &str = "/mine <block> [block...] <amount>";
+    let tokens: Vec<&str> = arguments.split_whitespace().collect();
+    let Some((amount_raw, block_tokens)) = tokens.split_last() else {
+        return Err(AppError::MissingConsoleArgument(USAGE.into()));
+    };
+    if block_tokens.is_empty() {
+        return Err(AppError::MissingConsoleArgument(USAGE.into()));
+    }
+    let amount: u32 = amount_raw
+        .parse()
+        .map_err(|_| AppError::InvalidConsoleSyntax("amount must be a positive integer".into()))?;
+    if amount == 0 {
+        return Err(AppError::InvalidConsoleSyntax(
+            "amount must be greater than zero".into(),
+        ));
+    }
+    let block_ids = block_tokens
+        .iter()
+        .map(|token| normalize_block_id(token))
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(ConsoleCommand::Mine { block_ids, amount })
 }
 
 fn no_arguments(
@@ -950,6 +982,35 @@ mod tests {
     }
 
     #[test]
+    fn parses_get_resource_command_for_ore_items() {
+        // `#get diamond 10`: the argument is the *item*, not a block --
+        // resolution to `diamond_ore`/`deepslate_diamond_ore` happens at
+        // dispatch time (see `mobs::resolve_resource`'s own tests); parsing
+        // only needs to accept the item id and carry it through unchanged.
+        assert_eq!(
+            parse_input("/get diamond 10").unwrap(),
+            ConsoleInput::Command(ConsoleCommand::GetResource {
+                resource_id: "minecraft:diamond".into(),
+                amount: 10,
+            })
+        );
+        assert_eq!(
+            parse_input("/get raw_iron 20").unwrap(),
+            ConsoleInput::Command(ConsoleCommand::GetResource {
+                resource_id: "minecraft:raw_iron".into(),
+                amount: 20,
+            })
+        );
+        assert_eq!(
+            parse_input("/get coal 50").unwrap(),
+            ConsoleInput::Command(ConsoleCommand::GetResource {
+                resource_id: "minecraft:coal".into(),
+                amount: 50,
+            })
+        );
+    }
+
+    #[test]
     fn parses_get_resource_command_for_mob_drops() {
         assert_eq!(
             parse_input("/get leather 10").unwrap(),
@@ -1005,6 +1066,73 @@ mod tests {
         assert!(matches!(
             parse_input("/get not_a_real_thing 5"),
             Err(AppError::UnknownResourceIdentifier(_))
+        ));
+    }
+
+    #[test]
+    fn parses_mine_command_with_a_single_block() {
+        assert_eq!(
+            parse_input("/mine stone 100").unwrap(),
+            ConsoleInput::Command(ConsoleCommand::Mine {
+                block_ids: vec!["minecraft:stone".into()],
+                amount: 100,
+            })
+        );
+    }
+
+    #[test]
+    fn parses_mine_command_with_multiple_blocks() {
+        // `#mine diamond_ore deepslate_diamond_ore 10`: unlike `/get`, both
+        // arguments before the amount are taken literally as block ids --
+        // no item resolution happens here at all.
+        assert_eq!(
+            parse_input("/mine diamond_ore deepslate_diamond_ore 10").unwrap(),
+            ConsoleInput::Command(ConsoleCommand::Mine {
+                block_ids: vec![
+                    "minecraft:diamond_ore".into(),
+                    "minecraft:deepslate_diamond_ore".into(),
+                ],
+                amount: 10,
+            })
+        );
+    }
+
+    #[test]
+    fn mine_never_resolves_item_names_to_blocks() {
+        // `#get`'s ore resolution must not leak into `/mine`: a plain item
+        // name that is not itself a valid block id is rejected outright
+        // rather than silently expanded to source blocks.
+        assert!(matches!(
+            parse_input("/mine diamond 10"),
+            Err(AppError::UnknownBlockIdentifier(_))
+        ));
+        assert!(matches!(
+            parse_input("/mine raw_iron 10"),
+            Err(AppError::UnknownBlockIdentifier(_))
+        ));
+    }
+
+    #[test]
+    fn rejects_invalid_mine_arguments() {
+        assert!(matches!(
+            parse_input("/mine"),
+            Err(AppError::MissingConsoleArgument(_))
+        ));
+        assert!(matches!(
+            parse_input("/mine 10"),
+            Err(AppError::MissingConsoleArgument(_))
+        ));
+        assert!(matches!(
+            parse_input("/mine stone 0"),
+            Err(AppError::InvalidConsoleSyntax(_))
+        ));
+        assert!(matches!(
+            parse_input("/mine stone -5"),
+            Err(AppError::InvalidConsoleSyntax(_))
+        ));
+        assert!(matches!(
+            parse_input("/mine not_a_real_block 10"),
+            Err(AppError::UnknownBlockIdentifier(_))
         ));
     }
 

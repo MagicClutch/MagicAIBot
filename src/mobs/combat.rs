@@ -61,7 +61,13 @@ const TARGET_TIMEOUT: Duration = Duration::from_secs(45);
 /// vanilla's proximity item pickup even though melee reach is wider than the
 /// pickup radius.
 const COLLECT_TIMEOUT: Duration = Duration::from_secs(5);
-const COLLECT_ARRIVAL_DISTANCE: f64 = 1.5;
+/// Vanilla's actual item pickup range is much tighter than
+/// `MovementConfig::arrival_distance` (the general-purpose "close enough to
+/// interact" threshold `MovementService` itself stops at) -- `tick_collecting`
+/// polls the bot's live position against this instead of trusting
+/// `MovementStatus::Completed`, re-issuing the walk if movement gives up
+/// early while still outside it.
+const COLLECT_ARRIVAL_DISTANCE: f64 = 0.6;
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub enum CombatState {
@@ -456,11 +462,26 @@ impl CombatController {
             .is_some_and(|(position, target)| {
                 distance(position, target) <= COLLECT_ARRIVAL_DISTANCE
             });
-        let movement_status = movement.snapshot().await.status;
         let timed_out = started_at.is_some_and(|at| at.elapsed() >= COLLECT_TIMEOUT);
-        if arrived || timed_out || movement_status == MovementStatus::Failed {
+        if arrived || timed_out {
             let _ = movement.stop(minecraft).await;
             self.inner.lock().await.snapshot.state = CombatState::Completed;
+            return;
+        }
+        // `MovementService`'s own arrival threshold is looser than
+        // `COLLECT_ARRIVAL_DISTANCE` -- if it already gave up (reached its
+        // own threshold, or genuinely failed) while still outside the tight
+        // distance actually needed for pickup, nudge it toward the drop
+        // again rather than silently leaving the item uncollected.
+        let movement_status = movement.snapshot().await.status;
+        if matches!(
+            movement_status,
+            MovementStatus::Completed | MovementStatus::Idle | MovementStatus::Failed
+        ) && let Some(target) = death_position
+        {
+            let _ = movement
+                .goto(minecraft, target, NavigationMode::AllowMining)
+                .await;
         }
     }
 
