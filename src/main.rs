@@ -1,6 +1,7 @@
 mod app;
 mod blocks;
 mod bridging;
+mod combat;
 mod config;
 mod console;
 mod container;

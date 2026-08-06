@@ -86,6 +86,15 @@ pub struct BotSnapshot {
     /// (`azalea_entity::Physics::fall_distance`), reset whenever the entity
     /// touches ground or water.
     pub fall_distance: Option<f64>,
+    /// Whether the bot's last movement tick was blocked sideways by a solid
+    /// block (`azalea_entity::Physics::horizontal_collision`) -- "walked
+    /// into a wall", as distinct from `on_ground` (which says nothing about
+    /// whether forward motion is actually working). Used by
+    /// `crate::combat` to detect an obstacle worth jumping over while
+    /// chasing a target with its own raw movement, which -- unlike
+    /// `crate::movement::MovementService`'s pathfinder-backed walking --
+    /// has no other way to notice it's stuck.
+    pub horizontal_collision: Option<bool>,
     pub last_position_update: Option<SystemTime>,
 }
 

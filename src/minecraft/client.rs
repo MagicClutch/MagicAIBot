@@ -14,7 +14,7 @@ use std::{
 use azalea::core::position::ChunkPos;
 use azalea::world::find_blocks::find_blocks_in_chunk;
 use azalea::{
-    Client, Event,
+    Client, Event, SprintDirection, WalkDirection,
     account::{Account, microsoft::MicrosoftAccountOpts},
     auto_reconnect::AutoReconnectDelay,
     block::BlockStates,
@@ -23,7 +23,7 @@ use azalea::{
         Dead, EntityKindComponent, EntityUuid, LocalEntity, LookDirection, Physics, Position,
         dimensions::EntityDimensions,
         inventory::Inventory,
-        metadata::{Health, Item, ItemItem},
+        metadata::{AbstractLivingUsingItem, Health, Item, ItemItem},
     },
     pathfinder::{
         PathfinderClientExt, PathfinderOpts,
@@ -37,7 +37,7 @@ use azalea::{
     registry::builtin::BlockKind,
     world::WorldName,
 };
-use azalea_inventory::components::{Damage, Enchantments, MaxDamage, Tool};
+use azalea_inventory::components::{Damage, Enchantments, Food as FoodComponent, MaxDamage, Tool};
 use tokio::{
     sync::{Mutex, watch},
     task::JoinHandle,
@@ -51,6 +51,7 @@ use crate::{
         block_query::{BlockSearchQuery, chunk_coordinate},
         block_snapshot::LoadedBlockCandidate,
     },
+    combat::movement::CombatWalk,
     config::{
         AccountMode, BridgingConfig, ConsoleConfig, MinecraftConfig, ReconnectConfig,
         VerticalNavigationConfig, WorldStateConfig,
@@ -74,6 +75,41 @@ pub(crate) struct HitboxSnapshot {
     pub position: [f64; 3],
     pub width: f64,
     pub height: f64,
+}
+
+/// See `MinecraftClient::player_combat_status`'s doc comment, in particular
+/// for `using_item`'s real limitations as a shield-blocking signal.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct PlayerCombatStatus {
+    pub health: Option<f32>,
+    pub alive: bool,
+    pub using_item: bool,
+}
+
+/// One held item this bot's own inventory reports as edible (has a real
+/// `Food` component), for `crate::combat::heal`'s selection policy. `slot`
+/// is the protocol slot index, used unchanged as the click source for
+/// equipping it, the same convention `equipment::model::EquipmentItem`
+/// uses.
+#[derive(Clone, Debug)]
+pub(crate) struct FoodCandidate {
+    pub slot: usize,
+    pub item_id: String,
+    pub nutrition: i32,
+}
+
+fn combat_walk_to_azalea(direction: CombatWalk) -> WalkDirection {
+    match direction {
+        CombatWalk::None => WalkDirection::None,
+        CombatWalk::Forward => WalkDirection::Forward,
+        CombatWalk::Backward => WalkDirection::Backward,
+        CombatWalk::Left => WalkDirection::Left,
+        CombatWalk::Right => WalkDirection::Right,
+        CombatWalk::ForwardLeft => WalkDirection::ForwardLeft,
+        CombatWalk::ForwardRight => WalkDirection::ForwardRight,
+        CombatWalk::BackwardLeft => WalkDirection::BackwardLeft,
+        CombatWalk::BackwardRight => WalkDirection::BackwardRight,
+    }
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -663,6 +699,25 @@ impl MinecraftClient {
         Ok(())
     }
 
+    /// Like [`Self::attack_entity`], but resolves the target by UUID
+    /// (`entity_id_by_uuid`, the same lookup `player_hitbox`/
+    /// `player_velocity`/`player_combat_status` already use) instead of a
+    /// Minecraft entity id -- `crate::combat` only ever has a player's
+    /// `PlayerSnapshot::uuid` on hand, never their numeric entity id.
+    pub(crate) async fn attack_player(&self, uuid: uuid::Uuid) -> Result<(), AppError> {
+        let client = self
+            .current_client
+            .lock()
+            .await
+            .clone()
+            .ok_or(AppError::MovementUnavailable)?;
+        let Some(entity) = client.entity_id_by_uuid(uuid) else {
+            return Err(AppError::LookTargetDisappeared);
+        };
+        client.attack(entity);
+        Ok(())
+    }
+
     pub(crate) async fn player_hitbox(&self, uuid: uuid::Uuid) -> Result<HitboxSnapshot, AppError> {
         let client = self
             .current_client
@@ -683,6 +738,199 @@ impl MinecraftClient {
                 }
             })
             .map_err(|_| AppError::LookTargetDisappeared)
+    }
+
+    /// A remote player's raw velocity (blocks/tick, Minecraft's native
+    /// unit), for `crate::combat`'s own short-term movement prediction
+    /// (`crate::combat::targeting::predicted_position`) -- unlike position,
+    /// nothing in this codebase needed a player's velocity before combat,
+    /// so unlike `player_hitbox` this has no pre-existing equivalent to
+    /// reuse. Falls back to zero (not an error) if the entity has no
+    /// `Physics` component yet, since that's a normal transient state right
+    /// after an entity first loads, not a failure.
+    pub(crate) async fn player_velocity(&self, uuid: uuid::Uuid) -> Result<[f64; 3], AppError> {
+        let client = self
+            .current_client
+            .lock()
+            .await
+            .clone()
+            .ok_or(AppError::LookUnavailable)?;
+        let Some(entity) = client.entity_id_by_uuid(uuid) else {
+            return Err(AppError::LookTargetDisappeared);
+        };
+        client
+            .query_entity::<Option<&Physics>, _>(entity, |physics| {
+                physics.map_or([0.0, 0.0, 0.0], |physics| {
+                    let velocity: azalea::Vec3 = physics.velocity;
+                    [velocity.x, velocity.y, velocity.z]
+                })
+            })
+            .map_err(|_| AppError::LookTargetDisappeared)
+    }
+
+    /// The subset of a remote player's live entity state `crate::combat`
+    /// needs beyond position (`player_hitbox`) or velocity
+    /// (`player_velocity`): health, whether they're alive, whether they're
+    /// standing on solid ground, and whether they currently appear to be
+    /// actively using an item.
+    ///
+    /// That last field is the best signal available for shield-blocking
+    /// detection, and it comes with a real limitation worth stating
+    /// plainly: Minecraft only tells other clients *that* an entity has an
+    /// item active -- eating, drinking, drawing a bow, or blocking all set
+    /// the exact same flag (`AbstractLivingUsingItem`) -- never *which*
+    /// item. This crate's vendored Azalea also does not track other
+    /// entities' held/equipped items at all (`azalea-client`'s
+    /// `set_equipment` packet handler is a debug-log no-op); teaching it to
+    /// would mean patching the vendored library, out of scope here. So
+    /// `using_item` is a heuristic, not a certainty: in the middle of a
+    /// melee fight it is overwhelmingly likely to mean "blocking", but it
+    /// cannot be told apart from the target eating or drawing a bow. See
+    /// `crate::combat::shield_break` for how this gets used regardless.
+    pub(crate) async fn player_combat_status(
+        &self,
+        uuid: uuid::Uuid,
+    ) -> Result<PlayerCombatStatus, AppError> {
+        let client = self
+            .current_client
+            .lock()
+            .await
+            .clone()
+            .ok_or(AppError::LookUnavailable)?;
+        let Some(entity) = client.entity_id_by_uuid(uuid) else {
+            return Err(AppError::LookTargetDisappeared);
+        };
+        client
+            .query_entity::<(
+                Option<&Health>,
+                Option<&Dead>,
+                Option<&AbstractLivingUsingItem>,
+            ), _>(entity, |(health, dead, using_item)| PlayerCombatStatus {
+                health: health.map(|health| health.0),
+                alive: dead.is_none() && health.is_none_or(|health| health.0 > 0.0),
+                using_item: using_item.is_some_and(|using_item| using_item.0),
+            })
+            .map_err(|_| AppError::LookTargetDisappeared)
+    }
+
+    /// Sets the bot's walk/strafe/sprint input for this tick, for
+    /// `crate::combat`'s own movement (see that module's doc comment for
+    /// why it drives raw input directly instead of going through
+    /// `crate::movement::MovementService`/Azalea's pathfinder). Sprinting
+    /// is only physically possible moving forward or forward-diagonally in
+    /// vanilla, so `sprint` is silently ignored for any other direction
+    /// (including [`CombatWalk::None`]) rather than erroring.
+    pub(crate) async fn set_combat_walk(
+        &self,
+        direction: CombatWalk,
+        sprint: bool,
+    ) -> Result<(), AppError> {
+        let client = self
+            .current_client
+            .lock()
+            .await
+            .clone()
+            .ok_or(AppError::MovementUnavailable)?;
+        if sprint {
+            let sprint_direction = match direction {
+                CombatWalk::Forward => Some(SprintDirection::Forward),
+                CombatWalk::ForwardLeft => Some(SprintDirection::ForwardLeft),
+                CombatWalk::ForwardRight => Some(SprintDirection::ForwardRight),
+                _ => None,
+            };
+            if let Some(sprint_direction) = sprint_direction {
+                client.sprint(sprint_direction);
+                return Ok(());
+            }
+        }
+        client.walk(combat_walk_to_azalea(direction));
+        Ok(())
+    }
+
+    /// Queues a single jump for next tick (`Client::jump`, the same
+    /// one-shot primitive `azalea::bot::Client::jump` documents as "queue a
+    /// jump for the next tick" -- distinct from holding jump down), used by
+    /// `crate::combat::crits` to line up a critical hit.
+    pub(crate) async fn combat_jump_once(&self) -> Result<(), AppError> {
+        let client = self
+            .current_client
+            .lock()
+            .await
+            .clone()
+            .ok_or(AppError::MovementUnavailable)?;
+        client.jump();
+        Ok(())
+    }
+
+    /// Right-clicks (holds) whichever item is in the main hand -- eating
+    /// food for `crate::combat::heal` (select it into the hotbar first via
+    /// `select_hotbar_slot`, matching `azalea::Client::start_use_item`'s
+    /// own doc comment: "if the item is consumable, ... acts as if
+    /// right-click was held until the item finishes being consumed").
+    pub(crate) async fn start_use_main_hand(&self) -> Result<(), AppError> {
+        let client = self
+            .current_client
+            .lock()
+            .await
+            .clone()
+            .ok_or(AppError::MovementUnavailable)?;
+        client.start_use_item();
+        Ok(())
+    }
+
+    /// Like [`Self::start_use_main_hand`], but for the off hand -- raising
+    /// a shield for `crate::combat::defense`. Vanilla shield-blocking
+    /// activates whichever hand is actually holding the shield; this bot's
+    /// combat weapon (sword/axe) always occupies the main hand, so the
+    /// shield -- whenever one is present at all -- can only ever be in the
+    /// off hand (see `crate::combat::defense`'s module doc comment for the
+    /// consequence: no shield-use if the user's own `equipment.offhand`
+    /// config keeps something else, e.g. a totem, there instead).
+    /// `azalea::Client::start_use_item` hardcodes the main hand, so this
+    /// writes the underlying `StartUseItemEvent` directly instead.
+    pub(crate) async fn start_use_off_hand(&self) -> Result<(), AppError> {
+        let client = self
+            .current_client
+            .lock()
+            .await
+            .clone()
+            .ok_or(AppError::MovementUnavailable)?;
+        client
+            .ecs
+            .write()
+            .write_message(azalea_client::interact::StartUseItemEvent {
+                entity: client.entity,
+                hand: azalea::protocol::packets::game::s_interact::InteractionHand::OffHand,
+                force_block: None,
+                force_direction: None,
+            });
+        Ok(())
+    }
+
+    /// Releases whichever item is currently being held-used (eating,
+    /// drinking, or blocking) in either hand -- lowers a raised shield, or
+    /// stops eating early. There's no dedicated "stop use" event in this
+    /// crate's Azalea (unlike `StartUseItemEvent`); the real vanilla
+    /// mechanism is this exact serverbound packet
+    /// (`Action::ReleaseUseItem`), the same one `azalea_client`'s own
+    /// mining plugin uses `Client::write_packet` to send for its own
+    /// block-breaking actions.
+    pub(crate) async fn release_use_item(&self) -> Result<(), AppError> {
+        let client = self
+            .current_client
+            .lock()
+            .await
+            .clone()
+            .ok_or(AppError::MovementUnavailable)?;
+        client.write_packet(
+            azalea::protocol::packets::game::s_player_action::ServerboundPlayerAction {
+                action: azalea::protocol::packets::game::s_player_action::Action::ReleaseUseItem,
+                pos: azalea::BlockPos::default(),
+                direction: azalea::core::direction::Direction::Down,
+                seq: 0,
+            },
+        );
+        Ok(())
     }
 
     pub(crate) async fn set_look_direction(&self, yaw: f32, pitch: f32) -> Result<(), AppError> {
@@ -862,6 +1110,41 @@ impl MinecraftClient {
             offhand_worn: read(OFFHAND_PROTOCOL_SLOT),
             inventory: INVENTORY_PROTOCOL_SLOTS.filter_map(read).collect(),
         })
+    }
+
+    /// Every held item (main inventory + hotbar, mirroring
+    /// `equipment_snapshot`'s `INVENTORY_PROTOCOL_SLOTS` range) that
+    /// carries a real `Food` data component -- i.e. genuinely edible,
+    /// data-driven rather than matched against a hardcoded id list, so
+    /// `crate::combat::heal` recognizes any vanilla (or datapack-added)
+    /// food this bot happens to be holding, not just the six named in the
+    /// spec's priority list.
+    pub(crate) async fn food_snapshot(&self) -> Result<Vec<FoodCandidate>, AppError> {
+        use crate::equipment::model::INVENTORY_PROTOCOL_SLOTS;
+        let client = self
+            .current_client
+            .lock()
+            .await
+            .clone()
+            .ok_or(AppError::InventoryUnavailable)?;
+        let menu = client
+            .component::<Inventory>()
+            .map_err(|_| AppError::InventoryUnavailable)?
+            .inventory_menu
+            .clone();
+        let slots = menu.slots();
+        Ok(INVENTORY_PROTOCOL_SLOTS
+            .filter_map(|index| {
+                let item = slots.get(index)?;
+                let data = item.as_present()?;
+                let food = item.get_component::<FoodComponent>()?;
+                Some(FoodCandidate {
+                    slot: index,
+                    item_id: data.kind.to_string(),
+                    nutrition: food.nutrition,
+                })
+            })
+            .collect())
     }
 
     /// Maps Azalea's authoritative active menu into the application model.
@@ -1689,6 +1972,7 @@ async fn refresh_ecs_state(
         bot.on_ground = physics.map(Physics::on_ground);
         bot.velocity_y = physics.map(|physics| physics.velocity.y);
         bot.fall_distance = physics.map(|physics| physics.fall_distance);
+        bot.horizontal_collision = physics.map(|physics| physics.horizontal_collision);
         bot.alive = Some(dead.is_none());
     }
     let inventory_snapshot = inventory_from_component(&bot_inventory);

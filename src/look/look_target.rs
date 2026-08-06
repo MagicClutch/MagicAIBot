@@ -18,6 +18,12 @@ pub enum LookTarget {
     World(PositionSnapshot),
     Entity(u32),
     Player(String),
+    /// Like [`Self::Player`], but leads the aim slightly ahead of the
+    /// player's current position based on their live velocity, so the
+    /// crosshair anticipates a moving target instead of always trailing
+    /// slightly behind it. Used by `crate::combat` for PvP; falls back to
+    /// exactly [`Self::Player`]'s behavior when velocity is unavailable.
+    PredictedPlayer(String),
     #[allow(dead_code)]
     MovementDirection,
 }
@@ -40,7 +46,7 @@ impl LookTarget {
                 position.x, position.y, position.z
             ),
             Self::Entity(entity_id) => format!("entity {entity_id}"),
-            Self::Player(name) => format!("player {name}"),
+            Self::Player(name) | Self::PredictedPlayer(name) => format!("player {name}"),
             Self::MovementDirection => "movement direction".into(),
         }
     }

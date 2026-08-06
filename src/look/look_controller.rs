@@ -578,6 +578,20 @@ async fn resolve_context(
             let hitbox = minecraft.player_hitbox(player.uuid).await?;
             context_from_hitbox(hitbox, true)
         }
+        LookTarget::PredictedPlayer(name) => {
+            let player = world
+                .find_player_by_name(name)
+                .ok_or(AppError::LookTargetDisappeared)?;
+            let mut hitbox = minecraft.player_hitbox(player.uuid).await?;
+            // Best-effort: an aim lead is a nicety, not a correctness
+            // requirement, so a velocity read failing (no `Physics`
+            // component yet, a momentary disconnect) just falls back to
+            // `Player`'s exact tracking rather than failing the whole look.
+            if let Ok(velocity) = minecraft.player_velocity(player.uuid).await {
+                hitbox.position = leaded_position(hitbox.position, velocity);
+            }
+            context_from_hitbox(hitbox, true)
+        }
         LookTarget::MovementDirection => {
             let position = world.bot.position.ok_or(AppError::LookUnavailable)?;
             let yaw = f64::from(world.bot.yaw.unwrap_or_default()).to_radians();
@@ -619,4 +633,60 @@ fn context_from_hitbox(hitbox: HitboxSnapshot, player: bool) -> Result<AimContex
             "randomized entity hitbox point".into()
         },
     })
+}
+
+/// How far ahead (in seconds) [`LookTarget::PredictedPlayer`] leads the
+/// aim -- deliberately much shorter than
+/// `crate::combat::targeting::PREDICTION_LEAD_SECONDS` (which leads the
+/// bot's *feet*): overcommitting where the crosshair points for a hundred
+/// milliseconds is harmless (the next tick corrects it), but overcommitting
+/// where the bot *walks* for that long measurably throws off positioning.
+const AIM_LEAD_SECONDS: f64 = 0.1;
+/// Caps how far the aim lead can push the aim point, regardless of how
+/// fast the target is moving -- an aim that's already within a target's
+/// hitbox width doesn't need to lead further ahead to still land.
+const AIM_LEAD_MAX_BLOCKS: f64 = 0.6;
+
+/// Offsets a hitbox position horizontally by a short, capped lead based on
+/// `velocity` (Minecraft's native blocks/tick unit). Vertical velocity
+/// (jumping, falling) is ignored -- it says nothing about where to aim
+/// ahead, only where to aim *now*, which the unmodified `y` already covers.
+fn leaded_position(position: [f64; 3], velocity: [f64; 3]) -> [f64; 3] {
+    let lead_x =
+        (velocity[0] * 20.0 * AIM_LEAD_SECONDS).clamp(-AIM_LEAD_MAX_BLOCKS, AIM_LEAD_MAX_BLOCKS);
+    let lead_z =
+        (velocity[2] * 20.0 * AIM_LEAD_SECONDS).clamp(-AIM_LEAD_MAX_BLOCKS, AIM_LEAD_MAX_BLOCKS);
+    [position[0] + lead_x, position[1], position[2] + lead_z]
+}
+
+#[cfg(test)]
+mod leaded_position_tests {
+    use super::*;
+
+    #[test]
+    fn a_stationary_target_is_not_offset() {
+        let position = [10.0, 64.0, 10.0];
+        assert_eq!(leaded_position(position, [0.0, 0.0, 0.0]), position);
+    }
+
+    #[test]
+    fn a_moving_target_is_offset_ahead_in_its_direction_of_travel() {
+        let position = [0.0, 64.0, 0.0];
+        let leaded = leaded_position(position, [0.28, 0.0, 0.0]);
+        assert!(leaded[0] > position[0]);
+        assert_eq!(leaded[2], position[2]);
+    }
+
+    #[test]
+    fn vertical_velocity_never_affects_the_leaded_position() {
+        let position = [0.0, 64.0, 0.0];
+        assert_eq!(leaded_position(position, [0.0, -5.0, 0.0])[1], position[1]);
+    }
+
+    #[test]
+    fn an_extreme_velocity_is_clamped_rather_than_leading_forever() {
+        let position = [0.0, 64.0, 0.0];
+        let leaded = leaded_position(position, [500.0, 0.0, 0.0]);
+        assert!((leaded[0] - position[0] - AIM_LEAD_MAX_BLOCKS).abs() < 1e-9);
+    }
 }

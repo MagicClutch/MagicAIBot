@@ -48,6 +48,8 @@ pub struct Config {
     pub survival: SurvivalConfig,
     #[serde(default)]
     pub output: OutputConfig,
+    #[serde(default)]
+    pub killbot: KillbotConfig,
 }
 
 /// How much of the bot's own status narration (task started/progress/
@@ -497,6 +499,85 @@ impl Default for SurvivalConfig {
             placement_latency_compensation_ms: default_placement_latency_compensation_ms(),
             pickup_after_landing: true,
             disable_in_nether: true,
+        }
+    }
+}
+
+/// Standalone PvP (`#kill`/`/kill`, `crate::combat`) tuning -- entirely
+/// independent of `MovementConfig`/`BlockNavigationConfig` above, since
+/// combat drives its own raw movement rather than the pathfinder (see
+/// `crate::combat`'s module doc comment).
+#[derive(Clone, Debug, Deserialize)]
+pub struct KillbotConfig {
+    /// Vanilla melee reach: past this, the bot doesn't even attempt to
+    /// swing regardless of cooldown.
+    #[serde(default = "default_killbot_attack_range")]
+    pub attack_range: f64,
+    /// Center of the preferred 1.7-1.9 combat band (see
+    /// `combat::movement`'s doc comment for the full distance policy this
+    /// anchors).
+    #[serde(default = "default_killbot_preferred_range")]
+    pub preferred_range: f64,
+    #[serde(default = "default_true")]
+    pub crit_enabled: bool,
+    #[serde(default = "default_true")]
+    pub shield_break_enabled: bool,
+    #[serde(default = "default_true")]
+    pub shield_use_enabled: bool,
+    /// Health (HP, 0-20) at or below which the bot disengages into
+    /// `combat::health::CombatMode::Defensive`/`Critical` and starts
+    /// looking for food -- see `combat::heal`.
+    #[serde(default = "default_killbot_heal_threshold")]
+    pub heal_threshold: f64,
+    /// Health (HP, 0-20) the bot must recover to before re-engaging after
+    /// healing. Deliberately well above `heal_threshold` (a hysteresis
+    /// gap) so the bot doesn't immediately flip back into Defensive mode
+    /// the moment it lands one more hit.
+    #[serde(default = "default_killbot_reengage_threshold")]
+    pub reengage_threshold: f64,
+    #[serde(default = "default_true")]
+    pub sprint_reset_enabled: bool,
+    #[serde(default = "default_true")]
+    pub strafe_enabled: bool,
+    #[serde(default = "default_true")]
+    pub prediction_enabled: bool,
+    /// Safety ceiling on chasing one target, mirroring
+    /// `mobs::combat::TARGET_TIMEOUT`'s "don't chase forever" purpose but
+    /// expressed as a distance rather than a duration -- past this, the
+    /// bot gives up rather than following a fleeing/mounted player across
+    /// the whole map.
+    #[serde(default = "default_killbot_max_chase_distance")]
+    pub max_chase_distance: f64,
+}
+fn default_killbot_attack_range() -> f64 {
+    2.0
+}
+fn default_killbot_preferred_range() -> f64 {
+    1.8
+}
+fn default_killbot_heal_threshold() -> f64 {
+    8.0
+}
+fn default_killbot_reengage_threshold() -> f64 {
+    14.0
+}
+fn default_killbot_max_chase_distance() -> f64 {
+    128.0
+}
+impl Default for KillbotConfig {
+    fn default() -> Self {
+        Self {
+            attack_range: default_killbot_attack_range(),
+            preferred_range: default_killbot_preferred_range(),
+            crit_enabled: true,
+            shield_break_enabled: true,
+            shield_use_enabled: true,
+            heal_threshold: default_killbot_heal_threshold(),
+            reengage_threshold: default_killbot_reengage_threshold(),
+            sprint_reset_enabled: true,
+            strafe_enabled: true,
+            prediction_enabled: true,
+            max_chase_distance: default_killbot_max_chase_distance(),
         }
     }
 }
@@ -1356,6 +1437,18 @@ impl Config {
                 "min_fall_distance, placement_offset_blocks, or placement_latency_compensation_ms is out of range".into(),
             ));
         }
+        let killbot = &self.killbot;
+        if !(killbot.attack_range > 0.0 && killbot.attack_range <= 6.0)
+            || !(killbot.preferred_range > 0.0 && killbot.preferred_range <= killbot.attack_range)
+            || !(0.0..=20.0).contains(&killbot.heal_threshold)
+            || !(0.0..=20.0).contains(&killbot.reengage_threshold)
+            || killbot.reengage_threshold < killbot.heal_threshold
+            || !(killbot.max_chase_distance > 0.0 && killbot.max_chase_distance <= 1024.0)
+        {
+            return Err(AppError::InvalidKillbotConfiguration(
+                "attack_range, preferred_range, heal_threshold, reengage_threshold, or max_chase_distance is out of range".into(),
+            ));
+        }
         if !(-2032..=2032).contains(&self.vertical_navigation.minimum_y) {
             return Err(AppError::InvalidVerticalNavigationConfiguration(
                 "minimum_y must be within the technical world height limits (-2032..=2032)".into(),
@@ -1491,6 +1584,59 @@ mod tests {
         assert_eq!(config.equipment.offhand.priority, OffhandPriority::Totem);
         assert_eq!(config.output.console, OutputMode::Info);
         assert_eq!(config.output.chat, OutputMode::Info);
+        assert_eq!(config.killbot.attack_range, 2.0);
+        assert_eq!(config.killbot.preferred_range, 1.8);
+        assert_eq!(config.killbot.heal_threshold, 8.0);
+        assert_eq!(config.killbot.reengage_threshold, 14.0);
+        assert!(config.killbot.crit_enabled);
+    }
+
+    #[test]
+    fn rejects_a_killbot_reengage_threshold_below_the_heal_threshold() {
+        let mut config: Config = toml::from_str(
+            r#"
+                [minecraft]
+                server = "localhost"
+                username = "MagicBot"
+                account_mode = "offline"
+                [reconnect]
+                enabled = false
+                delay_seconds = 1
+                maximum_attempts = 1
+                [logging]
+                level = "info"
+            "#,
+        )
+        .unwrap();
+        config.killbot.reengage_threshold = config.killbot.heal_threshold - 1.0;
+        assert!(matches!(
+            config.validate(),
+            Err(AppError::InvalidKillbotConfiguration(_))
+        ));
+    }
+
+    #[test]
+    fn rejects_a_killbot_preferred_range_beyond_its_attack_range() {
+        let mut config: Config = toml::from_str(
+            r#"
+                [minecraft]
+                server = "localhost"
+                username = "MagicBot"
+                account_mode = "offline"
+                [reconnect]
+                enabled = false
+                delay_seconds = 1
+                maximum_attempts = 1
+                [logging]
+                level = "info"
+            "#,
+        )
+        .unwrap();
+        config.killbot.preferred_range = config.killbot.attack_range + 1.0;
+        assert!(matches!(
+            config.validate(),
+            Err(AppError::InvalidKillbotConfiguration(_))
+        ));
     }
 
     #[test]

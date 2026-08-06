@@ -14,7 +14,7 @@
 //! so nothing reasserts itself after being told to stop.
 
 use crate::{
-    interaction::InteractionController, logging, look::LookController,
+    combat::KillController, interaction::InteractionController, logging, look::LookController,
     minecraft::client::MinecraftClient, mobs::CombatController, movement::MovementService,
     navigation::BlockNavigationService, survival::SurvivalController,
 };
@@ -32,6 +32,9 @@ pub struct StopTargets<'a> {
     pub look: &'a LookController,
     pub interaction: &'a InteractionController,
     pub combat: &'a CombatController,
+    /// Standalone PvP (`#kill`/`/kill`) -- see `crate::combat`'s module
+    /// doc comment for why this is separate from `combat` above.
+    pub pvp: &'a KillController,
     pub container: &'a crate::container::service::ContainerService,
     pub survival: &'a SurvivalController,
 }
@@ -76,6 +79,7 @@ pub async fn execute(targets: &StopTargets<'_>, emergency: &EmergencyStop) {
         .combat
         .cancel(targets.minecraft, targets.movement, targets.look)
         .await;
+    targets.pvp.cancel(targets.minecraft, targets.look).await;
 
     logging::info("Stopping interactions");
     targets
@@ -159,6 +163,7 @@ mod tests {
             block_navigation.clone(),
         );
         let combat = CombatController::new();
+        let pvp = KillController::default();
         let container = ContainerService::default();
         let survival = SurvivalController::new(SurvivalConfig::default());
         let emergency = EmergencyStop::new();
@@ -171,6 +176,7 @@ mod tests {
             look: &look,
             interaction: &interaction,
             combat: &combat,
+            pvp: &pvp,
             container: &container,
             survival: &survival,
         };

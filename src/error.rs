@@ -53,6 +53,8 @@ pub enum AppError {
     InvalidInteractionConfiguration(String),
     #[error("invalid survival configuration: {0}")]
     InvalidSurvivalConfiguration(String),
+    #[error("invalid killbot configuration: {0}")]
+    InvalidKillbotConfiguration(String),
     #[error("invalid equipment configuration: {0}")]
     InvalidEquipmentConfiguration(String),
     #[error("invalid vertical-navigation configuration: {0}")]
@@ -103,6 +105,8 @@ pub enum AppError {
     ItemNotFoundForDrop(String),
     #[error("combat was cancelled")]
     CombatCancelled,
+    #[error("kill task was cancelled")]
+    KillCancelled,
     #[error("no valid approach position")]
     NoValidApproachPosition,
     #[error("target block disappeared")]

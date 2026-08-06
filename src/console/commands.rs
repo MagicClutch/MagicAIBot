@@ -47,6 +47,14 @@ pub enum ConsoleCommand {
     Follow {
         player: String,
     },
+    /// `#kill <player>`/`/kill <player>`: starts a standalone PvP fight
+    /// against a tracked player -- see `crate::combat`. Distinct from
+    /// `#get <mob> <amount>` (which can also fight, via
+    /// `mobs::combat::CombatController`), and from `/stop`, which cancels
+    /// this the same as everything else.
+    KillPlayer {
+        player: String,
+    },
     Movement,
     FindBlock {
         block_id: String,
@@ -240,6 +248,9 @@ pub fn parse_input(input: &str) -> Result<ConsoleInput, AppError> {
         "stopmovement" => no_arguments(command, arguments, ConsoleCommand::StopMovement)?,
         "follow" => ConsoleCommand::Follow {
             player: parse_follow_name(arguments)?,
+        },
+        "kill" => ConsoleCommand::KillPlayer {
+            player: single_argument(command, arguments, "/kill <player>")?.to_owned(),
         },
         "movement" => no_arguments(command, arguments, ConsoleCommand::Movement)?,
         "find" | "findblock" => parse_find_block(arguments)?,
@@ -1524,6 +1535,28 @@ mod tests {
         );
         assert!(matches!(
             parse_input("/explanation now"),
+            Err(AppError::InvalidConsoleSyntax(_))
+        ));
+    }
+
+    #[test]
+    fn kill_parses_a_single_player_name() {
+        assert_eq!(
+            parse_input("/kill 5cat").unwrap(),
+            ConsoleInput::Command(ConsoleCommand::KillPlayer {
+                player: "5cat".to_owned(),
+            })
+        );
+    }
+
+    #[test]
+    fn kill_rejects_a_missing_or_extra_argument() {
+        assert!(matches!(
+            parse_input("/kill"),
+            Err(AppError::MissingConsoleArgument(_))
+        ));
+        assert!(matches!(
+            parse_input("/kill 5cat Steve"),
             Err(AppError::InvalidConsoleSyntax(_))
         ));
     }
