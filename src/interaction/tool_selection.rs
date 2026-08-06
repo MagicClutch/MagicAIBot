@@ -9,6 +9,6 @@
 //! tool-selection flow (`MinecraftClient::select_tool_for_block`).
 
 pub(crate) use azalea::pathfinder::tool_policy::{
-    BlockKnowledge, ToolCandidate, ToolFallbackPolicy, ToolSelection, ToolSelectionPolicy,
-    category, preferred_category, select_tool, tier,
+    BlockKnowledge, ToolCandidate, ToolCategory, ToolFallbackPolicy, ToolSelection,
+    ToolSelectionPolicy, category, preferred_category, select_tool, tier,
 };

@@ -2,7 +2,10 @@
 //! by `crate::equipment::manager::EquipmentService` and directly
 //! unit-tested here.
 
-use crate::{config::ArmorMode, equipment::model::EquipmentItem};
+use crate::{
+    config::ArmorMode,
+    equipment::{model::EquipmentItem, scoring::penalize_for_durability},
+};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ArmorSlot {
@@ -108,32 +111,11 @@ pub fn classify(item_id: &str) -> Option<(ArmorSlot, ArmorMaterial)> {
 }
 
 /// `score` mode: a 1.0-10.0 rating for one armor piece, rounded to one
-/// decimal place.
-///
-/// ```text
-/// durabilityPercent = currentDurability / maxDurability
-/// durabilityPenalty = (1 - durabilityPercent) * 6
-/// score = clamp(baseScore - durabilityPenalty, 1, 10)
-/// ```
-///
-/// Material sets the ceiling; a durability penalty (up to 6.0 points at 0%
-/// remaining) pulls it down, so a badly damaged Netherite piece can score
-/// below a fully-repaired Diamond one. An item with no durability data
-/// (`max_durability == 0`) is scored as if fully repaired rather than
-/// excluded, matching how the rest of this codebase treats unknown
-/// durability (see `interaction::tool_selection`).
+/// decimal place. Material sets the ceiling; `scoring::penalize_for_durability`
+/// pulls it down for wear, so a badly damaged Netherite piece can score
+/// below a fully-repaired Diamond one.
 pub fn score(material: ArmorMaterial, current_durability: u32, max_durability: u32) -> f32 {
-    let base = material.base_score();
-    if max_durability == 0 {
-        return round_to_tenth(base.clamp(1.0, 10.0));
-    }
-    let durability_percent = (current_durability as f32 / max_durability as f32).min(1.0);
-    let durability_penalty = (1.0 - durability_percent) * 6.0;
-    round_to_tenth((base - durability_penalty).clamp(1.0, 10.0))
-}
-
-fn round_to_tenth(value: f32) -> f32 {
-    (value * 10.0).round() / 10.0
+    penalize_for_durability(material.base_score(), current_durability, max_durability)
 }
 
 /// One inventory candidate for a given `ArmorSlot`, paired with its parsed

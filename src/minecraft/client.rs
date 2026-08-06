@@ -91,6 +91,18 @@ pub(crate) enum RaycastFace {
     West,
     East,
 }
+impl RaycastFace {
+    fn to_direction(self) -> azalea::core::direction::Direction {
+        match self {
+            Self::Up => azalea::core::direction::Direction::Up,
+            Self::Down => azalea::core::direction::Direction::Down,
+            Self::North => azalea::core::direction::Direction::North,
+            Self::South => azalea::core::direction::Direction::South,
+            Self::West => azalea::core::direction::Direction::West,
+            Self::East => azalea::core::direction::Direction::East,
+        }
+    }
+}
 
 const CONNECTION_TIMEOUT: Duration = Duration::from_secs(30);
 pub const MAX_CHAT_MESSAGE_LENGTH: usize = 256;
@@ -387,6 +399,16 @@ impl MinecraftClient {
         self.world_state.lock().await.pop_incoming_player_chat()
     }
 
+    pub(crate) async fn take_matching_incoming_player_chat(
+        &self,
+        predicate: impl FnMut(&crate::minecraft::world_state::ChatRecord) -> bool,
+    ) -> Option<crate::minecraft::world_state::ChatRecord> {
+        self.world_state
+            .lock()
+            .await
+            .take_matching_incoming_player_chat(predicate)
+    }
+
     pub async fn set_incoming_player_chat_capacity(&self, capacity: usize) {
         self.world_state
             .lock()
@@ -410,6 +432,9 @@ impl MinecraftClient {
             .ok_or(AppError::BlockSearchDimensionUnavailable)?;
         if self.connection_state() != ConnectionState::Connected || !world_snapshot.joined_world() {
             return Err(AppError::BlockSearchUnavailable);
+        }
+        if crate::interaction::placement_rules::is_unbreakable(Some(&query.block_id)) {
+            return Err(AppError::UnbreakableBlock(query.block_id.clone()));
         }
 
         let block_kind = query
@@ -440,7 +465,14 @@ impl MinecraftClient {
         let world_guard = world.read();
         let world_min_y = world_guard.chunks.min_y();
         let world_max_y = world_min_y + world_guard.chunks.height() as i32 - 1;
-        let min_y = min_y.max(world_min_y);
+        // Never search below the configured floor (default -59, just above
+        // the Overworld's uneven natural-bedrock band) -- keeps the bot from
+        // ever finding, and therefore navigating toward, a target block
+        // deep enough that reaching it means digging through terrain that's
+        // frequently unbreakable bedrock.
+        let min_y = min_y
+            .max(world_min_y)
+            .max(self.vertical_navigation.minimum_y);
         let max_y = max_y.min(world_max_y);
         if min_y > max_y {
             return Ok(Vec::new());
@@ -736,6 +768,41 @@ impl MinecraftClient {
         Ok(())
     }
 
+    /// Like [`Self::interact_block`], but forces which face of `position` is
+    /// reported clicked instead of leaving it to Azalea's own
+    /// raycast-vs-`force_block` comparison. That comparison only overrides
+    /// the face when the *live* crosshair isn't already resting on
+    /// `position` at all -- if it happens to already be on the right block
+    /// but from the wrong side (a precise-aim-in-progress race, e.g. a
+    /// stale pre-clutch look target that coincidentally passes through the
+    /// same block on its way to the real one), it uses that wrong face
+    /// instead of defaulting to `Up`. Used by
+    /// `crate::survival::SurvivalController` so a water bucket always lands
+    /// on top of the landing surface regardless of whether the aim has
+    /// finished settling yet.
+    pub(crate) async fn interact_block_face(
+        &self,
+        position: BlockPosition,
+        face: RaycastFace,
+    ) -> Result<(), AppError> {
+        let client = self
+            .current_client
+            .lock()
+            .await
+            .clone()
+            .ok_or(AppError::MovementUnavailable)?;
+        client
+            .ecs
+            .write()
+            .write_message(azalea_client::interact::StartUseItemEvent {
+                entity: client.entity,
+                hand: azalea::protocol::packets::game::s_interact::InteractionHand::MainHand,
+                force_block: Some(azalea::BlockPos::new(position.x, position.y, position.z)),
+                force_direction: Some(face.to_direction()),
+            });
+        Ok(())
+    }
+
     pub(crate) async fn any_container_open(&self) -> bool {
         let Some(client) = self.current_client.lock().await.clone() else {
             return false;
@@ -997,6 +1064,25 @@ impl MinecraftClient {
                 } else {
                     Ok(false)
                 }
+            })
+            .await
+    }
+
+    /// Selects a hotbar slot by index rather than by item id -- used by
+    /// `crate::survival::SurvivalController` to restore whichever slot was
+    /// selected before it grabbed the water bucket, regardless of what item
+    /// (if any) is sitting there now.
+    pub(crate) async fn select_hotbar_slot(&self, slot: u8) -> Result<(), AppError> {
+        self.inventory_actions
+            .mutate(|| async {
+                let client = self
+                    .current_client
+                    .lock()
+                    .await
+                    .clone()
+                    .ok_or(AppError::InventoryUnavailable)?;
+                client.set_selected_hotbar_slot(slot);
+                Ok(())
             })
             .await
     }
@@ -1601,6 +1687,8 @@ async fn refresh_ecs_state(
         bot_inventory = inventory;
         bot.dimension = dimension.map(ToString::to_string);
         bot.on_ground = physics.map(Physics::on_ground);
+        bot.velocity_y = physics.map(|physics| physics.velocity.y);
+        bot.fall_distance = physics.map(|physics| physics.fall_distance);
         bot.alive = Some(dead.is_none());
     }
     let inventory_snapshot = inventory_from_component(&bot_inventory);

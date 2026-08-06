@@ -9,8 +9,13 @@ pub fn going_to(destination: PositionSnapshot) {
 pub fn following(name: &str) {
     logging::info(format!("Following player {name}"));
 }
+/// Deliberately `info`, not `success`: this fires once per movement
+/// sub-goal reached (every waypoint of a path, not just a whole command's
+/// final destination -- see `going_to`'s pairing), so tagging it a
+/// milestone would flood chat with dozens of identical lines for a single
+/// `/goto`/`#get`/`#mine` run and risk a spam kick.
 pub fn reached() {
-    logging::success("Position reached");
+    logging::info("Position reached");
 }
 pub fn cannot_reach(reason: &str) {
     logging::warning(format!("Cannot reach destination ({reason})"));

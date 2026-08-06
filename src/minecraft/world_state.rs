@@ -77,8 +77,28 @@ pub struct BotSnapshot {
     pub selected_hotbar_slot: Option<u8>,
     pub alive: Option<bool>,
     pub on_ground: Option<bool>,
+    /// Vertical component of Azalea's own physics velocity (blocks/tick,
+    /// negative while falling) -- see `azalea_entity::Physics::velocity`.
+    /// Used by `crate::survival` to detect and predict dangerous falls
+    /// without reimplementing Azalea's physics engine.
+    pub velocity_y: Option<f64>,
+    /// Azalea's own accumulated fall-damage counter
+    /// (`azalea_entity::Physics::fall_distance`), reset whenever the entity
+    /// touches ground or water.
+    pub fall_distance: Option<f64>,
     pub last_position_update: Option<SystemTime>,
 }
+
+/// Protocol slot range of the hotbar within the player's own inventory menu
+/// (`azalea_inventory::Player::HOTBAR_SLOTS`, `36..=44`) -- `InventorySlot::slot`
+/// is always a genuine protocol slot index (see `InventorySnapshot`'s
+/// population in `minecraft::client::inventory_from_component`, which reads
+/// straight off `Inventory::menu().slots()`), so hotbar membership is this
+/// fixed range, never a function of how many slots happen to be present.
+/// Duplicated from `crate::equipment::model::HOTBAR_PROTOCOL_SLOTS` rather
+/// than imported across that module boundary -- both describe the same
+/// underlying protocol fact, not shared behavior.
+const HOTBAR_PROTOCOL_SLOTS: std::ops::RangeInclusive<usize> = 36..=44;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct InventorySlot {
@@ -111,21 +131,13 @@ impl InventorySnapshot {
     }
     pub fn selected_item(&self) -> Option<&InventorySlot> {
         let selected = usize::from(self.selected_hotbar_slot?);
-        if self.slots.len() < 9 {
-            return self.slots.iter().find(|slot| slot.slot == selected);
-        }
-        let first_hotbar = self.slots.len() - 9;
-        self.slots
-            .iter()
-            .find(|slot| slot.slot == first_hotbar + selected)
+        let target = HOTBAR_PROTOCOL_SLOTS.start() + selected;
+        self.slots.iter().find(|slot| slot.slot == target)
     }
     pub fn item_is_in_hotbar(&self, id: &str) -> bool {
-        let Some(first_hotbar) = self.slots.len().checked_sub(9) else {
-            return false;
-        };
-        self.slots
-            .iter()
-            .any(|slot| slot.slot >= first_hotbar && slot.item_id.as_deref() == Some(id))
+        self.slots.iter().any(|slot| {
+            HOTBAR_PROTOCOL_SLOTS.contains(&slot.slot) && slot.item_id.as_deref() == Some(id)
+        })
     }
     fn rebuild_counts(&mut self) {
         self.total_counts.clear();
@@ -606,6 +618,22 @@ impl WorldState {
     pub fn pop_incoming_player_chat(&mut self) -> Option<ChatRecord> {
         self.incoming_player_chat.pop_front()
     }
+    /// Removes and returns the first queued player chat message matching
+    /// `predicate`, wherever it sits in the queue, leaving every other
+    /// queued message in its original relative order. Used only for the
+    /// `#stop`/`#stopall` emergency-stop chat commands
+    /// (`App::wait_tick`/`crate::control`), which must be detected even
+    /// while `App::tick_chat_commands` -- the normal drain loop -- can't
+    /// run because it's gated behind whatever blocking command is currently
+    /// stuck; `pop_incoming_player_chat` above remains the only way
+    /// anything else is consumed.
+    pub fn take_matching_incoming_player_chat(
+        &mut self,
+        predicate: impl FnMut(&ChatRecord) -> bool,
+    ) -> Option<ChatRecord> {
+        let index = self.incoming_player_chat.iter().position(predicate)?;
+        self.incoming_player_chat.remove(index)
+    }
     pub fn set_incoming_player_chat_capacity(&mut self, capacity: usize) {
         self.incoming_player_chat_capacity = capacity.max(1);
         while self.incoming_player_chat.len() > self.incoming_player_chat_capacity {
@@ -769,16 +797,19 @@ mod tests {
         state.update_inventory(InventorySnapshot {
             available: true,
             revision: 0,
+            // Protocol slot 37 = hotbar position 1 (36 + 1) -- real
+            // `InventorySlot::slot` values are always genuine protocol
+            // indices, never small relative offsets.
             selected_hotbar_slot: Some(1),
             slots: vec![
                 InventorySlot {
-                    slot: 1,
+                    slot: 37,
                     item_id: Some("minecraft:stone".into()),
                     display_name: None,
                     count: 3,
                 },
                 InventorySlot {
-                    slot: 4,
+                    slot: 10,
                     item_id: Some("minecraft:stone".into()),
                     display_name: None,
                     count: 7,
@@ -797,6 +828,41 @@ mod tests {
         state.update_inventory(InventorySnapshot::default());
         assert_eq!(state.inventory.count_item("minecraft:air"), 0);
         assert!(state.inventory.selected_item().is_none());
+    }
+    #[test]
+    fn hotbar_detection_uses_real_protocol_slots_not_a_length_offset() {
+        // A full live inventory snapshot always has all 46 protocol slots
+        // (craft result, craft grid, armor, main inventory, hotbar,
+        // offhand) present -- `item_is_in_hotbar` must key off the fixed
+        // `36..=44` hotbar range, not `slots.len() - 9` (which lands on
+        // `37..=45`, one slot too high: missing the first hotbar slot and
+        // wrongly counting the offhand slot as hotbar).
+        let mut state = WorldState::default();
+        let mut slots: Vec<InventorySlot> = (0..46)
+            .map(|slot| InventorySlot {
+                slot,
+                item_id: None,
+                display_name: None,
+                count: 0,
+            })
+            .collect();
+        slots[36].item_id = Some("minecraft:water_bucket".into()); // first hotbar slot
+        slots[36].count = 1;
+        slots[45].item_id = Some("minecraft:shield".into()); // offhand, not hotbar
+        slots[45].count = 1;
+        state.update_inventory(InventorySnapshot {
+            available: true,
+            revision: 0,
+            selected_hotbar_slot: Some(0),
+            slots,
+            total_counts: Default::default(),
+        });
+        assert!(state.inventory.item_is_in_hotbar("minecraft:water_bucket"));
+        assert!(!state.inventory.item_is_in_hotbar("minecraft:shield"));
+        assert_eq!(
+            state.inventory.selected_item().unwrap().item_id.as_deref(),
+            Some("minecraft:water_bucket")
+        );
     }
     #[test]
     fn player_lookup_is_case_insensitive_and_uuid_based() {
@@ -1004,5 +1070,50 @@ mod tests {
         assert!(state.pop_incoming_player_chat().is_none());
         state.record_received(ChatMessageKind::System, None, "system".into());
         assert!(state.pop_incoming_player_chat().is_none());
+    }
+
+    #[test]
+    fn take_matching_incoming_player_chat_jumps_the_queue_without_disturbing_the_rest() {
+        let mut state = WorldState::default();
+        state.set_incoming_player_chat_capacity(10);
+        for text in ["#hello", "#stop", "#goto 1 2 3"] {
+            state.record_received_from(
+                ChatMessageKind::Player,
+                None,
+                Some("Alex".into()),
+                text.into(),
+            );
+        }
+        let stop = state
+            .take_matching_incoming_player_chat(|chat| chat.text == "#stop")
+            .expect("the queued #stop message should be found");
+        assert_eq!(stop.text, "#stop");
+        // The other two messages are still queued, in their original order,
+        // with the matched one removed from between them -- nothing else
+        // was disturbed.
+        assert_eq!(state.pop_incoming_player_chat().unwrap().text, "#hello");
+        assert_eq!(
+            state.pop_incoming_player_chat().unwrap().text,
+            "#goto 1 2 3"
+        );
+        assert!(state.pop_incoming_player_chat().is_none());
+    }
+
+    #[test]
+    fn take_matching_incoming_player_chat_returns_none_without_a_match() {
+        let mut state = WorldState::default();
+        state.record_received_from(
+            ChatMessageKind::Player,
+            None,
+            Some("Alex".into()),
+            "#hello".into(),
+        );
+        assert!(
+            state
+                .take_matching_incoming_player_chat(|chat| chat.text == "#stop")
+                .is_none()
+        );
+        // The untouched message is still there for normal draining.
+        assert_eq!(state.pop_incoming_player_chat().unwrap().text, "#hello");
     }
 }

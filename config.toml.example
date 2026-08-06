@@ -18,6 +18,25 @@ show_action_bar_messages = false
 level = "info"
 debug = false
 
+# How much of the bot's OWN status narration (task started/progress/
+# finished -- not raw player chat) is shown, independently for the local
+# console/run window and for Minecraft chat. Change at runtime with
+# `/outputmode <console|chat|both> <mode>`; see `/explanation` in-game or in
+# the console for the same explanation as below.
+#
+#   none      - nothing at all
+#   light     - only a task's start and its final outcome
+#               (e.g. "Get task started: diamond x5", "Collected 5 diamond")
+#   info      - light, plus a running progress report as a task makes
+#               headway (e.g. "Collected diamond (3/5)")
+#   debug     - info, plus every other diagnostic line the bot prints
+#               (connection state, per-step narration, retries, ...)
+#   fulldebug - debug, but also disables repeat-collapsing so a stuck retry
+#               loop prints every repetition -- for troubleshooting only
+[output]
+console = "info"
+chat = "info"
+
 # A player can run a real console command directly from Minecraft chat with
 # a `#` prefix, e.g. `#goto 100 64 20` runs exactly what `/goto 100 64 20`
 # would in the local console. `/quit` can never be run this way.
@@ -34,7 +53,8 @@ requests = 3
 window_seconds = 30
 
 [world_state]
-nearby_entity_radius = 64
+# 256 is the hard maximum this app allows (see Config::validate).
+nearby_entity_radius = 256
 maximum_tracked_entities = 256
 stale_entity_seconds = 30
 
@@ -45,6 +65,13 @@ follow_distance = 3.0
 # chatter. 150 is a fast-but-safe default; the valid range is 50-10000.
 repath_interval_ms = 150
 arrival_distance = 1.5
+# How long a movement command tolerates the bot's distance to its
+# destination not improving before giving up -- a bot still making
+# progress, however slowly, never trips this no matter how long the trip
+# takes overall. maximum_navigation_seconds is a much longer, rarely-hit
+# absolute backstop on top of it.
+stuck_timeout_seconds = 12
+maximum_navigation_seconds = 900
 
 # Disabled by default: construction and excavation change the world.
 [vertical_navigation]
@@ -55,6 +82,14 @@ prefer_staircase_descent = true
 max_pillar_height = 32
 max_dig_depth = 64
 minimum_building_blocks = 4
+# Lowest Y the bot will ever deliberately target: block search results below
+# this are never returned as mining/navigation candidates. -59 sits just
+# above the Overworld's uneven natural-bedrock band (Y -64 to roughly -60)
+# in 1.18+, so ore down to the floor is still reachable without the bot
+# wasting time trying to dig or path through blocks that are frequently
+# unbreakable bedrock. minecraft:bedrock itself is also never a valid mining
+# target regardless of Y.
+minimum_y = -59
 # Building material is a deny-list, not an allow-list: the bot may use any
 # placeable block it holds except src/bridging's built-in blacklist
 # (containers, valuables, redstone, decorative blocks, crops, etc.) plus
@@ -77,15 +112,16 @@ backward_angle = 130.0
 extreme_angle = 160.0
 
 [block_search]
-default_radius = 32
-maximum_radius = 128
+# 256/384 are the hard maximums this app allows (see Config::validate).
+default_radius = 256
+maximum_radius = 256
 default_result_limit = 20
 maximum_result_limit = 256
-default_vertical_range = 32
+default_vertical_range = 384
 
 [block_navigation]
-default_search_radius = 32
-maximum_search_radius = 128
+default_search_radius = 256
+maximum_search_radius = 256
 candidate_limit = 20
 interaction_distance = 4.5
 arrival_distance = 1.5
@@ -157,8 +193,12 @@ reserved_tools = []
 [interaction.face_targeting]
 face_inset = 0.001
 edge_margin = 0.12
-maximum_face_attempts = 6
-maximum_hit_points_per_face = 5
+# How many of a block's faces (max 6), and how many points per face, to try
+# before giving up and repositioning instead. Each attempt visibly re-aims
+# the camera, so keep this low -- 3 faces x 2 points is already up to 6 look
+# changes per obstruction, x interaction.retry_limit retries.
+maximum_face_attempts = 3
+maximum_hit_points_per_face = 2
 
 # Fully automatic equipment: always wear the best available armor and keep
 # the offhand stocked with a Totem of Undying (or a Shield, if preferred/no
@@ -178,3 +218,61 @@ mode = "score"   # score | rarity
 # Which item the offhand prefers when both are available; the other is used
 # as a fallback, and the offhand is left alone if neither is held.
 priority = "totem"   # totem | shield
+
+# Automatic hotbar equipment: keeps the best sword/pickaxe/axe/shovel/
+# building block/water bucket (plus any utility_items below) in a fixed
+# hotbar slot, replacing a worse item automatically. Reuses the same scoring
+# this file already configures above -- armor.mode's rules, and
+# equipment.tools.ranking_mode below for weapons/tools -- rather than a
+# separate ranking system. Re-evaluation is event-driven (only when the
+# inventory actually changes), with periodic_scan_seconds as a fallback.
+[equipment.hotbar]
+enabled = true
+periodic_scan_seconds = 10
+
+[equipment.hotbar.slots]
+sword = 1
+pickaxe = 2
+axe = 3
+shovel = 4
+blocks = 5
+water_bucket = 6
+# Slots 7-9 are left free for manual use / other items by default.
+
+# Extra items to keep stocked in a specific hotbar slot by exact item id,
+# regardless of any scoring -- just kept there whenever held anywhere in the
+# inventory. Repeat this table for each extra item.
+# [[equipment.hotbar.utility_items]]
+# item_id = "minecraft:totem_of_undying"
+# slot = 9
+
+[equipment.tools]
+# rarity (default): rank pickaxe/axe/shovel/sword purely by material tier
+#   (wood < gold < stone < iron < diamond < netherite), like armor's
+#   "rarity" mode.
+# score: rank by a material-tier-derived score minus a durability penalty,
+#   like armor's "score" mode -- a damaged higher tier can lose to a
+#   pristine lower one.
+ranking_mode = "rarity"   # rarity | score
+
+# Automatic dropping of whatever a hotbar/armor replacement just displaced.
+# Never touches the item currently equipped -- only ever drops the item a
+# *successful* swap just displaced, and only after that swap is confirmed.
+[equipment.autodrop]
+enabled = true
+# Item ids never auto-dropped regardless of scoring, e.g. a spare tool kept
+# on purpose.
+protected_items = []
+
+[equipment.autodrop.armor]
+# Off by default: players often want to keep backup armor.
+enabled = false
+drop_when_better_available = true
+
+[equipment.autodrop.tools]
+enabled = true
+drop_when_better_available = true
+
+[equipment.autodrop.weapons]
+enabled = true
+drop_when_better_available = true

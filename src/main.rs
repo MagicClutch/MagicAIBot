@@ -4,6 +4,7 @@ mod bridging;
 mod config;
 mod console;
 mod container;
+mod control;
 mod equipment;
 mod error;
 mod interaction;
@@ -14,6 +15,7 @@ pub mod minecraft;
 mod mobs;
 mod movement;
 mod navigation;
+mod survival;
 mod tasks;
 
 fn main() -> Result<(), anyhow::Error> {

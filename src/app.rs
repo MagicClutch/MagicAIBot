@@ -13,10 +13,13 @@ use crate::{
     config::Config,
     console::{
         self,
-        commands::{ConsoleCommand, ConsoleInput, plain_chat_message},
+        commands::{
+            ConsoleCommand, ConsoleInput, OutputModeChange, OutputModeTarget, plain_chat_message,
+        },
     },
     container::{model::TransferDirection, service::ContainerService},
-    equipment::EquipmentService,
+    control::{EmergencyStop, stop::StopTargets, stop::execute as execute_emergency_stop},
+    equipment::{EquipmentService, HotbarEquipmentService},
     error::AppError,
     interaction::{InteractionController, interaction_controller::InteractionState},
     items::drop_plan::{self, DropPlanError},
@@ -33,6 +36,7 @@ use crate::{
     movement::{MovementService, NavigationMode},
     navigation::BlockNavigationService,
     navigation::navigation_state::BlockNavigationState,
+    survival::SurvivalController,
 };
 use tokio::{sync::mpsc, task::JoinHandle};
 use tokio_util::sync::CancellationToken;
@@ -81,19 +85,38 @@ enum WaitOutcome {
     Interrupted(ConsoleInput),
 }
 
-/// Bounded by `MovementConfig::maximum_navigation_seconds`. Azalea's
-/// pathfinder is submitted with `retry_on_no_path(true)` (see
-/// `MinecraftClient::start_navigation_to`), so a genuinely unreachable goal
-/// (not enough scaffold material to finish a route, a destination behind
-/// terrain the current policy can't cross) retries forever inside Azalea
-/// without ever surfacing as a failure -- `MovementStatus` would just stay
-/// `MovingToPosition` indefinitely. Without a deadline here, that would hang
-/// this function forever.
+/// Two-tier timeout, mirroring `BlockNavigationService`'s own
+/// `stuck_timeout_seconds`/`maximum_navigation_seconds` split: the *primary*
+/// deadline (`stuck_timeout_seconds`, short) only fires when the bot's
+/// distance to its destination stops improving -- so a bot that is still
+/// actively making progress, however slowly (a long-distance `/goto`, a
+/// multi-minute bridge build), is never cut off no matter how long the
+/// whole trip takes. `maximum_navigation_seconds` is a much longer,
+/// deliberately rare absolute backstop: Azalea's pathfinder is submitted
+/// with `retry_on_no_path(true)` (see `MinecraftClient::start_navigation_to`),
+/// so a genuinely unreachable goal retries forever inside Azalea without
+/// ever surfacing as a failure on its own -- but a goal that's truly
+/// unreachable also never gets any closer, so `stuck_timeout_seconds` alone
+/// already catches that case quickly; the absolute backstop exists only for
+/// the pathological case of a route that keeps inching closer forever
+/// without ever actually arriving.
 async fn await_movement_terminal(app: &App, input_rx: &mut InputReceiver) -> WaitOutcome {
-    let deadline = Duration::from_secs(app.movement.maximum_navigation_seconds());
+    let maximum_navigation = Duration::from_secs(app.movement.maximum_navigation_seconds());
+    let stuck_timeout = Duration::from_secs(app.movement.stuck_timeout_seconds());
     let started = Instant::now();
+    let mut best_distance: Option<f64> = None;
+    let mut last_progress = started;
     loop {
         app.movement.tick(&app.minecraft, false).await;
+        app.survival
+            .tick(
+                &app.minecraft,
+                &app.movement,
+                &app.look,
+                &app.interaction,
+                &app.combat,
+            )
+            .await;
         let snapshot = app.movement.snapshot().await;
         match snapshot.status {
             MovementStatus::Completed | MovementStatus::Idle => {
@@ -110,14 +133,34 @@ async fn await_movement_terminal(app: &App, input_rx: &mut InputReceiver) -> Wai
                 )));
             }
             MovementStatus::MovingToPosition | MovementStatus::FollowingPlayer => {
-                if started.elapsed() >= deadline {
+                if let Some(distance) = snapshot.estimated_distance {
+                    // More than a stride's worth of closing distance counts
+                    // as real progress -- the same tolerance
+                    // `BlockNavigationService` uses for its own positional
+                    // stuck check, so a single slow mining/build step along
+                    // the way doesn't false-positive as "stalled".
+                    let improved = best_distance.is_none_or(|best| distance < best - 0.1);
+                    if improved {
+                        best_distance = Some(distance);
+                        last_progress = Instant::now();
+                    }
+                }
+                if last_progress.elapsed() >= stuck_timeout {
                     let _ = app.movement.stop(&app.minecraft).await;
                     return WaitOutcome::Finished(Err(AppError::PathfindingFailure(format!(
-                        "movement timed out after {}s without reaching the destination or failing",
-                        deadline.as_secs()
+                        "movement stalled: no progress toward the destination in {}s",
+                        stuck_timeout.as_secs()
                     ))));
                 }
-                if let Some(input) = wait_tick(app, input_rx, Duration::from_millis(200)).await {
+                if started.elapsed() >= maximum_navigation {
+                    let _ = app.movement.stop(&app.minecraft).await;
+                    return WaitOutcome::Finished(Err(AppError::PathfindingFailure(format!(
+                        "movement exceeded the {}s absolute limit",
+                        maximum_navigation.as_secs()
+                    ))));
+                }
+                let poll = survival_poll_interval(app, Duration::from_millis(200)).await;
+                if let Some(input) = wait_tick(app, input_rx, poll).await {
                     return WaitOutcome::Interrupted(input);
                 }
             }
@@ -141,6 +184,15 @@ async fn await_block_navigation_terminal(app: &App, input_rx: &mut InputReceiver
         app.block_navigation
             .tick(&app.minecraft, &app.movement)
             .await;
+        app.survival
+            .tick(
+                &app.minecraft,
+                &app.movement,
+                &app.look,
+                &app.interaction,
+                &app.combat,
+            )
+            .await;
         let snapshot = app.block_navigation.snapshot().await;
         match snapshot.state {
             BlockNavigationState::Reached | BlockNavigationState::Idle => {
@@ -157,7 +209,8 @@ async fn await_block_navigation_terminal(app: &App, input_rx: &mut InputReceiver
                 )));
             }
             _ => {
-                if let Some(input) = wait_tick(app, input_rx, Duration::from_millis(200)).await {
+                let poll = survival_poll_interval(app, Duration::from_millis(200)).await;
+                if let Some(input) = wait_tick(app, input_rx, poll).await {
                     return WaitOutcome::Interrupted(input);
                 }
             }
@@ -204,6 +257,15 @@ async fn await_interaction_terminal(app: &App, input_rx: &mut InputReceiver) -> 
         app.interaction
             .tick(&app.minecraft, &app.movement, &app.look)
             .await;
+        app.survival
+            .tick(
+                &app.minecraft,
+                &app.movement,
+                &app.look,
+                &app.interaction,
+                &app.combat,
+            )
+            .await;
         let snapshot = app.interaction.snapshot().await;
         match snapshot.state {
             InteractionState::Completed | InteractionState::Idle => {
@@ -220,7 +282,8 @@ async fn await_interaction_terminal(app: &App, input_rx: &mut InputReceiver) -> 
                 )));
             }
             _ => {
-                if let Some(input) = wait_tick(app, input_rx, Duration::from_millis(75)).await {
+                let poll = survival_poll_interval(app, Duration::from_millis(75)).await;
+                if let Some(input) = wait_tick(app, input_rx, poll).await {
                     return WaitOutcome::Interrupted(input);
                 }
             }
@@ -239,6 +302,15 @@ async fn await_combat_terminal(app: &App, input_rx: &mut InputReceiver) -> WaitO
         app.combat
             .tick(&app.minecraft, &app.movement, &app.look)
             .await;
+        app.survival
+            .tick(
+                &app.minecraft,
+                &app.movement,
+                &app.look,
+                &app.interaction,
+                &app.combat,
+            )
+            .await;
         let snapshot = app.combat.snapshot().await;
         match snapshot.state {
             CombatState::Completed | CombatState::Idle => {
@@ -255,11 +327,31 @@ async fn await_combat_terminal(app: &App, input_rx: &mut InputReceiver) -> WaitO
                 )));
             }
             _ => {
-                if let Some(input) = wait_tick(app, input_rx, Duration::from_millis(75)).await {
+                let poll = survival_poll_interval(app, Duration::from_millis(75)).await;
+                if let Some(input) = wait_tick(app, input_rx, poll).await {
                     return WaitOutcome::Interrupted(input);
                 }
             }
         }
+    }
+}
+
+/// Poll cadence for the blocking-wait loops above while a water-bucket
+/// clutch is actively mid-flight (`SurvivalController::is_active`). Their
+/// normal cadence (75-200ms, sized for driving movement/interaction/combat
+/// state machines that change over whole seconds) is coarse enough to step
+/// straight from "still falling" to "already on the ground" without ever
+/// observing the placement window in between -- fast enough here to give
+/// several chances inside even a short one.
+const SURVIVAL_ACTIVE_POLL: Duration = Duration::from_millis(20);
+
+/// `fallback` normally, or [`SURVIVAL_ACTIVE_POLL`] whenever the clutch is
+/// actively mid-flight -- see `SURVIVAL_ACTIVE_POLL`'s doc comment.
+async fn survival_poll_interval(app: &App, fallback: Duration) -> Duration {
+    if app.survival.is_active().await {
+        SURVIVAL_ACTIVE_POLL
+    } else {
+        fallback
     }
 }
 
@@ -274,8 +366,24 @@ async fn wait_tick(
     input_rx: &mut InputReceiver,
     duration: Duration,
 ) -> Option<ConsoleInput> {
+    // Checked before racing the normal sleep/local-input select below so an
+    // in-game `#stop`/`#stopall` is caught even while `App::tick_chat_commands`
+    // -- the normal chat-command drain loop -- can't run, because it's
+    // gated behind whatever blocking command loop is currently calling this
+    // very function. See `emergency_stop_from_chat`'s doc comment.
+    if let Some(input) = emergency_stop_from_chat(app).await {
+        return Some(input);
+    }
+    flush_outgoing_chat(&app.minecraft).await;
+    let emergency = app.emergency_stop.token();
     tokio::select! {
         () = tokio::time::sleep(duration) => None,
+        // Independent of `input_rx` entirely: this wakes every blocking
+        // wait racing it (in every subsystem, everywhere `wait_tick` is
+        // called) the instant `EmergencyStop::trigger` fires, regardless of
+        // whether local console input is even being read right now -- see
+        // `crate::control`.
+        () = emergency.cancelled() => Some(ConsoleInput::Command(ConsoleCommand::Stop)),
         received = input_rx.recv() => match received {
             None => Some(ConsoleInput::Command(ConsoleCommand::Quit)),
             Some(Err(error)) => {
@@ -294,6 +402,54 @@ async fn wait_tick(
     }
 }
 
+/// Sends at most one status line `logging::milestone`/`progress`/etc. has
+/// queued for chat delivery, if `logging::pop_outgoing_chat`'s own rate
+/// limit allows it right now -- `logging` itself never touches the network,
+/// so this is the only place that actually calls `send_chat` for them.
+/// Deliberately never drains the whole queue in one call (a single
+/// `#get`/`#mine` run can queue dozens of lines in one tick): calling this
+/// on every tick lets a backlog drain out at a steady, spam-kick-safe pace
+/// instead of being blasted at the server all at once. Best-effort: a
+/// failed send (not yet connected, disconnected) is silently dropped rather
+/// than requeued, the same way every other best-effort network call in
+/// this file behaves.
+async fn flush_outgoing_chat(minecraft: &MinecraftClient) {
+    if let Some(line) = logging::pop_outgoing_chat() {
+        let _ = minecraft.send_chat(&line).await;
+    }
+}
+
+/// Detects `#stop`/`#stopall` sitting in the incoming player chat queue and,
+/// if the sender passes the normal chat-command access check, treats it
+/// exactly like local `/stop` input. Deliberately bypasses
+/// `App::tick_chat_commands`'s normal per-command rate limit -- an
+/// emergency stop must never be throttled -- while still respecting who is
+/// allowed to run it at all. Every other queued chat message is left
+/// untouched for `tick_chat_commands` to process normally once it's next
+/// reachable (see `WorldState::take_matching_incoming_player_chat`'s doc
+/// comment for why this can't just wait for that).
+async fn emergency_stop_from_chat(app: &App) -> Option<ConsoleInput> {
+    let chat = app
+        .minecraft
+        .take_matching_incoming_player_chat(|chat| {
+            chat.kind == crate::minecraft::world_state::ChatMessageKind::Player
+                && matches!(
+                    chat.text.trim().to_ascii_lowercase().as_str(),
+                    "#stop" | "#stopall"
+                )
+        })
+        .await?;
+    let sender = chat.sender?;
+    if !app.chat_access_allowed(&sender) {
+        logging::warning(format!(
+            "[Chat] Emergency stop from {sender} rejected: access denied"
+        ));
+        return None;
+    }
+    logging::info(format!("[Chat] {sender} ran: /stop"));
+    Some(ConsoleInput::Command(ConsoleCommand::Stop))
+}
+
 /// Application composition root.
 pub struct App {
     config: Config,
@@ -306,6 +462,9 @@ pub struct App {
     combat: CombatController,
     container: ContainerService,
     equipment: EquipmentService,
+    hotbar_equipment: HotbarEquipmentService,
+    survival: SurvivalController,
+    emergency_stop: EmergencyStop,
     chat_rate_limits: HashMap<String, VecDeque<Instant>>,
     session_ready: bool,
     started_at: Instant,
@@ -319,6 +478,7 @@ impl App {
         println!("Loading configuration...\n");
         let config = Config::load(Path::new("config.toml"))?;
         crate::config::init_logging(&config.logging)?;
+        logging::configure(config.output.console, config.output.chat);
         // Catches a hand-maintained table entry naming an item Minecraft
         // doesn't have (the "Raw Beef" != `raw_beef` bug class) before it
         // can surface later as "#get never finishes" -- non-fatal, since a
@@ -372,6 +532,13 @@ impl App {
             combat: CombatController::new(),
             container: ContainerService::default(),
             equipment: EquipmentService::new(config.equipment.clone()),
+            hotbar_equipment: HotbarEquipmentService::new(
+                config.equipment.hotbar.clone(),
+                config.equipment.tools.clone(),
+                config.equipment.autodrop.clone(),
+            ),
+            survival: SurvivalController::new(config.survival.clone()),
+            emergency_stop: EmergencyStop::new(),
             chat_rate_limits: HashMap::new(),
             session_ready: false,
             config,
@@ -423,6 +590,7 @@ impl App {
                             self.combat.cancel(&self.minecraft, &self.movement, &self.look).await;
                             self.block_navigation.cancel(&self.minecraft, &self.movement).await;
                             self.look.cancel().await;
+                            self.survival.reset().await;
                             let _ = self.movement.stop(&self.minecraft).await;
                             self.minecraft.clear_current_task().await;
                         }
@@ -454,6 +622,7 @@ impl App {
                     }
                 },
                 _ = interaction_tick.tick() => {
+                    flush_outgoing_chat(&self.minecraft).await;
                     // Block navigation owns interaction approach/repath state.
                     // Tick it on the fast interaction cadence so an interaction
                     // target does not wait for the slower movement repath timer
@@ -463,6 +632,16 @@ impl App {
                     self.combat.tick(&self.minecraft, &self.movement, &self.look).await;
                     self.container.tick(&self.minecraft, &self.movement, &self.block_navigation, &self.look).await;
                     self.equipment.tick(&self.minecraft).await;
+                    self.hotbar_equipment.tick(&self.minecraft).await;
+                    // Also on this fast, fixed 50ms cadence rather than
+                    // `movement_tick`'s slower, configurable
+                    // `repath_interval_ms` -- a fall's placement window can
+                    // be only a handful of ticks wide (see
+                    // `survival_poll_interval`'s doc comment for the same
+                    // reasoning applied to the blocking command-wait loops).
+                    self.survival
+                        .tick(&self.minecraft, &self.movement, &self.look, &self.interaction, &self.combat)
+                        .await;
                 },
                 input = input_rx.recv() => match input {
                     Some(Ok(ConsoleInput::Empty)) => {}
@@ -490,6 +669,7 @@ impl App {
             .cancel(&self.minecraft, &self.movement)
             .await;
         self.look.cancel().await;
+        self.survival.reset().await;
         self.interaction
             .cancel(&self.minecraft, &self.movement, &self.look)
             .await;
@@ -537,6 +717,11 @@ impl App {
                     ConsoleCommand::Inventory => self.print_inventory().await,
                     ConsoleCommand::ObservedContainerStatus => self.print_container_status().await,
                     ConsoleCommand::Entities { radius } => self.print_entities(radius).await,
+                    ConsoleCommand::OutputMode { change } => match change {
+                        None => print_output_mode_status(),
+                        Some(change) => apply_output_mode_change(change),
+                    },
+                    ConsoleCommand::Explanation => print_output_mode_explanation(),
                     ConsoleCommand::Goto { x, y, z } => {
                         self.interaction
                             .cancel(&self.minecraft, &self.movement, &self.look)
@@ -620,16 +805,40 @@ impl App {
                     }
                     ConsoleCommand::PathStatus => self.print_path_status().await,
                     ConsoleCommand::Stop => {
-                        // `/stop` is primarily the movement channel's stop
-                        // command, but it also cancels any active
-                        // explicit-priority look (a plain `/look`/
-                        // `/lookplayer`, or a task's own "look at" step,
-                        // e.g. `#drop <item> <amount> <player>`'s "Looking
-                        // at player" phase) -- see `interruptible_look`.
-                        // A `PreciseInteraction`-priority look is left
-                        // alone; that belongs to `InteractionController`'s
-                        // own break/place lifecycle and is only released by
-                        // finishing or by `/stopinteraction`.
+                        // The global emergency stop (`#stop`/`/stop`/`stopall`,
+                        // all identical -- see `crate::control`): force-cancels
+                        // every controller, not just movement/look. Genuinely
+                        // independent of the normal per-command cancellation
+                        // paths above -- it fires `self.emergency_stop` first,
+                        // which alone is enough to unstick any blocking wait
+                        // loop anywhere in this file (including, in
+                        // particular, whatever loop is currently awaiting
+                        // *this very command* -- see `wait_tick`), before a
+                        // single controller is touched.
+                        let targets = StopTargets {
+                            minecraft: &self.minecraft,
+                            movement: &self.movement,
+                            block_navigation: &self.block_navigation,
+                            look: &self.look,
+                            interaction: &self.interaction,
+                            combat: &self.combat,
+                            container: &self.container,
+                            survival: &self.survival,
+                        };
+                        execute_emergency_stop(&targets, &self.emergency_stop).await;
+                    }
+                    ConsoleCommand::StopMovement => {
+                        // The original, narrower stop: only the movement
+                        // channel and any interruptible look. Also cancels
+                        // any active explicit-priority look (a plain
+                        // `/look`/`/lookplayer`, or a task's own "look at"
+                        // step, e.g. `#drop <item> <amount> <player>`'s
+                        // "Looking at player" phase) -- see
+                        // `interruptible_look`. A `PreciseInteraction`-priority
+                        // look is left alone; that belongs to
+                        // `InteractionController`'s own break/place lifecycle
+                        // and is only released by finishing, `/stopinteraction`,
+                        // or the full `/stop` above.
                         let description = self.active_stop_description().await;
                         self.block_navigation
                             .cancel(&self.minecraft, &self.movement)
@@ -1951,7 +2160,7 @@ impl App {
         self.minecraft
             .set_current_task(task_snapshot(format!("Get {amount} {resource_id}")))
             .await;
-        logging::info(format!("Get task started: {resource_id} x{amount}"));
+        logging::milestone(format!("Get task started: {resource_id} x{amount}"));
         let result = self
             .resolve_and_run_get_resource(&resource_id, amount, input_rx)
             .await;
@@ -1983,7 +2192,7 @@ impl App {
             // rather than assumed, per "never crash".
             Err(error) => {
                 logging::error(format!("Block not found: {resource_id}"));
-                logging::info("Get task cancelled");
+                logging::milestone("Get task cancelled");
                 WaitOutcome::Finished(Err(error))
             }
         }
@@ -2099,7 +2308,7 @@ impl App {
                         .await
                         .inventory
                         .count_item(resource_id);
-                    logging::success(format!("Collected {resource_label} ({new_count}/{amount})"));
+                    logging::progress(format!("Collected {resource_label} ({new_count}/{amount})"));
                 }
                 WaitOutcome::Finished(Err(error)) => {
                     consecutive_failures += 1;
@@ -2122,7 +2331,7 @@ impl App {
             .cancel(&self.minecraft, &self.movement)
             .await;
         logging::error(format!("Block not found: {block_label}"));
-        logging::info("Get task cancelled");
+        logging::milestone("Get task cancelled");
         WaitOutcome::Finished(Err(error))
     }
 
@@ -2147,7 +2356,7 @@ impl App {
         self.minecraft
             .set_current_task(task_snapshot(format!("Mine {amount} {label}")))
             .await;
-        logging::info(format!("Mining {label}"));
+        logging::milestone(format!("Mining {label}"));
         let result = self.run_mine(&block_ids, amount, input_rx).await;
         self.minecraft.clear_current_task().await;
         result
@@ -2222,7 +2431,7 @@ impl App {
                 WaitOutcome::Finished(Ok(())) => {
                     consecutive_failures = 0;
                     mined += 1;
-                    logging::success(format!("Mined {mined_label} ({mined}/{amount})"));
+                    logging::progress(format!("Mined {mined_label} ({mined}/{amount})"));
                 }
                 WaitOutcome::Finished(Err(error)) => {
                     consecutive_failures += 1;
@@ -2248,7 +2457,7 @@ impl App {
             logging::warning(format!("Mined {mined} {label} blocks before stopping"));
         }
         logging::error(format!("Block not found: {label}"));
-        logging::info("Mine task cancelled");
+        logging::milestone("Mine task cancelled");
         WaitOutcome::Finished(Err(error))
     }
 
@@ -2273,7 +2482,7 @@ impl App {
         self.minecraft
             .set_current_task(task_snapshot(format!("Drop {amount} {label}")))
             .await;
-        logging::info(format!("Drop task started: {label} x{amount}"));
+        logging::milestone(format!("Drop task started: {label} x{amount}"));
         let result = match player {
             Some(player) => {
                 self.run_drop_to_player(&item_id, &label, amount, player, input_rx)
@@ -2584,7 +2793,17 @@ impl App {
                 last_goto_destination = Some(destination);
             }
             self.movement.tick(&self.minecraft, false).await;
-            if let Some(input) = wait_tick(self, input_rx, Duration::from_millis(75)).await {
+            self.survival
+                .tick(
+                    &self.minecraft,
+                    &self.movement,
+                    &self.look,
+                    &self.interaction,
+                    &self.combat,
+                )
+                .await;
+            let poll = survival_poll_interval(self, Duration::from_millis(75)).await;
+            if let Some(input) = wait_tick(self, input_rx, poll).await {
                 return Some(input);
             }
         }
@@ -2637,7 +2856,7 @@ impl App {
                         .await
                         .inventory
                         .count_item(resource_id);
-                    logging::success(format!("Collected {resource_id} ({new_count}/{amount})"));
+                    logging::progress(format!("Collected {resource_id} ({new_count}/{amount})"));
                 }
                 WaitOutcome::Finished(Err(error)) => {
                     consecutive_failures += 1;
@@ -2664,7 +2883,7 @@ impl App {
             .cancel(&self.minecraft, &self.movement, &self.look)
             .await;
         logging::error(format!("Mob not found: {}", mobs::mob_label(mob_id)));
-        logging::info("Get task cancelled");
+        logging::milestone("Get task cancelled");
         WaitOutcome::Finished(Err(error))
     }
 
@@ -2913,6 +3132,17 @@ impl App {
                     self.print_path_status().await;
                     true
                 }
+                ConsoleCommand::OutputMode { change } => {
+                    match change {
+                        None => print_output_mode_status(),
+                        Some(change) => apply_output_mode_change(*change),
+                    }
+                    true
+                }
+                ConsoleCommand::Explanation => {
+                    print_output_mode_explanation();
+                    true
+                }
                 ConsoleCommand::Movement => {
                     self.print_movement().await;
                     true
@@ -3041,7 +3271,10 @@ fn print_help() {
     println!("Movement");
     println!("  /goto <x> <y> <z>          Walk to a position and wait until it is reached");
     println!("  /follow <player>           Follow a player");
-    println!("  /stop                      Stop movement");
+    println!(
+        "  /stop                      Emergency stop: force-cancel everything (alias: stopall, #stop in chat)"
+    );
+    println!("  /stopmovement              Stop movement/pathfinding only");
     println!("  /look <x> <y> <z>          Look at a position and wait until aimed");
     println!();
     println!("Status");
@@ -3074,11 +3307,58 @@ fn print_help() {
     println!("  /reconnect                 Reconnect to the configured server");
     println!("  /quit                      Shut down the application");
     println!(
+        "  /outputmode [console|chat|both] [none|light|info|debug|fulldebug]  Show or change how much status narration is printed/sent to chat"
+    );
+    println!("  /explanation               Explain what each output mode shows (alias: /explain)");
+    println!(
         "  A player can also run any command from Minecraft chat by prefixing it with #, e.g. \"#goto 100 64 20\"."
     );
     println!(
         "  Additional lower-level debug commands (findblock, gotoblock, lookblock, breaknearest, placeblock, ...) remain available; see src/console/commands.rs for the complete set."
     );
+}
+
+fn print_output_mode_status() {
+    println!(
+        "Output mode -- console: {}, chat: {}",
+        logging::console_mode().as_str(),
+        logging::chat_mode().as_str()
+    );
+}
+
+fn apply_output_mode_change(change: OutputModeChange) {
+    match change.target {
+        OutputModeTarget::Console => logging::set_console_mode(change.mode),
+        OutputModeTarget::Chat => logging::set_chat_mode(change.mode),
+        OutputModeTarget::Both => logging::configure(change.mode, change.mode),
+    }
+    print_output_mode_status();
+}
+
+/// `/explanation` (`/explain`, `#explanation` in chat) -- see
+/// `crate::config::OutputMode`'s doc comment for the source of truth this
+/// mirrors for a user who doesn't want to go read the config file.
+fn print_output_mode_explanation() {
+    println!(
+        "Output modes control how much of the bot's own status narration (task started/progress/finished -- not raw player chat) is shown, independently for the console (this window) and Minecraft chat."
+    );
+    println!();
+    println!("  none       nothing at all");
+    println!("  light      only a task's start and its final outcome");
+    println!("             e.g. \"Get task started: diamond x5\", \"Collected 5 diamond\"");
+    println!("  info       light, plus a running progress report as a task makes headway");
+    println!(
+        "             e.g. \"Collected diamond (3/5)\" -- the default for both console and chat"
+    );
+    println!(
+        "  debug      info, plus every other diagnostic line the bot prints (connection state, per-step narration, retries, ...)"
+    );
+    println!(
+        "  fulldebug  debug, but also disables repeat-collapsing so a stuck retry loop prints every repetition -- for troubleshooting only, not everyday use"
+    );
+    println!();
+    println!("Change with: /outputmode <console|chat|both> <mode>");
+    println!("Show current settings with: /outputmode");
 }
 
 async fn await_console_task(task: JoinHandle<()>) {

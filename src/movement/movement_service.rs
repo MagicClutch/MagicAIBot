@@ -46,10 +46,20 @@ impl MovementService {
         self.state.lock().await.clone()
     }
 
-    /// Hard ceiling for how long a caller awaiting movement completion
-    /// should wait before giving up (see `MovementConfig::maximum_navigation_seconds`).
+    /// Absolute backstop for how long a caller awaiting movement completion
+    /// should wait before giving up, regardless of progress (see
+    /// `MovementConfig::maximum_navigation_seconds`). See
+    /// [`Self::stuck_timeout_seconds`] for the shorter, progress-based
+    /// timeout that governs the common case.
     pub(crate) fn maximum_navigation_seconds(&self) -> u64 {
         self.config.maximum_navigation_seconds
+    }
+
+    /// How long a caller awaiting movement completion tolerates no
+    /// improvement in distance to the destination before giving up (see
+    /// `MovementConfig::stuck_timeout_seconds`).
+    pub(crate) fn stuck_timeout_seconds(&self) -> u64 {
+        self.config.stuck_timeout_seconds
     }
 
     /// The latest camera-relative movement recommendation. Azalea's

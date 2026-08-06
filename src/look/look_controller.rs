@@ -419,7 +419,11 @@ impl LookController {
             let already_completed = inner.snapshot.state == LookState::Completed;
             inner.snapshot.state = LookState::Completed;
             if !already_completed {
-                logging::success("Rotation completed");
+                // `info`, not `success`: a look completes once per aim (every
+                // block broken/placed during a `#get`/`#mine` run re-aims),
+                // so tagging it a milestone would flood chat with one
+                // identical line per item and risk a spam kick.
+                logging::info("Rotation completed");
             }
         }
         Ok(())

@@ -140,7 +140,7 @@ mod tests {
         let first = random_delay(&config, &mut a);
         let second = random_delay(&config, &mut b);
         assert_eq!(first, second);
-        assert!((35..=90).contains(&first.as_millis()));
+        assert!((20..=55).contains(&first.as_millis()));
     }
     #[test]
     fn movement_waits_then_coalesces_to_newest_point() {

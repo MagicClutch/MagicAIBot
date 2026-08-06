@@ -10,8 +10,14 @@
 //! clicks; `model` is the plain data passed between the two.
 
 pub mod armor;
+
+pub mod autodrop;
+pub mod hotbar;
 pub mod manager;
 pub mod model;
 pub mod offhand;
+pub mod scoring;
+pub mod tools;
 
+pub use hotbar::HotbarEquipmentService;
 pub use manager::EquipmentService;

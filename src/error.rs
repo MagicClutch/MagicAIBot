@@ -51,6 +51,14 @@ pub enum AppError {
     InvalidLookConfiguration(String),
     #[error("invalid interaction configuration: {0}")]
     InvalidInteractionConfiguration(String),
+    #[error("invalid survival configuration: {0}")]
+    InvalidSurvivalConfiguration(String),
+    #[error("invalid equipment configuration: {0}")]
+    InvalidEquipmentConfiguration(String),
+    #[error("invalid vertical-navigation configuration: {0}")]
+    InvalidVerticalNavigationConfiguration(String),
+    #[error("cannot mine {0}: indestructible")]
+    UnbreakableBlock(String),
     #[error("interaction target is out of reach")]
     InteractionOutOfReach,
     #[error("cannot break air")]

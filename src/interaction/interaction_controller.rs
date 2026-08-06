@@ -13,7 +13,7 @@ use crate::{
     error::AppError,
     interaction::{
         faces::{BlockFace, BlockFacePurpose, best_face, face_hit_points},
-        placement_rules::{has_support, is_air, is_replaceable},
+        placement_rules::{has_support, is_air, is_replaceable, is_unbreakable},
         progress::estimated_progress,
         reach::{distance_to_block_center, within_reach},
         tool_selection::{ToolFallbackPolicy, ToolSelectionPolicy},
@@ -207,6 +207,9 @@ impl InteractionController {
             .ok_or(AppError::TargetChunkUnloaded)?;
         if is_air(Some(&id)) {
             return Err(AppError::CannotBreakAir);
+        }
+        if is_unbreakable(Some(&id)) {
+            return Err(AppError::UnbreakableBlock(id));
         }
         self.replace(
             Operation::Break {
@@ -1003,7 +1006,7 @@ impl InteractionController {
                 inner.hit_point_attempt = 0;
                 inner.face_attempt += 1;
             }
-            if inner.face_attempt < 6 {
+            if inner.face_attempt < self.config.face_targeting.maximum_face_attempts {
                 inner.snapshot.state = InteractionState::Preparing;
                 return;
             }

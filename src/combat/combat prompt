@@ -1,0 +1,384 @@
+# Implement a standalone PvP combat system with `#kill (player)` command
+
+You are working on a Rust Minecraft AI bot using Azalea.
+
+The project already contains:
+
+* movement
+* navigation
+* pathfinding
+* look controller
+* inventory management
+* interaction controller
+* task execution
+* world state
+* player tracking
+* AI integration
+
+## Critical architecture requirement
+
+**Do not modify the existing pathfinding or navigation implementation.**
+
+Do not replace:
+
+* `/goto`
+* `/follow`
+* navigation
+* pathfinding
+* movement tasks
+* gather tasks
+* mining tasks
+
+The combat system must live in a **completely separate module/folder** and use its own movement/combat logic.
+
+It may **reuse existing utilities** such as:
+
+* look controller
+* player lookup
+* inventory access
+* world state
+* raycasting
+* interaction utilities
+* attack packets
+* equipment helpers
+
+But it must have its **own combat movement implementation**.
+
+## Folder structure
+
+Create a new combat module such as:
+
+```text
+src/combat/
+    mod.rs
+    kill.rs
+    movement.rs
+    crits.rs
+    shield_break.rs
+    targeting.rs
+    executor.rs
+    state.rs
+```
+
+The combat system should be isolated from navigation/pathfinding.
+
+## Command
+
+Implement:
+
+```text
+#kill <player>
+```
+
+Examples:
+
+```text
+#kill 5cat
+#kill Steve
+#kill Alex
+```
+
+The command should create a combat task that runs until:
+
+* the target dies,
+* the target disconnects,
+* the task is cancelled,
+* or the target cannot be found.
+
+## Required combat behavior
+
+This must be a **smart PvP bot**, not a simple follow-and-hit loop.
+
+Do **not** implement:
+
+```text
+follow player
+stop
+hit player
+follow player
+stop
+hit player
+```
+
+Instead implement continuous combat behavior.
+
+## Main combat loop
+
+The bot should continuously:
+
+* track the target,
+* predict movement,
+* maintain attack range,
+* strafe,
+* sprint,
+* perform critical hits,
+* break shields,
+* avoid standing still,
+* and continue attacking until the target is dead.
+
+Conceptually:
+
+```text
+Acquire target
+        ↓
+Maintain combat distance
+        ↓
+Strafe
+        ↓
+Sprint reset
+        ↓
+Critical hit timing
+        ↓
+Shield break when blocking
+        ↓
+Continue pursuit
+        ↓
+Target dead
+        ↓
+Task complete
+```
+
+## Combat distance
+
+Maintain approximately **2 blocks maximum distance**.
+
+Preferred range:
+
+* 1.5-2.0 blocks
+
+If the target moves away:
+
+* chase aggressively.
+
+If the target is too close:
+
+* reposition.
+
+Do not stand inside the player.
+
+## Continuous movement
+
+Implement combat movement independent of navigation.
+
+Requirements:
+
+* strafe left/right,
+* sprint while approaching,
+* sprint reset after attacks,
+* small random movement variation,
+* obstacle avoidance,
+* maintain pressure,
+* never remain stationary for long periods.
+
+The movement should feel like a real PvP player.
+
+## Critical hits
+
+Implement real Minecraft critical hits.
+
+The bot should:
+
+* jump only when appropriate,
+* attack while falling,
+* avoid random jumping,
+* time attacks during the falling portion,
+* maximize critical hit frequency,
+* avoid losing sprint unnecessarily.
+
+Do not spam jump every attack.
+
+## Attack timing
+
+Respect Minecraft attack cooldowns.
+
+The bot should attack at high efficiency.
+
+Avoid:
+
+* attacking too early,
+* attacking every tick,
+* wasting cooldown.
+
+Time attacks for maximum damage.
+
+## Axe shield breaking
+
+If the target is using a shield:
+
+* detect the shield,
+* switch to an axe automatically,
+* disable/break the shield,
+* switch back to the preferred weapon,
+* continue attacking.
+
+Reuse the existing inventory system.
+
+Do not duplicate equipment logic.
+
+## Weapon selection
+
+Choose the best available weapon automatically.
+
+Priority example:
+
+Netherite Sword
+Diamond Sword
+Iron Sword
+Stone Sword
+Wooden Sword
+
+For shield breaking:
+
+Netherite Axe
+Diamond Axe
+Iron Axe
+Stone Axe
+Wooden Axe
+
+Switch intelligently during combat.
+
+## Look controller
+
+Reuse the existing look controller.
+
+The combat system should:
+
+* continuously track the target,
+* predict short-term movement,
+* aim smoothly,
+* avoid jitter,
+* keep the crosshair on the target.
+
+Do not implement a second rotation system.
+
+## Target prediction
+
+Do not aim only at the current position.
+
+Predict:
+
+* movement direction,
+* sprint direction,
+* short-term velocity,
+* strafe changes.
+
+Aim slightly ahead when appropriate.
+
+## Pursuit
+
+If the target runs:
+
+* continue chasing,
+* maintain sprint,
+* use combat movement,
+* avoid getting stuck,
+* continue until the target dies.
+
+Do not require repeated follow commands.
+
+## Target lost
+
+If the target becomes temporarily unreachable:
+
+* continue searching nearby,
+* remember the last known position,
+* attempt reacquisition.
+
+If the target leaves loaded entities:
+
+```text
+[ERROR] Target lost: 5cat
+```
+
+Then cancel the combat task.
+
+## Task behavior
+
+Implement as a normal task.
+
+States:
+
+* Created
+* Running
+* Completed
+* Failed
+* Cancelled
+
+The combat task should have higher priority than idle behavior.
+
+## Console output
+
+Example:
+
+```text
+#kill 5cat
+
+[INFO] Kill task started: 5cat
+[INFO] Target acquired
+[INFO] Engaging target
+[INFO] Shield detected, switching to axe
+[INFO] Shield broken
+[INFO] Critical hit landed
+[INFO] Target health low
+[SUCCESS] Target eliminated: 5cat
+```
+
+Keep logs concise.
+
+Do not print movement logs every tick.
+
+## Manual validation
+
+Test:
+
+* target standing still,
+* target sprinting,
+* target jumping,
+* target strafing,
+* target using shield,
+* target changing direction rapidly,
+* target on uneven terrain,
+* target climbing,
+* target descending,
+* target attempting to escape.
+
+The bot should:
+
+* continuously pressure the target,
+* maintain approximately 2-block range,
+* perform critical hits,
+* break shields with an axe,
+* switch weapons automatically,
+* strafe intelligently,
+* sprint reset properly,
+* and continue fighting until the player dies.
+
+## Validation
+
+Run:
+
+```bash
+cargo fmt
+cargo check
+cargo test
+cargo clippy --all-targets --all-features
+cargo build --release
+```
+
+Fix all compilation errors, warnings, and failing tests.
+
+## Final report
+
+Provide:
+
+1. new combat folder structure,
+2. files created,
+3. files reused,
+4. movement implementation,
+5. critical hit implementation,
+6. shield break implementation,
+7. target prediction implementation,
+8. inventory integration,
+9. tests added,
+10. known limitations,
+11. and confirmation that the combat system is completely independent from the existing navigation/pathfinding implementation.

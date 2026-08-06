@@ -15,6 +15,7 @@ use crate::{
     container::model::{ClickButton, InventoryClick},
     equipment::{
         armor::{self, ArmorSlot},
+        autodrop::{drop_displaced_item, should_drop},
         model::OFFHAND_PROTOCOL_SLOT,
         offhand,
     },
@@ -58,11 +59,13 @@ impl EquipmentService {
             }
             let source_slot = candidate.item.slot;
             let item_label = candidate.item.item_id.clone();
-            if self
-                .equip(minecraft, source_slot, slot.protocol_slot())
-                .await
-            {
+            let displaced = worn.map(|item| item.item_id.clone());
+            if swap_into_slot(minecraft, source_slot, slot.protocol_slot()).await {
                 logging::info(format!("Equipped {item_label}"));
+                if let Some(displaced_id) = displaced {
+                    self.maybe_drop_armor(minecraft, &displaced_id, source_slot)
+                        .await;
+                }
             }
         }
 
@@ -109,40 +112,66 @@ impl EquipmentService {
             return;
         };
         let source_slot = source.slot;
-        if self
-            .equip(minecraft, source_slot, OFFHAND_PROTOCOL_SLOT)
-            .await
-        {
+        if swap_into_slot(minecraft, source_slot, OFFHAND_PROTOCOL_SLOT).await {
             logging::info(format!("Equipped {desired} in offhand"));
         }
     }
 
-    /// Three-click swap: pick the item up from `source`, place it at
-    /// `destination` (swapping out whatever was already worn there, if
-    /// anything, onto the cursor), then place the swapped-out item back
-    /// into `source`. If `destination` was empty the third click is a
-    /// harmless no-op (nothing on the cursor, nothing in the now-empty
-    /// `source`).
-    ///
-    /// Azalea applies each click's client-side prediction synchronously --
-    /// `ContainerClickEvent` is handled by an observer
-    /// (`handle_container_click_event`), not a system scheduled for a
-    /// later tick -- so the third click always sees the correct post-swap
-    /// state with no delay needed between clicks.
-    async fn equip(&self, minecraft: &MinecraftClient, source: usize, destination: usize) -> bool {
-        for slot in [source, destination, source] {
-            let click = InventoryClick {
-                slot,
-                button: ClickButton::Left,
-            };
-            if minecraft
-                .container_click(PLAYER_INVENTORY_WINDOW, click)
-                .await
-                .is_err()
-            {
-                return false;
-            }
+    /// Off by default (`equipment.autodrop.armor.enabled = false`) --
+    /// players often want to keep backup armor -- but when enabled, drops
+    /// the piece this replacement just displaced (now sitting wherever the
+    /// new piece used to be, per `swap_into_slot`'s doc comment) the same
+    /// way `equipment::hotbar::HotbarEquipmentService` does for
+    /// tools/weapons, via the same shared policy.
+    async fn maybe_drop_armor(&self, minecraft: &MinecraftClient, item_id: &str, slot: usize) {
+        let autodrop = &self.config.autodrop;
+        if !should_drop(
+            autodrop.enabled,
+            &autodrop.armor,
+            item_id,
+            &autodrop.protected_items,
+        ) {
+            return;
         }
-        true
+        if drop_displaced_item(minecraft, slot).await {
+            logging::info(format!("Dropped {item_id}"));
+        }
     }
+}
+
+/// Three-click swap: pick the item up from `source`, place it at
+/// `destination` (swapping out whatever was already there, if anything,
+/// onto the cursor), then place the swapped-out item back into `source`. If
+/// `destination` was empty the third click is a harmless no-op (nothing on
+/// the cursor, nothing in the now-empty `source`).
+///
+/// Azalea applies each click's client-side prediction synchronously --
+/// `ContainerClickEvent` is handled by an observer
+/// (`handle_container_click_event`), not a system scheduled for a later tick
+/// -- so the third click always sees the correct post-swap state with no
+/// delay needed between clicks.
+///
+/// Shared by [`EquipmentService`] (armor/offhand) and
+/// `crate::survival::SurvivalController` (stocking a water bucket into the
+/// hotbar) -- the only inventory-mutation primitive either needs, so neither
+/// duplicates it.
+pub(crate) async fn swap_into_slot(
+    minecraft: &MinecraftClient,
+    source: usize,
+    destination: usize,
+) -> bool {
+    for slot in [source, destination, source] {
+        let click = InventoryClick {
+            slot,
+            button: ClickButton::Left,
+        };
+        if minecraft
+            .container_click(PLAYER_INVENTORY_WINDOW, click)
+            .await
+            .is_err()
+        {
+            return false;
+        }
+    }
+    true
 }

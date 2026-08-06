@@ -1,0 +1,327 @@
+# Implement a global emergency stop system (`#stop`, `/stop`, `stopall`)
+
+You are working on a Rust Minecraft AI bot using Azalea.
+
+The project already contains:
+
+* movement
+* navigation
+* pathfinding
+* AI tasks
+* gather tasks
+* mining tasks
+* combat tasks
+* bridge tasks
+* crafting tasks
+* interaction controller
+* look controller
+* inventory management
+* task execution
+
+## Goal
+
+Implement a **global emergency stop system** that can **force-stop every running task immediately**, even if another subsystem is frozen, deadlocked, stuck in a loop, or waiting on a future.
+
+This must be **completely independent from the normal task cancellation logic**.
+
+It should function as a hard interrupt.
+
+## Commands
+
+Support all of the following aliases:
+
+```text
+#stop
+/stop
+stopall
+```
+
+All three commands must perform exactly the same operation.
+
+## Critical requirement
+
+The emergency stop must work even when:
+
+* pathfinding is stuck,
+* AI planning is stuck,
+* gather is stuck,
+* combat is stuck,
+* bridge execution is stuck,
+* crafting is stuck,
+* movement is stuck,
+* interaction is stuck,
+* look controller is stuck,
+* or a task never returns.
+
+Do **not** rely solely on the existing task cancellation mechanism.
+
+The stop system must be able to interrupt and reset all subsystems.
+
+## Architecture
+
+Create a dedicated emergency stop module, for example:
+
+```text
+src/control/
+    stop.rs
+    emergency.rs
+    mod.rs
+```
+
+Do not place this inside pathfinding, combat, AI, gather, or navigation.
+
+It should be globally accessible.
+
+## What stop must do
+
+When any stop command is executed:
+
+### Cancel all tasks
+
+Force-cancel:
+
+* AI tasks
+* gather tasks
+* mining tasks
+* crafting tasks
+* combat tasks
+* bridge tasks
+* navigation tasks
+* follow tasks
+* goto tasks
+* any queued tasks
+
+### Stop movement
+
+Immediately release:
+
+* forward
+* backward
+* left
+* right
+* sprint
+* jump
+* sneak
+
+The bot should become completely stationary.
+
+### Stop pathfinding
+
+Abort:
+
+* current path
+* active goals
+* bridge executor
+* pillar executor
+* staircase executor
+* mining path actions
+* follow targets
+
+### Stop combat
+
+Abort:
+
+* attack loop
+* target tracking
+* crit timing
+* shield break logic
+* combat movement
+
+### Stop interaction
+
+Abort:
+
+* block breaking
+* block placing
+* crafting interactions
+* inventory interactions
+* container interactions
+* bucket actions
+
+### Stop look controller
+
+Cancel:
+
+* look tasks
+* rotation interpolation
+* precise look mode
+* target tracking
+
+### Clear temporary state
+
+Reset:
+
+* current target block
+* current target entity
+* follow target
+* bridge state
+* combat state
+* gather state
+* crafting state
+* AI session state
+* queued commands
+* pending callbacks
+
+## Force reset behavior
+
+This is important.
+
+The stop system must not wait for graceful completion.
+
+It should immediately invalidate:
+
+* cancellation tokens
+* task handles
+* async loops
+* path executors
+* behavior trees
+* command queues
+
+If a subsystem is waiting forever, it must be abandoned and reset.
+
+## Thread safety
+
+The emergency stop must be safe to call from:
+
+* console thread
+* AI thread
+* task executor
+* command handler
+* network event
+* any runtime context
+
+## Console output
+
+When executed:
+
+```text
+#stop
+```
+
+Output:
+
+```text
+[INFO] Emergency stop requested
+[INFO] Cancelling all active tasks
+[INFO] Stopping movement
+[INFO] Stopping pathfinding
+[INFO] Stopping combat
+[INFO] Stopping interactions
+[INFO] Clearing queued actions
+[SUCCESS] Emergency stop complete
+```
+
+Keep logging concise.
+
+## Recovery
+
+After stop completes, the bot must immediately be able to accept new commands.
+
+Example:
+
+```text
+#get oak_log 10
+```
+
+Then:
+
+```text
+#stop
+```
+
+Then immediately:
+
+```text
+#goto 100 64 100
+```
+
+The new command should work without restarting the bot.
+
+## Frozen-task recovery
+
+Specifically verify:
+
+* infinite gather loop,
+* infinite mining loop,
+* pathfinding deadlock,
+* AI waiting forever,
+* combat loop,
+* bridge loop,
+* look controller stall,
+* interaction timeout,
+* crafting stall.
+
+`#stop` must recover from all of them.
+
+## Tests
+
+Add tests for:
+
+* stop while gathering,
+* stop while mining,
+* stop while crafting,
+* stop while following,
+* stop while pathfinding,
+* stop while bridging,
+* stop while pillaring,
+* stop while in combat,
+* stop while looking,
+* stop while placing blocks,
+* stop while breaking blocks,
+* stop with no active task,
+* immediate command after stop.
+
+## Manual validation
+
+Verify:
+
+1. Start `#get`.
+
+2. Execute `#stop`.
+
+3. Bot stops instantly.
+
+4. Start `/goto`.
+
+5. Execute `/stop`.
+
+6. Bot stops instantly.
+
+7. Start `#kill`.
+
+8. Execute `stopall`.
+
+9. Bot stops instantly.
+
+10. Execute a new command immediately afterward.
+
+The bot must become completely idle and fully responsive after every emergency stop.
+
+## Validation
+
+Run:
+
+```bash
+cargo fmt
+cargo check
+cargo test
+cargo clippy --all-targets --all-features
+cargo build --release
+```
+
+Fix all compilation errors, warnings, and failing tests.
+
+## Final report
+
+Provide:
+
+1. files created,
+2. files modified,
+3. emergency stop architecture,
+4. movement reset implementation,
+5. pathfinding interruption implementation,
+6. combat interruption implementation,
+7. interaction interruption implementation,
+8. queue clearing implementation,
+9. tests added,
+10. and confirmation that `#stop`, `/stop`, and `stopall` can force-stop the bot even when another subsystem is frozen or deadlocked.

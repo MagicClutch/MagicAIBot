@@ -15,6 +15,10 @@ pub const OFFHAND_PROTOCOL_SLOT: usize = 45;
 /// (`azalea_inventory::Player::INVENTORY_SLOTS`).
 pub const INVENTORY_PROTOCOL_SLOTS: RangeInclusive<usize> = 9..=44;
 
+/// The protocol slot range of just the hotbar, the last 9 of
+/// [`INVENTORY_PROTOCOL_SLOTS`] (`azalea_inventory::Player::HOTBAR_SLOTS`).
+pub const HOTBAR_PROTOCOL_SLOTS: RangeInclusive<usize> = 36..=44;
+
 /// A single item stack the equipment system cares about: an armor slot, the
 /// offhand slot, or a main-inventory slot. `slot` is the protocol slot index
 /// inside the player's own inventory menu, used unchanged as the click

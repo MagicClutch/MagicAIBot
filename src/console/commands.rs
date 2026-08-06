@@ -35,7 +35,15 @@ pub enum ConsoleCommand {
         z: i32,
     },
     PathStatus,
+    /// Global emergency stop (`#stop`/`/stop`/`stopall`, all identical) --
+    /// see `crate::control`. Force-cancels every controller, not just
+    /// movement; distinct from [`Self::StopMovement`]'s narrower scope.
     Stop,
+    /// The original, narrower `/stopmovement`: releases movement/pathfinding
+    /// and any interruptible look, but deliberately leaves interaction,
+    /// combat, and container state alone. Kept for callers that want that
+    /// finer-grained behavior; `/stop` itself is now the full emergency stop.
+    StopMovement,
     Follow {
         player: String,
     },
@@ -135,6 +143,29 @@ pub enum ConsoleCommand {
     CloseContainer,
     Reconnect,
     Quit,
+    /// `/outputmode` (no args) reports the current console/chat levels;
+    /// `/outputmode <console|chat|both> <mode>` changes one or both. See
+    /// `crate::config::OutputMode` for what each mode shows.
+    OutputMode {
+        change: Option<OutputModeChange>,
+    },
+    /// `/explanation` (alias `/explain`, and `#explanation` in chat): prints
+    /// what each `/outputmode` level shows, for a user who doesn't want to
+    /// go read the config file.
+    Explanation,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum OutputModeTarget {
+    Console,
+    Chat,
+    Both,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct OutputModeChange {
+    pub target: OutputModeTarget,
+    pub mode: crate::config::OutputMode,
 }
 
 #[derive(Debug, PartialEq)]
@@ -205,7 +236,8 @@ pub fn parse_input(input: &str) -> Result<ConsoleInput, AppError> {
             }
         }
         "path-status" => no_arguments(command, arguments, ConsoleCommand::PathStatus)?,
-        "stop" | "stopmovement" => no_arguments(command, arguments, ConsoleCommand::Stop)?,
+        "stop" | "stopall" => no_arguments(command, arguments, ConsoleCommand::Stop)?,
+        "stopmovement" => no_arguments(command, arguments, ConsoleCommand::StopMovement)?,
         "follow" => ConsoleCommand::Follow {
             player: parse_follow_name(arguments)?,
         },
@@ -288,6 +320,8 @@ pub fn parse_input(input: &str) -> Result<ConsoleInput, AppError> {
         "close-container" => no_arguments(command, arguments, ConsoleCommand::CloseContainer)?,
         "reconnect" => no_arguments(command, arguments, ConsoleCommand::Reconnect)?,
         "quit" => no_arguments(command, arguments, ConsoleCommand::Quit)?,
+        "outputmode" => parse_output_mode(arguments)?,
+        "explanation" | "explain" => no_arguments(command, arguments, ConsoleCommand::Explanation)?,
         "chat" => {
             if arguments.is_empty() {
                 return Err(AppError::MissingConsoleArgument(
@@ -663,6 +697,42 @@ fn parse_drop(arguments: &str) -> Result<ConsoleCommand, AppError> {
     })
 }
 
+const OUTPUT_MODE_USAGE: &str = "/outputmode [console|chat|both] [none|light|info|debug|fulldebug]";
+
+fn parse_output_mode(arguments: &str) -> Result<ConsoleCommand, AppError> {
+    if arguments.is_empty() {
+        return Ok(ConsoleCommand::OutputMode { change: None });
+    }
+    let mut parts = arguments.split_whitespace();
+    let target_token = parts
+        .next()
+        .ok_or_else(|| AppError::InvalidConsoleSyntax(OUTPUT_MODE_USAGE.to_owned()))?;
+    let mode_token = parts
+        .next()
+        .ok_or_else(|| AppError::MissingConsoleArgument(OUTPUT_MODE_USAGE.to_owned()))?;
+    if parts.next().is_some() {
+        return Err(AppError::InvalidConsoleSyntax(OUTPUT_MODE_USAGE.to_owned()));
+    }
+    let target = match target_token.to_ascii_lowercase().as_str() {
+        "console" => OutputModeTarget::Console,
+        "chat" => OutputModeTarget::Chat,
+        "both" => OutputModeTarget::Both,
+        _ => {
+            return Err(AppError::InvalidConsoleSyntax(format!(
+                "unknown output target '{target_token}' -- expected console, chat, or both"
+            )));
+        }
+    };
+    let mode = crate::config::OutputMode::parse(mode_token).ok_or_else(|| {
+        AppError::InvalidConsoleSyntax(format!(
+            "unknown output mode '{mode_token}' -- expected none, light, info, debug, or fulldebug"
+        ))
+    })?;
+    Ok(ConsoleCommand::OutputMode {
+        change: Some(OutputModeChange { target, mode }),
+    })
+}
+
 fn no_arguments(
     command: &str,
     arguments: &str,
@@ -888,11 +958,31 @@ mod tests {
     fn parses_independent_task_control_commands() {
         assert_eq!(
             parse_input("/stopmovement").unwrap(),
-            ConsoleInput::Command(ConsoleCommand::Stop)
+            ConsoleInput::Command(ConsoleCommand::StopMovement)
         );
         assert_eq!(
             parse_input("/lookat 1 64 -2").unwrap(),
             ConsoleInput::Command(ConsoleCommand::Look { x: 1, y: 64, z: -2 })
+        );
+    }
+
+    #[test]
+    fn stop_stopall_and_hash_stop_are_all_the_same_emergency_stop_command() {
+        // `#stop` in chat is reparsed as `/stop` before ever reaching this
+        // function (see `App::handle_chat_console_command`), so covering
+        // "/stop" and "/stopall" here covers all three required aliases.
+        for input in ["/stop", "/stopall", "/STOPALL"] {
+            assert_eq!(
+                parse_input(input).unwrap(),
+                ConsoleInput::Command(ConsoleCommand::Stop),
+                "{input}"
+            );
+        }
+        // The emergency stop and the narrower movement-only stop must
+        // remain genuinely distinct commands, not aliases of each other.
+        assert_ne!(
+            parse_input("/stop").unwrap(),
+            parse_input("/stopmovement").unwrap()
         );
     }
 
@@ -1361,5 +1451,80 @@ mod tests {
             parse_input("/help").unwrap(),
             ConsoleInput::Command(ConsoleCommand::Help)
         );
+    }
+
+    #[test]
+    fn outputmode_with_no_arguments_reports_current_settings() {
+        assert_eq!(
+            parse_input("/outputmode").unwrap(),
+            ConsoleInput::Command(ConsoleCommand::OutputMode { change: None })
+        );
+    }
+
+    #[test]
+    fn outputmode_parses_target_and_mode_case_insensitively() {
+        assert_eq!(
+            parse_input("/outputmode console debug").unwrap(),
+            ConsoleInput::Command(ConsoleCommand::OutputMode {
+                change: Some(OutputModeChange {
+                    target: OutputModeTarget::Console,
+                    mode: crate::config::OutputMode::Debug,
+                }),
+            })
+        );
+        assert_eq!(
+            parse_input("/outputmode CHAT None").unwrap(),
+            ConsoleInput::Command(ConsoleCommand::OutputMode {
+                change: Some(OutputModeChange {
+                    target: OutputModeTarget::Chat,
+                    mode: crate::config::OutputMode::None,
+                }),
+            })
+        );
+        assert_eq!(
+            parse_input("/outputmode both fulldebug").unwrap(),
+            ConsoleInput::Command(ConsoleCommand::OutputMode {
+                change: Some(OutputModeChange {
+                    target: OutputModeTarget::Both,
+                    mode: crate::config::OutputMode::FullDebug,
+                }),
+            })
+        );
+    }
+
+    #[test]
+    fn outputmode_rejects_an_unknown_target_or_mode_or_a_missing_mode() {
+        assert!(matches!(
+            parse_input("/outputmode sideways info"),
+            Err(AppError::InvalidConsoleSyntax(_))
+        ));
+        assert!(matches!(
+            parse_input("/outputmode console nonsense"),
+            Err(AppError::InvalidConsoleSyntax(_))
+        ));
+        assert!(matches!(
+            parse_input("/outputmode console"),
+            Err(AppError::MissingConsoleArgument(_))
+        ));
+        assert!(matches!(
+            parse_input("/outputmode console info extra"),
+            Err(AppError::InvalidConsoleSyntax(_))
+        ));
+    }
+
+    #[test]
+    fn explanation_and_explain_are_the_same_no_argument_command() {
+        assert_eq!(
+            parse_input("/explanation").unwrap(),
+            ConsoleInput::Command(ConsoleCommand::Explanation)
+        );
+        assert_eq!(
+            parse_input("/explain").unwrap(),
+            ConsoleInput::Command(ConsoleCommand::Explanation)
+        );
+        assert!(matches!(
+            parse_input("/explanation now"),
+            Err(AppError::InvalidConsoleSyntax(_))
+        ));
     }
 }

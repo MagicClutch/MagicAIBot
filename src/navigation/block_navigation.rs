@@ -371,7 +371,12 @@ impl BlockNavigationService {
                 let _ = movement.stop(minecraft).await;
                 let mut inner = self.inner.lock().await;
                 inner.snapshot.state = BlockNavigationState::Reached;
-                logging::success(format!(
+                // `info`, not `success`: fires once per block navigated to
+                // (once per item during a `#get`/`#mine` run), so tagging it
+                // a milestone would flood chat with one line per item on top
+                // of the "Collected ... (n/amount)" progress line that
+                // already reports that same cadence.
+                logging::info(format!(
                     "Reached {selected_block_id} at ({}, {}, {})",
                     target.x, target.y, target.z
                 ));
