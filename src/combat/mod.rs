@@ -1,5 +1,12 @@
 //! Standalone PvP combat: `#kill <player>`.
 //!
+//! The fight is **full aggression** end to end: the bot closes the gap,
+//! stays in the target's face, eats mid-fight without ever backing off, and
+//! keeps swinging until the target is dead. Nothing in here retreats,
+//! flees, or ends a fight because the bot is hurt -- see [`executor`]'s
+//! module doc comment for the one thing that briefly pauses attacking (a
+//! bite in progress) and why.
+//!
 //! Deliberately independent of `crate::movement`/`crate::navigation` (the
 //! pathfinder-backed systems every other command -- `/goto`, `/follow`,
 //! `#get`, `#mine` -- shares) and of `crate::mobs::combat` (the

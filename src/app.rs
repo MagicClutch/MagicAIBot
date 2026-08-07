@@ -37,6 +37,7 @@ use crate::{
     movement::{MovementService, NavigationMode},
     navigation::BlockNavigationService,
     navigation::navigation_state::BlockNavigationState,
+    pathfinding::{NavigationState, PathfindingController},
     survival::SurvivalController,
 };
 use tokio::{sync::mpsc, task::JoinHandle};
@@ -346,6 +347,58 @@ async fn await_combat_terminal(app: &App, input_rx: &mut InputReceiver) -> WaitO
 /// (mob combat, unrelated to and untouched by a PvP fight) is passed to
 /// `survival.tick` purely because that's its fixed signature; it stays idle
 /// for the whole fight.
+/// Blocking wait for a long-distance `/goto` running through
+/// `crate::pathfinding`. Structurally identical to
+/// [`await_movement_terminal`] -- same poll cadence, same interruption
+/// handling -- but it watches the *navigation* state machine rather than the
+/// movement one, because with the segmented planner in charge the movement
+/// layer legitimately reaches `Completed` at the end of every waypoint hop,
+/// dozens of times per trip, and none of those mean the journey is over.
+///
+/// It also needs no stuck timeout of its own: the planner detects a blocked
+/// segment (`segment_stuck_seconds`) and either replans or fails, so the
+/// only way out of this loop is a terminal navigation state.
+async fn await_navigation_terminal(app: &App, input_rx: &mut InputReceiver) -> WaitOutcome {
+    loop {
+        app.pathfinding.tick(&app.minecraft, &app.movement).await;
+        app.movement.tick(&app.minecraft, false).await;
+        app.survival
+            .tick(
+                &app.minecraft,
+                &app.movement,
+                &app.look,
+                &app.interaction,
+                &app.combat,
+            )
+            .await;
+        let snapshot = app.pathfinding.snapshot().await;
+        match snapshot.state {
+            NavigationState::Arrived | NavigationState::Idle => {
+                return WaitOutcome::Finished(Ok(()));
+            }
+            NavigationState::Cancelled => {
+                return WaitOutcome::Finished(Err(AppError::MovementCancelled));
+            }
+            NavigationState::Failed => {
+                return WaitOutcome::Finished(Err(AppError::PathfindingFailure(
+                    snapshot
+                        .failure
+                        .map(|failure| failure.to_string())
+                        .unwrap_or_else(|| "unknown reason".into()),
+                )));
+            }
+            NavigationState::Planning
+            | NavigationState::FollowingSegment
+            | NavigationState::Recalculating => {
+                let poll = survival_poll_interval(app, Duration::from_millis(75)).await;
+                if let Some(input) = wait_tick(app, input_rx, poll).await {
+                    return WaitOutcome::Interrupted(input);
+                }
+            }
+        }
+    }
+}
+
 async fn await_kill_terminal(app: &App, input_rx: &mut InputReceiver) -> WaitOutcome {
     loop {
         app.look.tick(&app.minecraft).await;
@@ -513,6 +566,11 @@ pub struct App {
     /// separate controller from `combat` (mob-hunting) above rather than an
     /// extension of it.
     pvp: KillController,
+    /// Baritone-style long-distance navigation (`/goto <x> <y> <z>` past
+    /// `pathfinding.long_distance_threshold`) -- see `crate::pathfinding`.
+    /// Plans the route and slices it into segments; each segment is still
+    /// executed through `movement` below.
+    pathfinding: PathfindingController,
     container: ContainerService,
     equipment: EquipmentService,
     hotbar_equipment: HotbarEquipmentService,
@@ -582,8 +640,20 @@ impl App {
                 ),
                 block_navigation,
             ),
-            combat: CombatController::new(),
+            // Mob combat has no view of the held weapon, so an automatic
+            // cadence resolves to a sword's -- which is what `#get <mob>`
+            // equips before fighting anyway.
+            combat: CombatController::new(
+                config
+                    .killbot
+                    .attack_cooldown()
+                    .unwrap_or(crate::combat::crits::SWORD_COOLDOWN),
+            ),
             pvp: KillController::new(config.killbot.clone()),
+            pathfinding: PathfindingController::new(
+                config.pathfinding.clone(),
+                config.vertical_navigation.clone(),
+            ),
             container: ContainerService::default(),
             equipment: EquipmentService::new(config.equipment.clone()),
             hotbar_equipment: HotbarEquipmentService::new(
@@ -643,6 +713,7 @@ impl App {
                             self.interaction.cancel(&self.minecraft, &self.movement, &self.look).await;
                             self.combat.cancel(&self.minecraft, &self.movement, &self.look).await;
                             self.pvp.cancel(&self.minecraft, &self.look).await;
+                            self.pathfinding.cancel(&self.minecraft, &self.movement).await;
                             self.block_navigation.cancel(&self.minecraft, &self.movement).await;
                             self.look.cancel().await;
                             self.survival.reset().await;
@@ -654,6 +725,11 @@ impl App {
                     self.session_ready = true;
                     self.tick_chat_commands(&mut input_rx).await;
                     let explicit_look = self.look.snapshot().await.state == LookState::Looking;
+                    // Before `movement`: the pathfinder decides which
+                    // waypoint the movement layer should be walking toward,
+                    // so it submits the goal that this same tick then
+                    // refreshes.
+                    self.pathfinding.tick(&self.minecraft, &self.movement).await;
                     self.movement.tick(&self.minecraft, explicit_look).await;
                 },
                 _ = look_tick.tick() => {
@@ -789,6 +865,22 @@ impl App {
                     {
                         self.pvp.cancel(&self.minecraft, &self.look).await;
                     }
+                    // Exactly the same hazard for long-distance navigation
+                    // (`crate::pathfinding`), which also keeps ticking in the
+                    // background: a `/goto 5000 100 -3000` that the user
+                    // interrupts with new console input leaves the segment
+                    // follower alive, resubmitting a movement goal every
+                    // tick, so the next command would spend its whole life
+                    // being dragged toward the abandoned destination. `Stop`
+                    // is excluded only because it already cancels this
+                    // through `StopTargets`; `Goto` is not excluded, since
+                    // starting a new trip should supersede the old one and
+                    // `start` does not itself stop the movement layer.
+                    if !is_read_only_query(&command) && !matches!(command, ConsoleCommand::Stop) {
+                        self.pathfinding
+                            .cancel(&self.minecraft, &self.movement)
+                            .await;
+                    }
                     match command {
                         ConsoleCommand::Help => print_help(),
                         ConsoleCommand::Status => self.print_status().await,
@@ -817,12 +909,18 @@ impl App {
                             self.block_navigation
                                 .cancel(&self.minecraft, &self.movement)
                                 .await;
-                            logging::info(format!("Navigating to ({x}, {y}, {z})"));
                             let destination = crate::minecraft::world_state::PositionSnapshot {
                                 x: f64::from(x),
                                 y: f64::from(y),
                                 z: f64::from(z),
                             };
+                            // The segmented planner prints its own richer
+                            // start line (and, with `debug_pathfinding`, the
+                            // whole route plan), so only the direct path
+                            // announces itself here.
+                            if !self.use_segmented_navigation(destination).await {
+                                logging::info(format!("Navigating to ({x}, {y}, {z})"));
+                            }
                             match self
                                 .goto_and_wait(
                                     "Go to position",
@@ -912,6 +1010,7 @@ impl App {
                                 combat: &self.combat,
                                 pvp: &self.pvp,
                                 container: &self.container,
+                                pathfinding: &self.pathfinding,
                                 survival: &self.survival,
                             };
                             execute_emergency_stop(&targets, &self.emergency_stop).await;
@@ -1654,6 +1753,14 @@ impl App {
     }
 
     async fn print_path_status(&self) {
+        // The segmented planner first when it has anything to say: while it
+        // is running, Azalea's own pathfinder status below describes only
+        // the current waypoint hop, which on its own reads as a confusingly
+        // short trip.
+        let navigation = self.pathfinding.snapshot().await;
+        if navigation.state != NavigationState::Idle {
+            println!("{}", crate::pathfinding::debug::format_status(&navigation));
+        }
         match self.minecraft.navigation_status().await {
             Ok(status) if status.calculating => println!("Pathfinder: calculating"),
             Ok(status) if status.executing => println!("Pathfinder: following path"),
@@ -2146,6 +2253,30 @@ impl App {
     // and shows a lightweight name in `/status`'s "Current task" line for the
     // duration (purely a display aid; nothing reads it back programmatically).
 
+    /// Whether a destination is far enough away to be worth the segmented
+    /// planner (see `crate::pathfinding`). Short hops go straight to the
+    /// movement layer as they always have: slicing a 40-block walk into
+    /// segments only adds planning latency to something Azalea's own
+    /// pathfinder already does reliably. Distance is measured from the bot's
+    /// live position, so `/goto` on a nearby coordinate behaves exactly as
+    /// it did before this system existed.
+    async fn use_segmented_navigation(
+        &self,
+        destination: crate::minecraft::world_state::PositionSnapshot,
+    ) -> bool {
+        if !self.config.pathfinding.enabled {
+            return false;
+        }
+        let world = self.minecraft.world_state_snapshot().await;
+        let Some(position) = world.bot.position else {
+            return false;
+        };
+        let dx = destination.x - position.x;
+        let dy = destination.y - position.y;
+        let dz = destination.z - position.z;
+        (dx * dx + dy * dy + dz * dz).sqrt() > self.config.pathfinding.long_distance_threshold
+    }
+
     async fn goto_and_wait(
         &self,
         name: &str,
@@ -2154,7 +2285,14 @@ impl App {
         input_rx: &mut InputReceiver,
     ) -> WaitOutcome {
         self.minecraft.set_current_task(task_snapshot(name)).await;
+        let segmented = self.use_segmented_navigation(destination).await;
         let result = async {
+            if segmented {
+                if let Err(error) = self.pathfinding.start(&self.minecraft, destination).await {
+                    return WaitOutcome::Finished(Err(error));
+                }
+                return await_navigation_terminal(self, input_rx).await;
+            }
             if let Err(error) = self.movement.goto(&self.minecraft, destination, mode).await {
                 return WaitOutcome::Finished(Err(error));
             }
@@ -3088,6 +3226,13 @@ impl App {
             await_interaction_terminal(self, input_rx).await
         }
         .await;
+        // The bot just changed the world at `target`: forget what the
+        // navigation cache believed about that chunk, and discard any
+        // planned segment whose route passes through it. Almost always a
+        // no-op (nothing is usually navigating while a block is being
+        // broken) and cheap when it is -- see
+        // `PathfindingController::notify_world_change`.
+        self.pathfinding.notify_world_change(target).await;
         self.minecraft.clear_current_task().await;
         result
     }

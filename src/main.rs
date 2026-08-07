@@ -16,6 +16,7 @@ pub mod minecraft;
 mod mobs;
 mod movement;
 mod navigation;
+mod pathfinding;
 mod survival;
 mod tasks;
 

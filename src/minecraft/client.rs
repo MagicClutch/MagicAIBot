@@ -596,6 +596,109 @@ impl MinecraftClient {
             .collect())
     }
 
+    /// Copies every loaded block in `bounds` into an owned
+    /// [`TerrainGrid`](crate::pathfinding::grid::TerrainGrid) for the
+    /// pathfinder, clamping the requested Y range to the world's real
+    /// height limits.
+    ///
+    /// This is the only place Azalea's world is read on the pathfinder's
+    /// behalf, and it is deliberately a *copy*: the search that consumes the
+    /// grid runs for up to a second on a blocking thread (see
+    /// `crate::pathfinding::planner`), which it could not do while holding
+    /// the world lock. Cells in chunks that aren't loaded are simply left
+    /// `Unknown`, which is what makes the planner treat render-distance edge
+    /// as a frontier rather than as walkable ground.
+    ///
+    /// Cost: one world lock, held for the duration of a linear walk over the
+    /// requested cells (~300k for a default-sized sample). Block states are
+    /// memoized by state id, and a chunk's palette rarely holds more than a
+    /// few dozen distinct states, so the expensive part -- resolving a state
+    /// to a block id string and classifying it -- runs a handful of times
+    /// per chunk rather than once per block.
+    pub(crate) async fn sample_terrain(
+        &self,
+        bounds: crate::pathfinding::grid::GridBounds,
+    ) -> Result<crate::pathfinding::grid::TerrainGrid, AppError> {
+        use crate::pathfinding::{grid::TerrainGrid, terrain};
+        use azalea::core::position::ChunkBlockPos;
+
+        if self.connection_state() != ConnectionState::Connected {
+            return Err(AppError::MovementUnavailable);
+        }
+        let client = self
+            .current_client
+            .lock()
+            .await
+            .clone()
+            .ok_or(AppError::MovementUnavailable)?;
+        let world = client
+            .world()
+            .map_err(|error| AppError::WorldStateUpdateFailure(error.to_string()))?;
+        let world_guard = world.read();
+        let world_min_y = world_guard.chunks.min_y();
+        let world_max_y = world_min_y + world_guard.chunks.height() as i32 - 1;
+
+        let bounds = crate::pathfinding::grid::GridBounds {
+            min: BlockPosition {
+                y: bounds.min.y.max(world_min_y),
+                ..bounds.min
+            },
+            max: BlockPosition {
+                y: bounds.max.y.min(world_max_y + 1),
+                ..bounds.max
+            },
+        };
+        let mut grid = TerrainGrid::empty(bounds);
+        if bounds.height() <= 0 {
+            return Ok(grid);
+        }
+
+        let min_chunk = ChunkPos::new(
+            chunk_coordinate(bounds.min.x),
+            chunk_coordinate(bounds.min.z),
+        );
+        let max_chunk = ChunkPos::new(
+            chunk_coordinate(bounds.max.x - 1),
+            chunk_coordinate(bounds.max.z - 1),
+        );
+        let mut classified: HashMap<u32, terrain::TerrainClass> = HashMap::new();
+        for chunk_x in min_chunk.x..=max_chunk.x {
+            for chunk_z in min_chunk.z..=max_chunk.z {
+                let Some(chunk) = world_guard.chunks.get(&ChunkPos::new(chunk_x, chunk_z)) else {
+                    continue;
+                };
+                let chunk_guard = chunk.read();
+                let start_x = (chunk_x * 16).max(bounds.min.x);
+                let end_x = (chunk_x * 16 + 16).min(bounds.max.x);
+                let start_z = (chunk_z * 16).max(bounds.min.z);
+                let end_z = (chunk_z * 16 + 16).min(bounds.max.z);
+                for y in bounds.min.y..bounds.max.y {
+                    for x in start_x..end_x {
+                        for z in start_z..end_z {
+                            let local = ChunkBlockPos::new(
+                                x.rem_euclid(16) as u8,
+                                y,
+                                z.rem_euclid(16) as u8,
+                            );
+                            let Some(state) = chunk_guard.get_block_state(&local, world_min_y)
+                            else {
+                                continue;
+                            };
+                            let class =
+                                *classified.entry(u32::from(state.id())).or_insert_with(|| {
+                                    terrain::classify(Some(
+                                        state.to_trait().as_block_kind().to_str(),
+                                    ))
+                                });
+                            grid.set(BlockPosition { x, y, z }, class);
+                        }
+                    }
+                }
+            }
+        }
+        Ok(grid)
+    }
+
     pub(crate) async fn block_ids_at(
         &self,
         positions: &[BlockPosition],
@@ -876,6 +979,37 @@ impl MinecraftClient {
             .ok_or(AppError::MovementUnavailable)?;
         client.start_use_item();
         Ok(())
+    }
+
+    /// Which hotbar slot the *server* has been told the bot is holding, as
+    /// opposed to the one the bot has locally decided on
+    /// ([`Self::select_hotbar_slot`] updates that immediately, but the
+    /// `ServerboundSetCarriedItem` packet only goes out on the next game
+    /// tick).
+    ///
+    /// This distinction is load-bearing for eating. Azalea sends the
+    /// carried-item packet *after* the use-item packet within a tick
+    /// (`ensure_has_sent_carried_item` is explicitly ordered
+    /// `.after(handle_start_use_item_queued)`), so selecting food and
+    /// starting to use it in the same tick makes the server apply the use to
+    /// whatever was held *before* -- the sword -- and only then switch to the
+    /// food. The bot ends up holding an apple it never started eating. See
+    /// `crate::combat::executor`'s `apply_eating`, which waits for this to
+    /// confirm the swap before sending the use.
+    ///
+    /// `None` means the client has not sent one yet (nothing selected since
+    /// joining).
+    pub(crate) async fn acknowledged_hotbar_slot(&self) -> Result<Option<u8>, AppError> {
+        let client = self
+            .current_client
+            .lock()
+            .await
+            .clone()
+            .ok_or(AppError::InventoryUnavailable)?;
+        Ok(client
+            .component::<azalea_client::inventory::LastSentSelectedHotbarSlot>()
+            .ok()
+            .map(|last_sent| last_sent.slot))
     }
 
     /// Like [`Self::start_use_main_hand`], but for the off hand -- raising

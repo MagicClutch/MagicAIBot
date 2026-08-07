@@ -12,18 +12,16 @@ use std::time::Duration;
 
 use crate::look::aim_point::SeededRng;
 
-/// Below this, the bot backs off urgently (no sprint -- backing into
-/// something at a sprint is how PvP bots end up in lava). Close enough to
-/// be standing almost inside the target otherwise, which both looks
-/// unnatural and makes it harder to track them with a normal aim.
+/// Below this the bot is effectively standing inside the target. It no
+/// longer backs off (see [`decide_movement`] -- full aggression never
+/// retreats), it just stops advancing and circles, which is also what
+/// `crate::combat::executor::compute_active_phase` reports as
+/// `CombatPhase::Reposition`.
 pub const BACK_OFF_DISTANCE: f64 = 1.2;
-/// The bottom of the tight preferred band (1.7-1.9): within
-/// [`BACK_OFF_DISTANCE`, `PREFERRED_MIN_DISTANCE`), the bot gently closes
-/// (walks, doesn't sprint) back toward it rather than treating the whole
-/// 1.2-1.7 stretch as fine to sit in indefinitely.
-pub const PREFERRED_MIN_DISTANCE: f64 = 1.7;
-/// The top of the tight preferred band -- the bot holds position and just
-/// strafes anywhere from here down to `PREFERRED_MIN_DISTANCE`.
+/// The top of the preferred band -- the bot holds position and just circles
+/// anywhere from here all the way down to zero. There is no lower edge to
+/// the band any more: full aggression never corrects back outward, so
+/// "closer than preferred" is simply not a case that needs a distance.
 pub const PREFERRED_MAX_DISTANCE: f64 = 1.9;
 /// Past this, the bot switches from a gentle walking correction to
 /// aggressively closing distance at a sprint -- a target this far away is
@@ -171,17 +169,16 @@ impl MovementDecision {
     }
 }
 
-/// Core combat positioning policy, five bands from urgent-retreat to
-/// sprinting pursuit:
+/// Core combat positioning policy -- full aggression, so only three bands,
+/// and `backward` is never set at all:
 ///
-/// - `< BACK_OFF_DISTANCE`: back off, no sprint.
-/// - `BACK_OFF_DISTANCE ..< PREFERRED_MIN_DISTANCE`: gently close in
-///   (walk, not sprint) toward the preferred band.
-/// - `PREFERRED_MIN_DISTANCE ..= PREFERRED_MAX_DISTANCE`: hold -- the
-///   1.7-1.9 sweet spot.
-/// - `PREFERRED_MAX_DISTANCE ..= AGGRESSIVE_CLOSE_DISTANCE`: gently close
-///   in, same as the inner band below preferred.
-/// - `> AGGRESSIVE_CLOSE_DISTANCE`: aggressively close in at a sprint.
+/// - `> AGGRESSIVE_CLOSE_DISTANCE`: close the gap at a sprint.
+/// - `PREFERRED_MAX_DISTANCE ..= AGGRESSIVE_CLOSE_DISTANCE`: close the gap
+///   at a walk.
+/// - `<= PREFERRED_MAX_DISTANCE`: hold and circle. Including *far* inside
+///   the preferred band: the bot stays in the target's face rather than
+///   stepping back out to a comfortable 1.7-1.9, since anything that walks
+///   away from a target is an opening for them to eat, block, or run.
 ///
 /// `pattern` supplies the strafe component in every band -- but per
 /// [`StrafePattern::Still`], that component isn't always actually
@@ -189,13 +186,11 @@ impl MovementDecision {
 /// interval is always followed by an active one, see
 /// [`next_strafe_pattern`]) rather than "never remain stationary at all".
 pub fn decide_movement(distance_to_target: f64, pattern: StrafePattern) -> MovementDecision {
-    let too_close = distance_to_target < BACK_OFF_DISTANCE;
-    let below_preferred = (BACK_OFF_DISTANCE..PREFERRED_MIN_DISTANCE).contains(&distance_to_target);
     let above_preferred = distance_to_target > PREFERRED_MAX_DISTANCE;
     let aggressive = distance_to_target > AGGRESSIVE_CLOSE_DISTANCE;
     MovementDecision {
-        forward: below_preferred || above_preferred,
-        backward: too_close,
+        forward: above_preferred,
+        backward: false,
         strafe: pattern.side(),
         sprint: aggressive,
     }
@@ -257,25 +252,22 @@ mod tests {
     }
 
     #[test]
-    fn gently_closes_distance_without_sprinting_just_below_the_preferred_band() {
-        let decision = decide_movement(PREFERRED_MIN_DISTANCE - 0.1, StrafePattern::Left);
-        assert!(decision.forward);
-        assert!(!decision.backward);
-        assert!(!decision.sprint);
+    fn never_backs_off_however_close_the_target_is() {
+        for distance in [0.0, 0.5, BACK_OFF_DISTANCE - 0.2, BACK_OFF_DISTANCE, 1.6] {
+            let decision = decide_movement(distance, StrafePattern::Right);
+            assert!(
+                !decision.backward,
+                "full aggression must never retreat (distance {distance})"
+            );
+            assert!(!decision.forward);
+            assert!(!decision.sprint);
+            assert_eq!(decision.strafe, Some(StrafeSide::Right));
+        }
     }
 
     #[test]
-    fn backs_off_without_sprinting_when_too_close() {
-        let decision = decide_movement(BACK_OFF_DISTANCE - 0.2, StrafePattern::Right);
-        assert!(decision.backward);
-        assert!(!decision.forward);
-        assert!(!decision.sprint);
-    }
-
-    #[test]
-    fn holds_position_and_strafes_within_the_preferred_band() {
-        let mid = (PREFERRED_MIN_DISTANCE + PREFERRED_MAX_DISTANCE) / 2.0;
-        let decision = decide_movement(mid, StrafePattern::Left);
+    fn holds_position_and_strafes_up_to_the_preferred_maximum() {
+        let decision = decide_movement(PREFERRED_MAX_DISTANCE, StrafePattern::Left);
         assert!(!decision.forward);
         assert!(!decision.backward);
         assert!(!decision.sprint);

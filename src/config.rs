@@ -50,6 +50,8 @@ pub struct Config {
     pub output: OutputConfig,
     #[serde(default)]
     pub killbot: KillbotConfig,
+    #[serde(default)]
+    pub pathfinding: PathfindingConfig,
 }
 
 /// How much of the bot's own status narration (task started/progress/
@@ -513,28 +515,80 @@ pub struct KillbotConfig {
     /// swing regardless of cooldown.
     #[serde(default = "default_killbot_attack_range")]
     pub attack_range: f64,
-    /// Center of the preferred 1.7-1.9 combat band (see
-    /// `combat::movement`'s doc comment for the full distance policy this
-    /// anchors).
+    /// Milliseconds between two attacks, or **0 for automatic** (the
+    /// default): swing exactly when the weapon actually in hand finishes
+    /// recharging -- 625ms for any sword, 1000ms for a netherite axe, and so
+    /// on (see `combat::crits::weapon_cooldown`).
+    ///
+    /// Automatic is the maximum-damage setting, and there is real arithmetic
+    /// behind that rather than a preference: Java scales each hit by
+    /// `0.2 + 0.8 * (t/T)^2`, so hitting at half charge deals 40% damage at
+    /// twice the rate -- 0.8x the damage per second of simply waiting. An
+    /// explicit value here overrides that curve in both directions, and any
+    /// value below the held weapon's real recharge time costs damage.
+    ///
+    /// Governs both `#kill` (PvP) and `#get <mob>` (mob combat): it is the
+    /// same swing, on the same weapon, against the same vanilla cooldown, so
+    /// there is one knob rather than two that would only ever be set to the
+    /// same number.
+    #[serde(default = "default_killbot_attack_cooldown_ms")]
+    pub attack_cooldown_ms: u64,
+    /// The distance the bot holds and circles at once it has closed in
+    /// (see `combat::movement`'s doc comment for the full distance policy
+    /// this anchors -- it only ever closes toward this, never backs out to
+    /// it).
     #[serde(default = "default_killbot_preferred_range")]
     pub preferred_range: f64,
     #[serde(default = "default_true")]
     pub crit_enabled: bool,
+    /// Never take a sword swing flat-footed: if the attack cooldown comes up
+    /// while the bot is standing on the ground, jump and hold the hit until
+    /// it lands as a critical (1.5x damage) instead of swinging immediately.
+    ///
+    /// Costs about a third of a second on the hits where it applies and pays
+    /// for it several times over in damage. Bounded, so a bot that cannot
+    /// jump (a low ceiling, a one-block tunnel) swings normally after a
+    /// moment rather than freezing -- see `combat::crits::CRIT_HOLD_TIMEOUT`.
+    /// Sword-only: an axe's slower cooldown already leaves room for the
+    /// ordinary crit jump. Requires `crit_enabled`.
+    #[serde(default = "default_true")]
+    pub always_crit_with_sword: bool,
     #[serde(default = "default_true")]
     pub shield_break_enabled: bool,
     #[serde(default = "default_true")]
     pub shield_use_enabled: bool,
-    /// Health (HP, 0-20) at or below which the bot disengages into
-    /// `combat::health::CombatMode::Defensive`/`Critical` and starts
-    /// looking for food -- see `combat::heal`.
+    /// Health (HP, 0-20) below which the bot eats -- *without* disengaging:
+    /// it keeps chasing and hitting the target the whole time (see
+    /// `combat::executor`'s module doc comment). Nothing about this
+    /// threshold ever makes the bot retreat or stop fighting.
+    ///
+    /// Exactly one bite is taken per trip below the threshold; the bot then
+    /// commits to the fight for `eat_cooldown_ms` before it will even
+    /// consider another. Defaults to four hearts.
     #[serde(default = "default_killbot_heal_threshold")]
     pub heal_threshold: f64,
-    /// Health (HP, 0-20) the bot must recover to before re-engaging after
-    /// healing. Deliberately well above `heal_threshold` (a hysteresis
-    /// gap) so the bot doesn't immediately flip back into Defensive mode
-    /// the moment it lands one more hit.
-    #[serde(default = "default_killbot_reengage_threshold")]
-    pub reengage_threshold: f64,
+    /// How long after finishing one bite before the bot will eat again, in
+    /// milliseconds. **One bite at a time**: the bot swallows, goes straight
+    /// back to fighting, and only reaches for more food once this has
+    /// elapsed and it is still hurt.
+    ///
+    /// Defaults to a golden apple's own Regeneration II duration (5s),
+    /// because that is the thing being waited for: a gap heals 4 HP
+    /// *gradually*, so health has barely moved the instant it lands.
+    /// Without this wait the bot re-checks its health, still sees it low,
+    /// and eats again -- burning five apples in ten seconds without
+    /// throwing a punch. Set to 0 to chain bites back to back.
+    #[serde(default = "default_killbot_eat_cooldown_ms")]
+    pub eat_cooldown_ms: u64,
+    /// Target health (HP, 0-20) at or below which the bot stops caring about
+    /// its own: no eating, just damage until the target is down.
+    ///
+    /// A finishing rule, and the one case where ignoring `heal_threshold` is
+    /// correct -- a target four hearts from death dies to the next couple of
+    /// hits, and a bot that stops to eat instead hands them the fight. Set
+    /// to 0 to disable and always respect `heal_threshold`.
+    #[serde(default = "default_killbot_finisher_health")]
+    pub finisher_health: f64,
     #[serde(default = "default_true")]
     pub sprint_reset_enabled: bool,
     #[serde(default = "default_true")]
@@ -552,32 +606,323 @@ pub struct KillbotConfig {
 fn default_killbot_attack_range() -> f64 {
     2.0
 }
+fn default_killbot_attack_cooldown_ms() -> u64 {
+    0
+}
 fn default_killbot_preferred_range() -> f64 {
     1.8
 }
 fn default_killbot_heal_threshold() -> f64 {
     8.0
 }
-fn default_killbot_reengage_threshold() -> f64 {
-    14.0
+fn default_killbot_eat_cooldown_ms() -> u64 {
+    5000
+}
+fn default_killbot_finisher_health() -> f64 {
+    8.0
 }
 fn default_killbot_max_chase_distance() -> f64 {
     128.0
 }
+impl KillbotConfig {
+    /// [`Self::eat_cooldown_ms`] as a `Duration`.
+    #[must_use]
+    pub fn eat_cooldown(&self) -> std::time::Duration {
+        std::time::Duration::from_millis(self.eat_cooldown_ms)
+    }
+
+    /// [`Self::attack_cooldown_ms`] as an explicit override, or `None` for
+    /// the automatic weapon-accurate cadence -- see that field's doc
+    /// comment. Callers that have no idea what the bot is holding fall back
+    /// to `crate::combat::crits::SWORD_COOLDOWN`.
+    #[must_use]
+    pub fn attack_cooldown(&self) -> Option<std::time::Duration> {
+        (self.attack_cooldown_ms > 0)
+            .then(|| std::time::Duration::from_millis(self.attack_cooldown_ms))
+    }
+}
+
 impl Default for KillbotConfig {
     fn default() -> Self {
         Self {
             attack_range: default_killbot_attack_range(),
+            attack_cooldown_ms: default_killbot_attack_cooldown_ms(),
             preferred_range: default_killbot_preferred_range(),
             crit_enabled: true,
+            always_crit_with_sword: true,
             shield_break_enabled: true,
             shield_use_enabled: true,
             heal_threshold: default_killbot_heal_threshold(),
-            reengage_threshold: default_killbot_reengage_threshold(),
+            eat_cooldown_ms: default_killbot_eat_cooldown_ms(),
+            finisher_health: default_killbot_finisher_health(),
             sprint_reset_enabled: true,
             strafe_enabled: true,
             prediction_enabled: true,
             max_chase_distance: default_killbot_max_chase_distance(),
+        }
+    }
+}
+
+/// Baritone-style hierarchical long-distance navigation -- see
+/// `crate::pathfinding`'s module doc comment. This section governs the
+/// *planner* (route, segments, searching, caching); the physical execution
+/// of each segment still runs through `[movement]` and
+/// `[vertical_navigation]`.
+#[derive(Clone, Debug, Deserialize)]
+pub struct PathfindingConfig {
+    /// Whether `/goto <x> <y> <z>` uses the segmented planner for distant
+    /// destinations at all. With this off, every `/goto` behaves exactly as
+    /// it did before this system existed (one goal, straight to Azalea's
+    /// pathfinder) -- the escape hatch if the planner ever misbehaves.
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+    /// The `[Pathfinder]` narration: route plans, per-segment progress, and
+    /// every replan with its reason. Off by default; this is a lot of
+    /// output for a long trip.
+    #[serde(default)]
+    pub debug_pathfinding: bool,
+    /// Destinations closer than this (in blocks) skip the planner entirely
+    /// and go straight to the movement layer -- segmenting a 40-block walk
+    /// only adds latency, and Azalea's own pathfinder is reliable at that
+    /// range.
+    #[serde(default = "default_long_distance_threshold")]
+    pub long_distance_threshold: f64,
+    /// Target length of one path slice, in blocks. Shorter means more
+    /// frequent (cheaper) searches and more responsive replanning; longer
+    /// means fewer, larger searches.
+    #[serde(default = "default_segment_length")]
+    pub segment_length: f64,
+    /// Horizontal half-extent of the terrain sampled around a segment
+    /// before searching it. Must comfortably exceed `segment_length` or the
+    /// search has no room to route around anything.
+    #[serde(default = "default_sample_margin")]
+    pub sample_margin: i32,
+    /// Vertical half-extent sampled around a segment. The dominant term in
+    /// how much memory one sample costs.
+    #[serde(default = "default_vertical_window")]
+    pub vertical_window: i32,
+    /// Node budget for one block-level search.
+    #[serde(default = "default_max_search_nodes")]
+    pub max_search_nodes: usize,
+    /// Wall-clock budget for one block-level search. Runs on a blocking
+    /// thread, so this never stalls the bot's own tick loop -- it only
+    /// bounds how stale a computed segment can be by the time it lands.
+    #[serde(default = "default_search_timeout_ms")]
+    pub search_timeout_ms: u64,
+    /// How close (in blocks) the bot must get to the final destination to
+    /// count as arrived.
+    #[serde(default = "default_arrival_radius")]
+    pub arrival_radius: f64,
+    /// How close the bot must get to a segment's end before moving on to
+    /// the next one. Looser than `arrival_radius`: a segment boundary is an
+    /// arbitrary point in open terrain, not a place the user asked to be.
+    #[serde(default = "default_segment_arrival_radius")]
+    pub segment_arrival_radius: f64,
+    /// Seconds without measurable progress toward the current segment's end
+    /// before it is treated as blocked and recalculated.
+    #[serde(default = "default_segment_stuck_seconds")]
+    pub segment_stuck_seconds: u64,
+    /// How many consecutive failed replans end the task. Each replan
+    /// re-samples the world, so a few retries genuinely help (terrain
+    /// streams in); an unbounded number just spins.
+    #[serde(default = "default_max_consecutive_replans")]
+    pub max_consecutive_replans: u32,
+    /// Chunks the navigation cache holds before evicting the oldest.
+    #[serde(default = "default_cache_capacity")]
+    pub cache_capacity: usize,
+    /// How many cache writes a chunk summary stays trustworthy for -- an
+    /// age in "chunks recorded since", not in seconds, so it scales with how
+    /// much the bot is actually moving.
+    #[serde(default = "default_cache_max_age")]
+    pub cache_max_age: u64,
+    /// Whether the planner may route through blocks it would have to mine.
+    /// Independent of `[vertical_navigation]`'s build permissions, which
+    /// govern what the *executor* does.
+    #[serde(default = "default_true")]
+    pub allow_breaking: bool,
+    /// Whether the planner may route across a gap by placing blocks.
+    /// Intersected with `[vertical_navigation]`'s own build permissions
+    /// (see `pathfinding::planner::move_policy`), so turning building off
+    /// there also stops the planner routing bridges -- these two can't
+    /// drift apart into "plans a bridge it will never build".
+    #[serde(default = "default_true")]
+    pub allow_bridging: bool,
+    /// Whether the planner may route through water.
+    #[serde(default = "default_true")]
+    pub allow_swimming: bool,
+    /// Deepest drop the planner will route down.
+    #[serde(default = "default_max_drop")]
+    pub max_drop: i32,
+    #[serde(default)]
+    pub costs: PathfindingCostConfig,
+}
+
+/// The weights `crate::pathfinding::cost::CostProfile` scores with, in units
+/// of "one block of easy walking". See that type's doc comment for what each
+/// one means -- they are deliberately one-to-one so tuning is a config edit.
+#[derive(Clone, Copy, Debug, Deserialize)]
+pub struct PathfindingCostConfig {
+    #[serde(default = "default_cost_walk")]
+    pub walk: f64,
+    #[serde(default = "default_cost_diagonal")]
+    pub diagonal: f64,
+    #[serde(default = "default_cost_jump_up")]
+    pub jump_up: f64,
+    #[serde(default = "default_cost_drop_per_block")]
+    pub drop_per_block: f64,
+    #[serde(default = "default_cost_max_safe_drop")]
+    pub max_safe_drop: i32,
+    #[serde(default = "default_cost_fall_damage_penalty")]
+    pub fall_damage_penalty: f64,
+    #[serde(default = "default_cost_swim")]
+    pub swim: f64,
+    #[serde(default = "default_cost_break_block")]
+    pub break_block: f64,
+    #[serde(default = "default_cost_bridge_block")]
+    pub bridge_block: f64,
+    #[serde(default = "default_cost_climb")]
+    pub climb: f64,
+    #[serde(default = "default_cost_hazard")]
+    pub hazard: f64,
+    #[serde(default = "default_cost_lava_avoidance")]
+    pub lava_avoidance: f64,
+    #[serde(default = "default_cost_hazard_proximity")]
+    pub hazard_proximity: f64,
+    #[serde(default = "default_cost_ledge_proximity")]
+    pub ledge_proximity: f64,
+    #[serde(default = "default_cost_entity_hazard")]
+    pub entity_hazard: f64,
+}
+
+fn default_long_distance_threshold() -> f64 {
+    96.0
+}
+fn default_segment_length() -> f64 {
+    48.0
+}
+fn default_sample_margin() -> i32 {
+    24
+}
+fn default_vertical_window() -> i32 {
+    32
+}
+fn default_max_search_nodes() -> usize {
+    20_000
+}
+fn default_search_timeout_ms() -> u64 {
+    1_500
+}
+fn default_arrival_radius() -> f64 {
+    1.5
+}
+fn default_segment_arrival_radius() -> f64 {
+    3.0
+}
+fn default_segment_stuck_seconds() -> u64 {
+    12
+}
+fn default_max_consecutive_replans() -> u32 {
+    8
+}
+fn default_cache_capacity() -> usize {
+    4_096
+}
+fn default_cache_max_age() -> u64 {
+    8_192
+}
+fn default_max_drop() -> i32 {
+    8
+}
+fn default_cost_walk() -> f64 {
+    1.0
+}
+fn default_cost_diagonal() -> f64 {
+    1.41
+}
+fn default_cost_jump_up() -> f64 {
+    1.8
+}
+fn default_cost_drop_per_block() -> f64 {
+    1.1
+}
+fn default_cost_max_safe_drop() -> i32 {
+    3
+}
+fn default_cost_fall_damage_penalty() -> f64 {
+    20.0
+}
+fn default_cost_swim() -> f64 {
+    3.0
+}
+fn default_cost_break_block() -> f64 {
+    6.0
+}
+fn default_cost_bridge_block() -> f64 {
+    8.0
+}
+fn default_cost_climb() -> f64 {
+    2.5
+}
+fn default_cost_hazard() -> f64 {
+    40.0
+}
+fn default_cost_lava_avoidance() -> f64 {
+    200.0
+}
+fn default_cost_hazard_proximity() -> f64 {
+    6.0
+}
+fn default_cost_ledge_proximity() -> f64 {
+    1.0
+}
+fn default_cost_entity_hazard() -> f64 {
+    25.0
+}
+
+impl Default for PathfindingCostConfig {
+    fn default() -> Self {
+        Self {
+            walk: default_cost_walk(),
+            diagonal: default_cost_diagonal(),
+            jump_up: default_cost_jump_up(),
+            drop_per_block: default_cost_drop_per_block(),
+            max_safe_drop: default_cost_max_safe_drop(),
+            fall_damage_penalty: default_cost_fall_damage_penalty(),
+            swim: default_cost_swim(),
+            break_block: default_cost_break_block(),
+            bridge_block: default_cost_bridge_block(),
+            climb: default_cost_climb(),
+            hazard: default_cost_hazard(),
+            lava_avoidance: default_cost_lava_avoidance(),
+            hazard_proximity: default_cost_hazard_proximity(),
+            ledge_proximity: default_cost_ledge_proximity(),
+            entity_hazard: default_cost_entity_hazard(),
+        }
+    }
+}
+
+impl Default for PathfindingConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            debug_pathfinding: false,
+            long_distance_threshold: default_long_distance_threshold(),
+            segment_length: default_segment_length(),
+            sample_margin: default_sample_margin(),
+            vertical_window: default_vertical_window(),
+            max_search_nodes: default_max_search_nodes(),
+            search_timeout_ms: default_search_timeout_ms(),
+            arrival_radius: default_arrival_radius(),
+            segment_arrival_radius: default_segment_arrival_radius(),
+            segment_stuck_seconds: default_segment_stuck_seconds(),
+            max_consecutive_replans: default_max_consecutive_replans(),
+            cache_capacity: default_cache_capacity(),
+            cache_max_age: default_cache_max_age(),
+            allow_breaking: true,
+            allow_bridging: true,
+            allow_swimming: true,
+            max_drop: default_max_drop(),
+            costs: PathfindingCostConfig::default(),
         }
     }
 }
@@ -899,10 +1244,10 @@ fn default_look_update_rate() -> u32 {
     30
 }
 fn default_reaction_delay_min_ms() -> u64 {
-    20
+    10
 }
 fn default_reaction_delay_max_ms() -> u64 {
-    55
+    28
 }
 fn default_prediction_strength() -> f64 {
     0.35
@@ -985,29 +1330,36 @@ fn default_maximum_hold_time_ms() -> u64 {
 fn default_retarget_chance() -> f64 {
     0.35
 }
+// Aim speeds are doubled relative to the original "human-like" profile, and
+// the accelerations are quadrupled to match. That pairing is what makes the
+// aim genuinely twice as fast rather than only twice as fast on long sweeps:
+// a turn short enough to never reach top speed is limited by acceleration
+// alone (`d = a*t^2/2`), so halving *its* time needs 4x the acceleration,
+// while a long turn is limited by top speed and needs 2x. Scaling both
+// together halves the time in either regime.
 fn default_minimum_yaw_speed() -> f64 {
-    60.0
+    120.0
 }
 fn default_maximum_yaw_speed() -> f64 {
-    480.0
+    960.0
 }
 fn default_minimum_pitch_speed() -> f64 {
-    50.0
+    100.0
 }
 fn default_maximum_pitch_speed() -> f64 {
-    380.0
+    760.0
 }
 fn default_yaw_acceleration() -> f64 {
-    2200.0
+    8800.0
 }
 fn default_pitch_acceleration() -> f64 {
-    1800.0
+    7200.0
 }
 fn default_yaw_deceleration() -> f64 {
-    2600.0
+    10400.0
 }
 fn default_pitch_deceleration() -> f64 {
-    2100.0
+    8400.0
 }
 fn default_slowdown_angle() -> f64 {
     14.0
@@ -1030,13 +1382,17 @@ fn default_maximum_overshoot_degrees() -> f64 {
 
 impl Default for LookConfig {
     fn default() -> Self {
+        // Every field defers to its `default_*` function rather than
+        // restating the number: the two had already drifted apart once, so a
+        // `LookConfig::default()` could disagree with the same config
+        // deserialized from an empty table.
         Self {
-            update_rate: 30,
-            reaction_delay_min_ms: 20,
-            reaction_delay_max_ms: 55,
+            update_rate: default_look_update_rate(),
+            reaction_delay_min_ms: default_reaction_delay_min_ms(),
+            reaction_delay_max_ms: default_reaction_delay_max_ms(),
             moving_target_prediction: true,
-            prediction_strength: 0.35,
-            minimum_target_movement: 0.03,
+            prediction_strength: default_prediction_strength(),
+            minimum_target_movement: default_minimum_target_movement(),
             randomization: LookRandomizationConfig::default(),
             motion: LookMotionConfig::default(),
         }
@@ -1062,14 +1418,14 @@ impl Default for LookRandomizationConfig {
 impl Default for LookMotionConfig {
     fn default() -> Self {
         Self {
-            minimum_yaw_speed: 60.0,
-            maximum_yaw_speed: 480.0,
-            minimum_pitch_speed: 50.0,
-            maximum_pitch_speed: 380.0,
-            yaw_acceleration: 2200.0,
-            pitch_acceleration: 1800.0,
-            yaw_deceleration: 2600.0,
-            pitch_deceleration: 2100.0,
+            minimum_yaw_speed: default_minimum_yaw_speed(),
+            maximum_yaw_speed: default_maximum_yaw_speed(),
+            minimum_pitch_speed: default_minimum_pitch_speed(),
+            maximum_pitch_speed: default_maximum_pitch_speed(),
+            yaw_acceleration: default_yaw_acceleration(),
+            pitch_acceleration: default_pitch_acceleration(),
+            yaw_deceleration: default_yaw_deceleration(),
+            pitch_deceleration: default_pitch_deceleration(),
             slowdown_angle: 14.0,
             arrival_tolerance: 1.2,
             micro_correction_enabled: true,
@@ -1378,16 +1734,20 @@ impl Config {
             || randomization.minimum_hold_time_ms == 0
             || randomization.maximum_hold_time_ms < randomization.minimum_hold_time_ms
             || !(0.0..=1.0).contains(&randomization.retarget_chance_per_second)
+            // Ceilings sized for the doubled aim profile and a little
+            // headroom above it: 1440 deg/s is four full turns a second,
+            // past anything a hand on a mouse produces for longer than a
+            // flick, and 20000 deg/s^2 reaches that top speed in ~70ms.
             || !(motion.minimum_yaw_speed > 0.0
                 && motion.minimum_yaw_speed <= motion.maximum_yaw_speed
-                && motion.maximum_yaw_speed <= 720.0)
+                && motion.maximum_yaw_speed <= 1440.0)
             || !(motion.minimum_pitch_speed > 0.0
                 && motion.minimum_pitch_speed <= motion.maximum_pitch_speed
-                && motion.maximum_pitch_speed <= 720.0)
-            || !(motion.yaw_acceleration > 0.0 && motion.yaw_acceleration <= 5000.0)
-            || !(motion.pitch_acceleration > 0.0 && motion.pitch_acceleration <= 5000.0)
-            || !(motion.yaw_deceleration > 0.0 && motion.yaw_deceleration <= 5000.0)
-            || !(motion.pitch_deceleration > 0.0 && motion.pitch_deceleration <= 5000.0)
+                && motion.maximum_pitch_speed <= 1440.0)
+            || !(motion.yaw_acceleration > 0.0 && motion.yaw_acceleration <= 20_000.0)
+            || !(motion.pitch_acceleration > 0.0 && motion.pitch_acceleration <= 20_000.0)
+            || !(motion.yaw_deceleration > 0.0 && motion.yaw_deceleration <= 20_000.0)
+            || !(motion.pitch_deceleration > 0.0 && motion.pitch_deceleration <= 20_000.0)
             || !(motion.slowdown_angle > 0.0 && motion.slowdown_angle <= 180.0)
             || !(motion.arrival_tolerance > 0.0 && motion.arrival_tolerance <= 45.0)
             || !(0.0..=1.0).contains(&motion.micro_correction_strength)
@@ -1441,12 +1801,74 @@ impl Config {
         if !(killbot.attack_range > 0.0 && killbot.attack_range <= 6.0)
             || !(killbot.preferred_range > 0.0 && killbot.preferred_range <= killbot.attack_range)
             || !(0.0..=20.0).contains(&killbot.heal_threshold)
-            || !(0.0..=20.0).contains(&killbot.reengage_threshold)
-            || killbot.reengage_threshold < killbot.heal_threshold
+            || !(0.0..=20.0).contains(&killbot.finisher_health)
             || !(killbot.max_chase_distance > 0.0 && killbot.max_chase_distance <= 1024.0)
+            || !(killbot.attack_cooldown_ms == 0
+                || (50..=10_000).contains(&killbot.attack_cooldown_ms))
+            || killbot.eat_cooldown_ms > 60_000
         {
             return Err(AppError::InvalidKillbotConfiguration(
-                "attack_range, preferred_range, heal_threshold, reengage_threshold, or max_chase_distance is out of range".into(),
+                "attack_range, attack_cooldown_ms, preferred_range, heal_threshold, finisher_health, or max_chase_distance is out of range".into(),
+            ));
+        }
+        let pathfinding = &self.pathfinding;
+        if !(pathfinding.segment_length >= 8.0 && pathfinding.segment_length <= 512.0)
+            || !(pathfinding.long_distance_threshold >= 0.0
+                && pathfinding.long_distance_threshold <= 4096.0)
+            || !(1..=256).contains(&pathfinding.sample_margin)
+            || !(1..=384).contains(&pathfinding.vertical_window)
+            || !(64..=5_000_000).contains(&pathfinding.max_search_nodes)
+            || !(10..=60_000).contains(&pathfinding.search_timeout_ms)
+            || !(pathfinding.arrival_radius > 0.0 && pathfinding.arrival_radius <= 64.0)
+            || !(pathfinding.segment_arrival_radius > 0.0
+                && pathfinding.segment_arrival_radius <= 64.0)
+            || !(1..=3600).contains(&pathfinding.segment_stuck_seconds)
+            || !(0..=1024).contains(&pathfinding.max_drop)
+            || pathfinding.cache_capacity == 0
+            || pathfinding.cache_max_age == 0
+        {
+            return Err(AppError::InvalidPathfindingConfiguration(
+                "segment_length, long_distance_threshold, sample_margin, vertical_window, \
+                 max_search_nodes, search_timeout_ms, arrival_radius, segment_arrival_radius, \
+                 segment_stuck_seconds, max_drop, cache_capacity, or cache_max_age is out of range"
+                    .into(),
+            ));
+        }
+        // The sampled corridor has to be wider than the segment it contains,
+        // or every search starts hard against the edge of what was sampled
+        // and can never route around anything.
+        if f64::from(pathfinding.sample_margin) < pathfinding.segment_length * 0.25 {
+            return Err(AppError::InvalidPathfindingConfiguration(
+                "sample_margin must be at least a quarter of segment_length".into(),
+            ));
+        }
+        let costs = &pathfinding.costs;
+        let weights = [
+            costs.walk,
+            costs.diagonal,
+            costs.jump_up,
+            costs.drop_per_block,
+            costs.fall_damage_penalty,
+            costs.swim,
+            costs.break_block,
+            costs.bridge_block,
+            costs.climb,
+            costs.hazard,
+            costs.lava_avoidance,
+            costs.hazard_proximity,
+            costs.ledge_proximity,
+            costs.entity_hazard,
+        ];
+        // A non-positive or non-finite weight breaks A*'s termination
+        // guarantee outright (a zero-cost cycle is an infinite loop), so this
+        // is a hard error rather than a clamp.
+        if weights
+            .iter()
+            .any(|weight| !weight.is_finite() || *weight <= 0.0)
+            || !(0..=1024).contains(&costs.max_safe_drop)
+        {
+            return Err(AppError::InvalidPathfindingConfiguration(
+                "every pathfinding cost weight must be finite and greater than zero".into(),
             ));
         }
         if !(-2032..=2032).contains(&self.vertical_navigation.minimum_y) {
@@ -1572,10 +1994,10 @@ mod tests {
         assert_eq!(config.block_search.default_radius, 32);
         assert_eq!(config.block_search.default_result_limit, 20);
         assert_eq!(config.block_navigation.maximum_target_attempts, 10);
-        assert_eq!(config.look.motion.maximum_yaw_speed, 480.0);
+        assert_eq!(config.look.motion.maximum_yaw_speed, 960.0);
         assert_eq!(config.look.update_rate, 30);
         assert!(config.look.randomization.enabled);
-        assert_eq!(config.look.reaction_delay_min_ms, 20);
+        assert_eq!(config.look.reaction_delay_min_ms, 10);
         assert!(config.look.moving_target_prediction);
         assert_eq!(config.interaction.maximum_reach, 4.5);
         assert_eq!(config.multitasking.normal_forward_angle, 35.0);
@@ -1587,12 +2009,106 @@ mod tests {
         assert_eq!(config.killbot.attack_range, 2.0);
         assert_eq!(config.killbot.preferred_range, 1.8);
         assert_eq!(config.killbot.heal_threshold, 8.0);
-        assert_eq!(config.killbot.reengage_threshold, 14.0);
+        assert_eq!(config.killbot.finisher_health, 8.0);
         assert!(config.killbot.crit_enabled);
     }
 
+    /// Every default in `[pathfinding]` must itself pass validation --
+    /// otherwise a config file that simply omits the section (which serde
+    /// fills in from these defaults) would fail to load.
     #[test]
-    fn rejects_a_killbot_reengage_threshold_below_the_heal_threshold() {
+    fn the_pathfinding_defaults_are_themselves_valid() {
+        let config: Config = toml::from_str(
+            r#"
+                [minecraft]
+                server = "localhost"
+                username = "MagicBot"
+                account_mode = "offline"
+                [reconnect]
+                enabled = false
+                delay_seconds = 1
+                maximum_attempts = 1
+                [logging]
+                level = "info"
+            "#,
+        )
+        .unwrap();
+        config
+            .validate()
+            .expect("a config without a [pathfinding] section must still be valid");
+        assert!(config.pathfinding.enabled);
+        assert!(!config.pathfinding.debug_pathfinding);
+        assert_eq!(config.pathfinding.segment_length, 48.0);
+        assert_eq!(config.pathfinding.long_distance_threshold, 96.0);
+        assert_eq!(config.pathfinding.costs.walk, 1.0);
+        assert_eq!(config.pathfinding.costs.lava_avoidance, 200.0);
+    }
+
+    fn pathfinding_config() -> Config {
+        toml::from_str(
+            r#"
+                [minecraft]
+                server = "localhost"
+                username = "MagicBot"
+                account_mode = "offline"
+                [reconnect]
+                enabled = false
+                delay_seconds = 1
+                maximum_attempts = 1
+                [logging]
+                level = "info"
+            "#,
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn rejects_a_zero_or_negative_pathfinding_cost_weight() {
+        // A zero-cost move makes A* non-terminating (a free cycle is an
+        // infinite loop), so this has to be rejected rather than clamped.
+        for weight in [0.0, -1.0, f64::NAN] {
+            let mut config = pathfinding_config();
+            config.pathfinding.costs.walk = weight;
+            assert!(
+                matches!(
+                    config.validate(),
+                    Err(AppError::InvalidPathfindingConfiguration(_))
+                ),
+                "a walk cost of {weight} must be rejected"
+            );
+        }
+    }
+
+    #[test]
+    fn rejects_a_sample_margin_too_narrow_for_the_segment_length() {
+        let mut config = pathfinding_config();
+        config.pathfinding.segment_length = 256.0;
+        config.pathfinding.sample_margin = 8;
+        assert!(matches!(
+            config.validate(),
+            Err(AppError::InvalidPathfindingConfiguration(_))
+        ));
+    }
+
+    #[test]
+    fn rejects_an_out_of_range_pathfinding_search_budget() {
+        let mut config = pathfinding_config();
+        config.pathfinding.max_search_nodes = 1;
+        assert!(matches!(
+            config.validate(),
+            Err(AppError::InvalidPathfindingConfiguration(_))
+        ));
+
+        let mut config = pathfinding_config();
+        config.pathfinding.search_timeout_ms = 0;
+        assert!(matches!(
+            config.validate(),
+            Err(AppError::InvalidPathfindingConfiguration(_))
+        ));
+    }
+
+    #[test]
+    fn rejects_health_thresholds_outside_the_vanilla_scale() {
         let mut config: Config = toml::from_str(
             r#"
                 [minecraft]
@@ -1608,11 +2124,98 @@ mod tests {
             "#,
         )
         .unwrap();
-        config.killbot.reengage_threshold = config.killbot.heal_threshold - 1.0;
-        assert!(matches!(
-            config.validate(),
-            Err(AppError::InvalidKillbotConfiguration(_))
-        ));
+        assert_eq!(
+            config.killbot.heal_threshold, 8.0,
+            "eat below four hearts by default"
+        );
+        assert_eq!(
+            config.killbot.finisher_health, 8.0,
+            "ignore own health once the target is under four hearts"
+        );
+        for out_of_range in [-1.0, 20.1] {
+            config.killbot.finisher_health = out_of_range;
+            assert!(matches!(
+                config.validate(),
+                Err(AppError::InvalidKillbotConfiguration(_))
+            ));
+        }
+        config.killbot.finisher_health = 0.0;
+        config
+            .validate()
+            .expect("0 is valid -- it disables the finisher rule");
+    }
+
+    #[test]
+    fn rejects_an_out_of_range_attack_cooldown() {
+        let mut config: Config = toml::from_str(
+            r#"
+                [minecraft]
+                server = "localhost"
+                username = "MagicBot"
+                account_mode = "offline"
+                [reconnect]
+                enabled = false
+                delay_seconds = 1
+                maximum_attempts = 1
+                [logging]
+                level = "info"
+            "#,
+        )
+        .unwrap();
+        assert_eq!(
+            config.killbot.attack_cooldown_ms, 0,
+            "the shipped default is the automatic, weapon-accurate cadence"
+        );
+        assert_eq!(
+            config.killbot.attack_cooldown(),
+            None,
+            "0 means automatic, not an instant cooldown"
+        );
+        config.validate().expect("the default must be valid");
+
+        assert!(
+            config.killbot.always_crit_with_sword,
+            "sword swings default to holding out for a critical"
+        );
+        assert_eq!(
+            config.killbot.eat_cooldown_ms, 5000,
+            "one bite, then back to the fight while the regeneration works"
+        );
+        assert_eq!(
+            config.killbot.eat_cooldown(),
+            std::time::Duration::from_millis(5000)
+        );
+        config.killbot.eat_cooldown_ms = 60_001;
+        assert!(
+            matches!(
+                config.validate(),
+                Err(AppError::InvalidKillbotConfiguration(_))
+            ),
+            "an absurd eat cooldown is rejected"
+        );
+        config.killbot.eat_cooldown_ms = 0;
+        config
+            .validate()
+            .expect("0 is valid -- it means chain bites back to back");
+        config.killbot.attack_cooldown_ms = 625;
+        assert_eq!(
+            config.killbot.attack_cooldown(),
+            Some(std::time::Duration::from_millis(625))
+        );
+        config
+            .validate()
+            .expect("an explicit sword-speed cadence is valid");
+
+        for cooldown in [49, 10_001] {
+            config.killbot.attack_cooldown_ms = cooldown;
+            assert!(
+                matches!(
+                    config.validate(),
+                    Err(AppError::InvalidKillbotConfiguration(_))
+                ),
+                "an attack_cooldown_ms of {cooldown} must be rejected"
+            );
+        }
     }
 
     #[test]
@@ -1863,12 +2466,15 @@ mod tests {
             Err(AppError::InvalidLookConfiguration(_))
         ));
         config.look.randomization.horizontal_strength = 0.35;
-        config.look.motion.minimum_yaw_speed = 481.0;
-        assert!(matches!(
-            config.validate(),
-            Err(AppError::InvalidLookConfiguration(_))
-        ));
-        config.look.motion.minimum_yaw_speed = 60.0;
+        config.look.motion.minimum_yaw_speed = config.look.motion.maximum_yaw_speed + 1.0;
+        assert!(
+            matches!(
+                config.validate(),
+                Err(AppError::InvalidLookConfiguration(_))
+            ),
+            "a minimum aim speed above the maximum is nonsense at any scale"
+        );
+        config.look.motion.minimum_yaw_speed = default_minimum_yaw_speed();
         config.look.reaction_delay_max_ms = 5;
         assert!(matches!(
             config.validate(),

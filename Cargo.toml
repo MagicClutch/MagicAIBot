@@ -19,3 +19,13 @@ toml = "0.8"
 tracing = "0.1"
 tracing-subscriber = "0.3"
 uuid = "1"
+
+# Workaround for a rustc ICE on the pinned nightly (1.99.0-nightly,
+# da86f4d07): codegen panics with "not immediate: OperandRef(Uninit ...)" in
+# `rustc_codegen_ssa` while compiling tokio's multi-thread runtime at
+# opt-level 3, which breaks `cargo build --release` outright. Nothing to do
+# with this crate -- it reproduces on a pristine checkout -- and dropping
+# tokio alone to opt-level 1 sidesteps the offending codegen path. Remove
+# this once the toolchain is updated past the bug.
+[profile.release.package.tokio]
+opt-level = 1

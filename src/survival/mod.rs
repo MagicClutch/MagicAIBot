@@ -824,7 +824,7 @@ mod tests {
     }
 
     fn combat() -> CombatController {
-        CombatController::new()
+        CombatController::default()
     }
 
     #[tokio::test]

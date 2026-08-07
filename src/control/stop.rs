@@ -16,7 +16,8 @@
 use crate::{
     combat::KillController, interaction::InteractionController, logging, look::LookController,
     minecraft::client::MinecraftClient, mobs::CombatController, movement::MovementService,
-    navigation::BlockNavigationService, survival::SurvivalController,
+    navigation::BlockNavigationService, pathfinding::PathfindingController,
+    survival::SurvivalController,
 };
 
 use super::EmergencyStop;
@@ -36,6 +37,11 @@ pub struct StopTargets<'a> {
     /// doc comment for why this is separate from `combat` above.
     pub pvp: &'a KillController,
     pub container: &'a crate::container::service::ContainerService,
+    /// Long-distance segmented navigation -- see `crate::pathfinding`. Reset
+    /// before `movement` below hands anything back: a live segment follower
+    /// would otherwise resubmit a waypoint goal on its very next tick,
+    /// walking the bot on after the stop.
+    pub pathfinding: &'a PathfindingController,
     pub survival: &'a SurvivalController,
 }
 
@@ -61,6 +67,10 @@ pub async fn execute(targets: &StopTargets<'_>, emergency: &EmergencyStop) {
     targets.minecraft.clear_current_task().await;
 
     logging::info("Stopping movement");
+    targets
+        .pathfinding
+        .cancel(targets.minecraft, targets.movement)
+        .await;
     targets
         .block_navigation
         .cancel(targets.minecraft, targets.movement)
@@ -162,9 +172,10 @@ mod tests {
             search.clone(),
             block_navigation.clone(),
         );
-        let combat = CombatController::new();
+        let combat = CombatController::default();
         let pvp = KillController::default();
         let container = ContainerService::default();
+        let pathfinding = PathfindingController::new(Default::default(), Default::default());
         let survival = SurvivalController::new(SurvivalConfig::default());
         let emergency = EmergencyStop::new();
         let token_before = emergency.token();
@@ -178,6 +189,7 @@ mod tests {
             combat: &combat,
             pvp: &pvp,
             container: &container,
+            pathfinding: &pathfinding,
             survival: &survival,
         };
         tokio::time::timeout(

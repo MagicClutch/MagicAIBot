@@ -7,8 +7,13 @@
 /// function of its own current health (HP, 0-20 scale -- the same scale
 /// `KillbotConfig::heal_threshold`/`reengage_threshold` use, and the same
 /// scale `BotSnapshot::health` already reports). `crate::combat::executor`
-/// uses this to decide movement/attack/healing/shield behavior; it does
-/// not by itself change anything.
+/// uses this to decide shield behavior and to report the current tier; it
+/// does not by itself change anything.
+///
+/// Note that since `#kill` fights in full-aggression mode (see
+/// `crate::combat::executor`'s module doc comment) none of these tiers ever
+/// means "stop fighting" -- the low ones only mean "block more, and eat
+/// while continuing to press the target".
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub enum CombatMode {
     /// Full pressure: chase, crit, combo.
@@ -16,9 +21,11 @@ pub enum CombatMode {
     Aggressive,
     /// Moderate pressure: fewer unnecessary jumps, more willing to block.
     Balanced,
-    /// Disengage and look for a healing opportunity.
+    /// Still pressing, but eating mid-fight and blocking whenever the
+    /// shield is free.
     Defensive,
-    /// Maximum survival: block often, avoid trades, eat immediately.
+    /// Same as `Defensive`, one tier more urgent -- eat at the first
+    /// opportunity and block whenever in range.
     Critical,
 }
 
@@ -45,9 +52,34 @@ pub fn mode_for_health(health: f64, heal_threshold: f64) -> CombatMode {
     }
 }
 
+/// Whether the bot is hurt enough to eat: a single threshold, checked
+/// against the bot's own health.
+///
+/// There is deliberately no hysteresis or "top up to full" band. Spacing
+/// between bites is `KillbotConfig::eat_cooldown_ms`'s job -- one bite, then
+/// commit to the fight for several seconds -- and stacking a second
+/// mechanism on top of it is what produced a bot that ate its way through a
+/// whole stack of golden apples without swinging. Below the threshold it
+/// eats one; above it, it fights.
+///
+/// Nothing here disengages -- see `crate::combat::executor`; the bot eats
+/// while still chasing and hitting the target.
+pub fn wants_food(health: f64, heal_threshold: f64) -> bool {
+    health < heal_threshold
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn eats_below_the_threshold_and_not_at_or_above_it() {
+        // The default threshold is four hearts.
+        assert!(wants_food(7.9, 8.0));
+        assert!(!wants_food(8.0, 8.0));
+        assert!(!wants_food(20.0, 8.0));
+        assert!(wants_food(0.5, 8.0));
+    }
 
     #[test]
     fn full_health_is_aggressive() {
