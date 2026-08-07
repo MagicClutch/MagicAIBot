@@ -20,6 +20,7 @@ use crate::{
     logging,
     look::LookController,
     minecraft::client::MinecraftClient,
+    movement::MovementService,
 };
 
 #[derive(Clone)]
@@ -82,21 +83,36 @@ impl KillController {
     /// An idle (or already-terminal) controller is a no-op, the same
     /// contract every other controller in this codebase follows -- callers
     /// defensively cancel before starting something new.
-    pub async fn cancel(&self, minecraft: &MinecraftClient, look: &LookController) {
+    ///
+    /// `movement` is taken because a fight cancelled during its approach may
+    /// still hold a pathfinding goal (see `crate::combat::movement`'s
+    /// long-distance handoff); releasing only the raw combat input would
+    /// leave the bot walking to where the target used to be.
+    pub async fn cancel(
+        &self,
+        minecraft: &MinecraftClient,
+        movement: &MovementService,
+        look: &LookController,
+    ) {
         let active = { self.inner.lock().await.snapshot.state == KillState::Running };
         if !active {
             return;
         }
-        executor::stop_all(minecraft, look).await;
+        executor::stop_all(minecraft, movement, look).await;
         let mut inner = self.inner.lock().await;
         inner.snapshot.state = KillState::Cancelled;
         inner.snapshot.failure_reason = None;
         logging::info("Kill task cancelled");
     }
 
-    pub async fn tick(&self, minecraft: &MinecraftClient, look: &LookController) {
+    pub async fn tick(
+        &self,
+        minecraft: &MinecraftClient,
+        movement: &MovementService,
+        look: &LookController,
+    ) {
         let mut inner = self.inner.lock().await;
-        executor::tick(minecraft, look, &mut inner).await;
+        executor::tick(minecraft, movement, look, &mut inner).await;
     }
 }
 
@@ -130,6 +146,13 @@ mod tests {
         )
     }
 
+    fn movement() -> MovementService {
+        MovementService::new(
+            crate::config::MovementConfig::default(),
+            crate::config::MultitaskingConfig::default(),
+        )
+    }
+
     fn look() -> LookController {
         LookController::new(LookConfig::default(), BlockSearchService::new(32, 20, 32))
     }
@@ -143,7 +166,7 @@ mod tests {
     #[tokio::test]
     async fn cancel_on_an_idle_controller_is_a_no_op() {
         let kill = KillController::default();
-        kill.cancel(&minecraft(), &look()).await;
+        kill.cancel(&minecraft(), &movement(), &look()).await;
         assert_eq!(kill.snapshot().await.state, KillState::Created);
     }
 
@@ -158,7 +181,7 @@ mod tests {
     #[tokio::test]
     async fn ticking_an_untouched_controller_does_not_panic() {
         let kill = KillController::default();
-        kill.tick(&minecraft(), &look()).await;
+        kill.tick(&minecraft(), &movement(), &look()).await;
         assert_eq!(kill.snapshot().await.state, KillState::Created);
     }
 }

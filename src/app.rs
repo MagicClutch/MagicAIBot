@@ -1,6 +1,7 @@
 use std::{
     collections::{HashMap, VecDeque},
     path::Path,
+    sync::Mutex,
     time::{Duration, Instant, SystemTime},
 };
 
@@ -402,7 +403,11 @@ async fn await_navigation_terminal(app: &App, input_rx: &mut InputReceiver) -> W
 async fn await_kill_terminal(app: &App, input_rx: &mut InputReceiver) -> WaitOutcome {
     loop {
         app.look.tick(&app.minecraft).await;
-        app.pvp.tick(&app.minecraft, &app.look).await;
+        app.pvp.tick(&app.minecraft, &app.movement, &app.look).await;
+        // A long-range `#kill` approach hands control to the normal
+        // pathfinder (see `crate::combat::executor`), which needs this tick
+        // to refresh its goal and notice arrival just as `/goto` does.
+        app.movement.tick(&app.minecraft, false).await;
         app.survival
             .tick(
                 &app.minecraft,
@@ -475,6 +480,9 @@ async fn wait_tick(
     if let Some(input) = emergency_stop_from_chat(app).await {
         return Some(input);
     }
+    // Answered inline and the wait continues: a status request is not a
+    // reason to interrupt whatever the bot is doing.
+    answer_chat_status_queries(app).await;
     flush_outgoing_chat(&app.minecraft).await;
     let emergency = app.emergency_stop.token();
     tokio::select! {
@@ -500,6 +508,75 @@ async fn wait_tick(
                 }
             }
         },
+    }
+}
+
+/// Parses a `#`-prefixed chat line into a read-only status query.
+///
+/// `None` for anything that isn't one -- an action command, a malformed
+/// command, or ordinary chat -- which is exactly what keeps `#goto` or
+/// `#kill` from starting while another task is already running. Only
+/// queries that cannot touch the bot's task get through here; everything
+/// else stays queued for the normal drain once the task finishes.
+fn chat_status_query(text: &str) -> Option<ConsoleInput> {
+    let command_text = text.trim().strip_prefix('#')?.trim();
+    if command_text.is_empty() {
+        return None;
+    }
+    let input = console::commands::parse_input(&format!("/{command_text}")).ok()?;
+    match &input {
+        ConsoleInput::Command(command) if is_read_only_query(command) => Some(input),
+        _ => None,
+    }
+}
+
+/// Answers status requests typed in chat *while a task is running*.
+///
+/// Every blocking command wait in this file is inline inside the single
+/// `select!` loop in `App::run`, so `App::tick_chat_commands` -- the normal
+/// chat drain -- cannot run for as long as a `#goto`, `#kill` or `#get` is
+/// in progress. Without this, asking the bot for its inventory mid-task got
+/// no answer until the task ended, which for a long trip could be minutes.
+///
+/// Deliberately narrow: it takes only messages that parse to a *read-only*
+/// query ([`chat_status_query`]) out of the incoming buffer and answers them
+/// through [`App::handle_inert_input`], the same executor the local console
+/// uses for queries during a wait. Anything that would start, redirect or
+/// stop work is left untouched in the buffer, so two actions can never run
+/// at once -- an in-game `#stop` is the one exception, and it has its own
+/// path (see [`emergency_stop_from_chat`]).
+///
+/// Access control and the per-player rate limit both still apply, exactly as
+/// they do for chat commands handled the normal way.
+async fn answer_chat_status_queries(app: &App) {
+    while let Some(chat) = app
+        .minecraft
+        .take_matching_incoming_player_chat(|chat| {
+            chat.kind == crate::minecraft::world_state::ChatMessageKind::Player
+                && chat_status_query(&chat.text).is_some()
+        })
+        .await
+    {
+        let Some(input) = chat_status_query(&chat.text) else {
+            continue;
+        };
+        let Some(sender) = chat.sender else {
+            continue;
+        };
+        if !app.chat_access_allowed(&sender) {
+            logging::warning(format!(
+                "[Chat] Status request from {sender} rejected: access denied"
+            ));
+            continue;
+        }
+        if !app.consume_chat_rate_limit(&sender, chat.sender_uuid) {
+            logging::warning(format!(
+                "[Chat] Status request from {sender} rejected: rate limited"
+            ));
+            continue;
+        }
+        logging::info(format!("[Chat] {sender} ran: {}", chat.text.trim()));
+        app.handle_inert_input(&input).await;
     }
 }
 
@@ -576,7 +653,12 @@ pub struct App {
     hotbar_equipment: HotbarEquipmentService,
     survival: SurvivalController,
     emergency_stop: EmergencyStop,
-    chat_rate_limits: HashMap<String, VecDeque<Instant>>,
+    /// Per-player chat-command rate limiter. Behind a lock rather than a
+    /// plain field because it is consumed from two places now: the normal
+    /// `&mut self` chat drain, and the read-only query path that answers
+    /// status requests mid-task through a shared `&App` (see
+    /// [`answer_chat_status_queries`]).
+    chat_rate_limits: Mutex<HashMap<String, VecDeque<Instant>>>,
     session_ready: bool,
     started_at: Instant,
 }
@@ -663,7 +745,7 @@ impl App {
             ),
             survival: SurvivalController::new(config.survival.clone()),
             emergency_stop: EmergencyStop::new(),
-            chat_rate_limits: HashMap::new(),
+            chat_rate_limits: Mutex::new(HashMap::new()),
             session_ready: false,
             config,
             shutdown: CancellationToken::new(),
@@ -712,7 +794,7 @@ impl App {
                             self.session_ready = false;
                             self.interaction.cancel(&self.minecraft, &self.movement, &self.look).await;
                             self.combat.cancel(&self.minecraft, &self.movement, &self.look).await;
-                            self.pvp.cancel(&self.minecraft, &self.look).await;
+                            self.pvp.cancel(&self.minecraft, &self.movement, &self.look).await;
                             self.pathfinding.cancel(&self.minecraft, &self.movement).await;
                             self.block_navigation.cancel(&self.minecraft, &self.movement).await;
                             self.look.cancel().await;
@@ -761,7 +843,7 @@ impl App {
                     self.block_navigation.tick(&self.minecraft, &self.movement).await;
                     self.interaction.tick(&self.minecraft, &self.movement, &self.look).await;
                     self.combat.tick(&self.minecraft, &self.movement, &self.look).await;
-                    self.pvp.tick(&self.minecraft, &self.look).await;
+                    self.pvp.tick(&self.minecraft, &self.movement, &self.look).await;
                     self.container.tick(&self.minecraft, &self.movement, &self.block_navigation, &self.look).await;
                     self.equipment.tick(&self.minecraft).await;
                     self.hotbar_equipment.tick(&self.minecraft).await;
@@ -808,7 +890,9 @@ impl App {
         self.combat
             .cancel(&self.minecraft, &self.movement, &self.look)
             .await;
-        self.pvp.cancel(&self.minecraft, &self.look).await;
+        self.pvp
+            .cancel(&self.minecraft, &self.movement, &self.look)
+            .await;
         let _ = self.movement.stop(&self.minecraft).await;
         self.minecraft.disconnect().await?;
         if let Some(task) = console_task {
@@ -863,7 +947,9 @@ impl App {
                                 | ConsoleCommand::StopMovement
                         )
                     {
-                        self.pvp.cancel(&self.minecraft, &self.look).await;
+                        self.pvp
+                            .cancel(&self.minecraft, &self.movement, &self.look)
+                            .await;
                     }
                     // Exactly the same hazard for long-distance navigation
                     // (`crate::pathfinding`), which also keeps ticking in the
@@ -1140,7 +1226,9 @@ impl App {
                             self.combat
                                 .cancel(&self.minecraft, &self.movement, &self.look)
                                 .await;
-                            self.pvp.cancel(&self.minecraft, &self.look).await;
+                            self.pvp
+                                .cancel(&self.minecraft, &self.movement, &self.look)
+                                .await;
                             self.block_navigation
                                 .cancel(&self.minecraft, &self.movement)
                                 .await;
@@ -1167,7 +1255,9 @@ impl App {
                             self.combat
                                 .cancel(&self.minecraft, &self.movement, &self.look)
                                 .await;
-                            self.pvp.cancel(&self.minecraft, &self.look).await;
+                            self.pvp
+                                .cancel(&self.minecraft, &self.movement, &self.look)
+                                .await;
                             self.block_navigation
                                 .cancel(&self.minecraft, &self.movement)
                                 .await;
@@ -1193,7 +1283,9 @@ impl App {
                             self.combat
                                 .cancel(&self.minecraft, &self.movement, &self.look)
                                 .await;
-                            self.pvp.cancel(&self.minecraft, &self.look).await;
+                            self.pvp
+                                .cancel(&self.minecraft, &self.movement, &self.look)
+                                .await;
                             self.block_navigation
                                 .cancel(&self.minecraft, &self.movement)
                                 .await;
@@ -2127,18 +2219,18 @@ impl App {
                 .any(|name| name.eq_ignore_ascii_case(player_name))
     }
 
-    fn consume_chat_rate_limit(
-        &mut self,
-        player_name: &str,
-        player_uuid: Option<uuid::Uuid>,
-    ) -> bool {
+    fn consume_chat_rate_limit(&self, player_name: &str, player_uuid: Option<uuid::Uuid>) -> bool {
         let limit = &self.config.chat_commands.rate_limit;
         if !limit.enabled {
             return true;
         }
         let key = player_uuid.map_or_else(|| player_name.to_ascii_lowercase(), |id| id.to_string());
         let now = Instant::now();
-        let entries = self.chat_rate_limits.entry(key).or_default();
+        let mut limits = self
+            .chat_rate_limits
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let entries = limits.entry(key).or_default();
         while entries
             .front()
             .is_some_and(|at| now.duration_since(*at) >= Duration::from_secs(limit.window_seconds))
@@ -3855,5 +3947,108 @@ mod drop_tests {
             drop_insufficient_error("diamond", 5, 3),
             AppError::InsufficientItemsForDrop { item, have: 3, need: 5 } if item == "diamond"
         ));
+    }
+}
+
+#[cfg(test)]
+mod concurrent_status_tests {
+    use super::*;
+
+    /// Everything a player can usefully ask for while the bot is busy.
+    const STATUS_QUERIES: &[&str] = &[
+        "#inventory",
+        "#status",
+        "#where",
+        "#health",
+        "#players",
+        "#entities",
+        "#entities 32",
+        "#path-status",
+        "#movement",
+        "#lookstatus",
+        "#interactionstatus",
+        "#container-status",
+        "#help",
+    ];
+
+    /// Everything that starts, redirects or stops work. None of these may
+    /// run while another task is in progress -- that is the whole point of
+    /// the gate.
+    const ACTIONS: &[&str] = &[
+        "#goto 100 64 -20",
+        "#goto Alex",
+        "#kill Alex",
+        "#follow Alex",
+        "#get diamond 5",
+        "#mine 10 20 30",
+        "#break 1 2 3",
+        "#place stone",
+        "#look 1 2 3",
+        "#drop diamond 1",
+        "#equip",
+        "#stop",
+        "#stopmovement",
+        "#quit",
+    ];
+
+    #[test]
+    fn every_status_request_is_answerable_while_busy() {
+        for text in STATUS_QUERIES {
+            assert!(
+                chat_status_query(text).is_some(),
+                "{text} should be answerable mid-task"
+            );
+        }
+    }
+
+    #[test]
+    fn no_action_command_can_start_while_another_task_runs() {
+        for text in ACTIONS {
+            assert!(
+                chat_status_query(text).is_none(),
+                "{text} must not run concurrently"
+            );
+        }
+    }
+
+    #[test]
+    fn the_two_sets_are_exactly_what_the_dispatcher_agrees_is_read_only() {
+        // `chat_status_query` and `is_read_only_query` must not drift apart:
+        // the first decides what runs concurrently, the second decides what
+        // is safe to run without cancelling a fight first.
+        for text in STATUS_QUERIES {
+            let Some(ConsoleInput::Command(command)) = chat_status_query(text) else {
+                panic!("{text} did not parse as a command");
+            };
+            assert!(is_read_only_query(&command), "{text}");
+        }
+    }
+
+    #[test]
+    fn ordinary_chat_is_never_mistaken_for_a_command() {
+        for text in [
+            "hello there",
+            "inventory",
+            "the # symbol mid sentence",
+            "",
+            "   ",
+            "#",
+            "#   ",
+        ] {
+            assert!(chat_status_query(text).is_none(), "{text:?}");
+        }
+    }
+
+    #[test]
+    fn a_malformed_status_request_is_ignored_rather_than_guessed_at() {
+        for text in ["#entities notanumber", "#outputmode nonsense mode"] {
+            assert!(chat_status_query(text).is_none(), "{text}");
+        }
+    }
+
+    #[test]
+    fn surrounding_whitespace_does_not_stop_a_request_being_answered() {
+        assert!(chat_status_query("  #inventory  ").is_some());
+        assert!(chat_status_query("#  inventory").is_some());
     }
 }

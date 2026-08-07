@@ -981,6 +981,21 @@ impl MinecraftClient {
         Ok(())
     }
 
+    /// Holds or releases sneak. Used by `crate::combat::movement` for edge
+    /// safety; harmless to call with the value it already has, since Azalea
+    /// only sends a packet when the state actually changes.
+    pub(crate) async fn set_sneaking(&self, sneaking: bool) -> Result<(), AppError> {
+        let client = self
+            .current_client
+            .lock()
+            .await
+            .clone()
+            .ok_or(AppError::MovementUnavailable)?;
+        client
+            .set_crouching(sneaking)
+            .map_err(|_| AppError::MovementUnavailable)
+    }
+
     /// Which hotbar slot the *server* has been told the bot is holding, as
     /// opposed to the one the bot has locally decided on
     /// ([`Self::select_hotbar_slot`] updates that immediately, but the

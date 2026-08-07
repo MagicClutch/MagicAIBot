@@ -30,8 +30,11 @@
 //! - [`state`] -- plain state/snapshot data, including the
 //!   [`state::CombatPhase`] state machine.
 //! - [`targeting`] -- pure distance/prediction/staleness math.
-//! - [`movement`] -- pure strafe/approach/sprint decisions (combat's own
-//!   movement model).
+//! - [`movement`] -- the combat-only continuous steering controller (see
+//!   its own module doc comment for why `#kill` does not share the
+//!   project's navigation stack).
+//! - [`terrain_probe`] -- lightweight local obstacle/hazard reading for
+//!   that controller.
 //! - [`crits`] -- pure attack-cooldown and critical-hit-timing decisions.
 //! - [`shield_break`] -- pure axe-switch policy for breaking the *target's*
 //!   shield.
@@ -54,5 +57,6 @@ pub mod movement;
 pub mod shield_break;
 pub mod state;
 pub mod targeting;
+pub mod terrain_probe;
 
 pub use kill::KillController;

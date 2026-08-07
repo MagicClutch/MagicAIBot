@@ -19,15 +19,28 @@
 //! you swing or sprint -- so an eat that is never allowed to finish would
 //! heal nothing at all.
 //!
-//! Known limitation, stated plainly rather than left implicit: this does
-//! not do any terrain/hazard awareness (avoiding lava, cliffs, getting
-//! trapped) -- combat movement is a straight line toward/away from the
-//! target with no block queries in the loop at all. A pathfinding-aware
-//! version of that would need to query terrain every tick the way
-//! `crate::navigation` already does for normal movement, which risks
-//! re-coupling combat back to the pathfinder this module deliberately
-//! stays independent of (see `crate::combat`'s module doc comment). Out of
-//! scope here; noted for anyone picking this up next.
+//! # Who is driving the bot
+//!
+//! Two systems, never both at once, split by distance:
+//!
+//! - **Beyond `engage_range`** the project's normal pathfinder has it
+//!   ([`approach_target`]). Getting to a fight fifty blocks away is a
+//!   navigation problem -- terrain, water, doors, cliffs -- and that is
+//!   exactly what `crate::movement`/`crate::pathfinding` are for.
+//! - **Inside it** `crate::combat::movement`'s continuous steering
+//!   controller has it. There is nothing to path around at two blocks, and
+//!   a route recomputed to block centres is the opposite of what a fight
+//!   needs.
+//!
+//! The handover stops whichever system is losing control before the other
+//! starts, so they can never write conflicting movement input in the same
+//! tick, and it is sticky in both directions so a target loitering on the
+//! boundary cannot flip the bot back and forth.
+//!
+//! Terrain awareness in the close-range half is deliberately *local* --
+//! [`probe_hazards`] samples a few blocks around the bot each tick and hands
+//! the combat controller a push-away vector, nothing more. It never invokes
+//! a search for a combat adjustment.
 
 use std::time::{Duration, Instant};
 
@@ -37,8 +50,10 @@ use crate::{
     combat::{
         crits, defense, heal,
         health::{self, CombatMode},
-        movement,
-        movement::StrafePattern,
+        movement::{
+            self, CombatMovementController, LocalHazards, MovementCommand, MovementSnapshot,
+            MovementTuning, Vec2,
+        },
         shield_break, state,
         targeting::{self, PREDICTION_LEAD_SECONDS},
     },
@@ -47,14 +62,15 @@ use crate::{
     interaction::tool_selection::{ToolCategory, category},
     logging,
     look::{LookController, LookTarget},
-    minecraft::client::MinecraftClient,
+    minecraft::{client::MinecraftClient, world_state::MovementStatus},
+    movement::{MovementService, NavigationMode},
 };
 
-/// How briefly sprint is released right after an attack -- the same
-/// "sprint reset" (a w-tap) real PvP players use to regain the small
-/// positioning/knockback edge of a freshly-started sprint rather than one
-/// held continuously through the hit.
-const SPRINT_RESET_DURATION: Duration = Duration::from_millis(120);
+/// How far the target may drift before the approach re-issues its
+/// pathfinding goal. Re-submitting every tick would restart Azalea's path
+/// computation before it ever finishes -- the same tolerance
+/// `mobs::combat` uses when chasing a mob, for the same reason.
+const APPROACH_GOAL_DRIFT: f64 = 2.0;
 
 /// Reserved hotbar slot (0-indexed, the 9th/last slot) `#kill` swaps its
 /// weapon into when the best sword/axe isn't already somewhere in the
@@ -113,9 +129,17 @@ struct PendingFood {
 pub(crate) struct Inner {
     pub(crate) snapshot: state::KillSnapshot,
     config: KillbotConfig,
-    strafe_pattern: StrafePattern,
-    strafe_since: Instant,
-    strafe_interval: Duration,
+    /// Whether the project's normal pathfinder is currently driving the
+    /// approach, rather than the combat movement controller. See
+    /// `movement::pathfinder_should_drive`.
+    approaching: bool,
+    /// Where the approach's last pathfinding goal was aimed, so it is only
+    /// re-issued once the target has actually moved.
+    approach_goal: Option<crate::minecraft::world_state::PositionSnapshot>,
+    /// The combat movement controller -- see `crate::combat::movement`.
+    /// Owns every piece of state that used to live loose in here as strafe
+    /// timers: orbit pattern, momentum, and target motion history.
+    movement: CombatMovementController,
     rng: crate::look::aim_point::SeededRng,
     last_attack: Option<Instant>,
     last_jump: Option<Instant>,
@@ -158,9 +182,6 @@ pub(crate) struct Inner {
     /// successful equipment read. Only consulted when the user hasn't set an
     /// explicit `attack_cooldown_ms` -- see [`attack_cooldown`].
     held_weapon_cooldown: Option<Duration>,
-    /// Whether that weapon is a sword -- the only one
-    /// `always_crit_with_sword` applies to.
-    held_weapon_is_sword: bool,
     /// When the bot first held back a ready swing waiting to become a crit.
     /// Cleared the moment it swings. Bounds the hold so a bot that cannot
     /// leave the ground still attacks -- see
@@ -177,9 +198,9 @@ impl Inner {
         Self {
             snapshot: state::KillSnapshot::default(),
             config,
-            strafe_pattern: StrafePattern::default(),
-            strafe_since: Instant::now(),
-            strafe_interval: movement::STRAFE_FLIP_INTERVAL,
+            approaching: false,
+            approach_goal: None,
+            movement: CombatMovementController::new(),
             rng: crate::look::aim_point::SeededRng::new(seed),
             last_attack: None,
             last_jump: None,
@@ -196,7 +217,6 @@ impl Inner {
             finishing_logged: false,
             shield_raised: false,
             held_weapon_cooldown: None,
-            held_weapon_is_sword: false,
             crit_hold_since: None,
             target_was_blocking: false,
         }
@@ -208,9 +228,9 @@ impl Inner {
     /// timers, attack cooldowns, or "already logged" flags from a
     /// previous fight.
     pub(crate) fn reset_for_new_fight(&mut self) {
-        self.strafe_pattern = StrafePattern::default();
-        self.strafe_since = Instant::now();
-        self.strafe_interval = movement::STRAFE_FLIP_INTERVAL;
+        self.movement.reset(&mut self.rng);
+        self.approaching = false;
+        self.approach_goal = None;
         self.last_attack = None;
         self.last_jump = None;
         self.sprint_released_at = None;
@@ -225,7 +245,6 @@ impl Inner {
         self.finishing_logged = false;
         self.shield_raised = false;
         self.held_weapon_cooldown = None;
-        self.held_weapon_is_sword = false;
         self.crit_hold_since = None;
         self.target_was_blocking = false;
         // `start()` only reaches this point after already confirming the
@@ -235,7 +254,12 @@ impl Inner {
     }
 }
 
-pub(crate) async fn tick(minecraft: &MinecraftClient, look: &LookController, inner: &mut Inner) {
+pub(crate) async fn tick(
+    minecraft: &MinecraftClient,
+    movement: &MovementService,
+    look: &LookController,
+    inner: &mut Inner,
+) {
     if inner.snapshot.state != state::KillState::Running {
         return;
     }
@@ -259,21 +283,21 @@ pub(crate) async fn tick(minecraft: &MinecraftClient, look: &LookController, inn
     // goes through the same "temporarily missing" reacquisition path as a
     // failed live-state query below.
     let Some(player) = world.find_player_by_name(&name) else {
-        disconnect(minecraft, look, inner, &name).await;
+        disconnect(minecraft, movement, look, inner, &name).await;
         return;
     };
     let Some(target_position) = player.position else {
-        handle_unresolved_target(minecraft, look, inner, &name).await;
+        handle_unresolved_target(minecraft, movement, look, inner, &name).await;
         return;
     };
     let target_uuid = player.uuid;
 
     let Ok(status) = minecraft.player_combat_status(target_uuid).await else {
-        handle_unresolved_target(minecraft, look, inner, &name).await;
+        handle_unresolved_target(minecraft, movement, look, inner, &name).await;
         return;
     };
     if !status.alive {
-        eliminate(minecraft, look, inner, &name).await;
+        eliminate(minecraft, movement, look, inner, &name).await;
         return;
     }
 
@@ -299,7 +323,15 @@ pub(crate) async fn tick(minecraft: &MinecraftClient, look: &LookController, inn
     let distance = targeting::distance(bot_position, predicted);
 
     if distance > inner.config.max_chase_distance {
-        abort(minecraft, look, inner, &name, "target out of chase range").await;
+        abort(
+            minecraft,
+            movement,
+            look,
+            inner,
+            &name,
+            "target out of chase range",
+        )
+        .await;
         return;
     }
 
@@ -339,15 +371,48 @@ pub(crate) async fn tick(minecraft: &MinecraftClient, look: &LookController, inn
     // obstacles, tracking the target) keeps running underneath it.
     let eating = apply_eating(minecraft, inner, &world.inventory, wants_food, finishing).await;
 
-    apply_movement(
-        minecraft,
-        inner,
+    // Long distance is the pathfinder's problem, close range is the combat
+    // controller's -- see `movement::pathfinder_should_drive`. Only one of
+    // them ever holds the controls, and handing over stops the other, so
+    // they can never fight for the same input.
+    let approaching = crate::combat::movement::pathfinder_should_drive(
         distance,
-        world.bot.on_ground.unwrap_or(true),
-        world.bot.horizontal_collision.unwrap_or(false),
-        !eating,
-    )
-    .await;
+        inner.config.engage_range,
+        inner.approaching,
+    );
+    if approaching {
+        if !inner.approaching {
+            inner.approaching = true;
+            inner.approach_goal = None;
+            // Release the raw combat input before the pathfinder takes over.
+            let _ = minecraft
+                .set_combat_walk(crate::combat::movement::CombatWalk::None, false)
+                .await;
+            debug_transition(inner, "Closing distance");
+        }
+        approach_target(minecraft, movement, inner, target_position).await;
+    } else {
+        if inner.approaching {
+            inner.approaching = false;
+            inner.approach_goal = None;
+            // Give the pathfinder back before driving raw input, or the two
+            // will overwrite each other's movement every tick.
+            let _ = movement.stop(minecraft).await;
+            inner.movement.reset(&mut inner.rng);
+            debug_transition(inner, "Engaging in melee");
+        }
+        apply_movement(
+            minecraft,
+            inner,
+            bot_position,
+            target_position,
+            world.bot.yaw.unwrap_or_default(),
+            world.bot.on_ground.unwrap_or(true),
+            world.bot.horizontal_collision.unwrap_or(false),
+            !eating,
+        )
+        .await;
+    }
     if !eating {
         apply_weapon_selection(
             minecraft,
@@ -407,11 +472,12 @@ fn compute_active_phase(distance: f64) -> state::CombatPhase {
 /// temporarily-unloaded target).
 async fn disconnect(
     minecraft: &MinecraftClient,
+    movement: &MovementService,
     look: &LookController,
     inner: &mut Inner,
     name: &str,
 ) {
-    stop_all(minecraft, look).await;
+    stop_all(minecraft, movement, look).await;
     inner.snapshot.state = state::KillState::Failed;
     inner.snapshot.phase = state::CombatPhase::Abort;
     inner.snapshot.failure_reason = Some(format!("Target lost: {name} (disconnected)"));
@@ -429,6 +495,7 @@ async fn disconnect(
 /// tracking gap doesn't end the fight.
 async fn handle_unresolved_target(
     minecraft: &MinecraftClient,
+    movement: &MovementService,
     look: &LookController,
     inner: &mut Inner,
     name: &str,
@@ -437,7 +504,7 @@ async fn handle_unresolved_target(
         .last_seen_at
         .is_none_or(|last_seen| targeting::is_stale(last_seen.elapsed().as_secs_f64()));
     if stale {
-        lose_target(minecraft, look, inner, name).await;
+        lose_target(minecraft, movement, look, inner, name).await;
         return;
     }
     let _ = minecraft
@@ -472,37 +539,174 @@ async fn track_aim(
 /// `allow_sprint` is false only while a bite is in progress -- vanilla
 /// cancels item use the instant you start sprinting, so the bot closes the
 /// gap at a walk for those ~1.8 seconds rather than losing the food.
+/// One tick of combat movement: builds the controller's view of the fight,
+/// runs it, and dispatches the resulting key presses.
+///
+/// `allow_sprint` is false while eating -- sprinting cancels a vanilla bite
+/// -- and is the one input the controller doesn't decide for itself.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "one call site, and each argument is an independent reading of               the same tick; bundling them would only rebuild the               `MovementSnapshot` this already assembles"
+)]
 async fn apply_movement(
     minecraft: &MinecraftClient,
     inner: &mut Inner,
-    distance: f64,
+    bot_position: crate::minecraft::world_state::PositionSnapshot,
+    target_position: crate::minecraft::world_state::PositionSnapshot,
+    camera_yaw: f32,
     on_ground: bool,
     horizontal_collision: bool,
     allow_sprint: bool,
 ) {
-    if movement::should_flip_strafe(inner.strafe_since.elapsed(), inner.strafe_interval) {
-        inner.strafe_pattern = movement::next_strafe_pattern(inner.strafe_pattern, &mut inner.rng);
-        inner.strafe_since = Instant::now();
-        inner.strafe_interval = movement::next_flip_interval(&mut inner.rng);
-    }
-    let mut decision = movement::decide_movement(distance, inner.strafe_pattern);
-    if !inner.config.strafe_enabled {
-        decision.strafe = None;
-    }
-    let sprint_reset_active = inner.config.sprint_reset_enabled
-        && inner
-            .sprint_released_at
-            .is_some_and(|released_at| released_at.elapsed() < SPRINT_RESET_DURATION);
-    let sprint = decision.sprint && !sprint_reset_active && allow_sprint;
+    let hazards = probe_hazards(minecraft, inner, bot_position, target_position).await;
+    let tuning = movement_tuning(inner);
+    let snapshot = MovementSnapshot {
+        bot: Vec2::of(bot_position),
+        target: Vec2::of(target_position),
+        on_ground,
+        horizontal_collision,
+        camera_yaw,
+        hazards,
+        now: Instant::now(),
+    };
+    let Inner {
+        movement: controller,
+        rng,
+        ..
+    } = inner;
+    let MovementCommand {
+        walk,
+        sprint,
+        jump,
+        sneak,
+    } = controller.update(snapshot, &tuning, rng);
+
     let _ = minecraft
-        .set_combat_walk(decision.walk_direction(), sprint)
+        .set_combat_walk(walk, sprint && allow_sprint)
         .await;
-    // This bot's own raw movement has no other terrain awareness (see this
-    // module's doc comment) -- without an explicit jump here, a single
-    // block-high step, stair, or fence in the way would leave it pushing
-    // uselessly against it forever instead of chasing.
-    if movement::should_jump_over_obstacle(decision.forward, on_ground, horizontal_collision) {
+    if jump {
         let _ = minecraft.combat_jump_once().await;
+    }
+    let _ = minecraft.set_sneaking(sneak).await;
+}
+
+/// Walks toward a distant target with the project's normal pathfinding,
+/// exactly as `/goto` would -- terrain, water and cliffs included.
+///
+/// Uses `goto_for_block_navigation` rather than `goto` so the movement layer
+/// stays quiet: this is one leg of a fight, not a user-issued trip, and it
+/// would otherwise print a "Going to" line every time the target moved two
+/// blocks.
+async fn approach_target(
+    minecraft: &MinecraftClient,
+    movement: &MovementService,
+    inner: &mut Inner,
+    target_position: crate::minecraft::world_state::PositionSnapshot,
+) {
+    let snapshot = movement.snapshot().await;
+    let drifted = inner.approach_goal.is_none_or(|previous| {
+        targeting::distance(previous, target_position) > APPROACH_GOAL_DRIFT
+    });
+    // Also re-issue if the movement layer has finished or given up on the
+    // last goal: a chase is not over just because one leg of it completed.
+    let idle = snapshot.status != MovementStatus::MovingToPosition;
+    if !drifted && !idle {
+        return;
+    }
+    if movement
+        .goto_for_block_navigation(minecraft, target_position, NavigationMode::AllowMining)
+        .await
+        .is_ok()
+    {
+        inner.approach_goal = Some(target_position);
+    }
+}
+
+fn debug_transition(inner: &Inner, message: &str) {
+    if inner.snapshot.state == state::KillState::Running {
+        logging::info(message);
+    }
+}
+
+/// Half-extent of the terrain sample taken around the bot each tick, in
+/// blocks. Small on purpose: this is local obstacle avoidance for a fight,
+/// not pathfinding, and the whole point is that it never invokes the
+/// pathfinder for a combat adjustment.
+const HAZARD_PROBE_RADIUS: i32 = 3;
+/// Vertical extent of that sample: enough to see a step up, a head-height
+/// obstruction, and a drop worth not walking off.
+const HAZARD_PROBE_HEIGHT: i32 = 3;
+
+/// Looks at the blocks immediately around the bot and turns them into the
+/// push-away vector and stop flags the movement controller consumes.
+///
+/// Reuses `crate::pathfinding::terrain`'s classification -- solid, lava,
+/// hazard, climbable -- so combat and navigation agree on what a dangerous
+/// block is, but shares none of its search machinery: this is one small
+/// sample and a handful of comparisons per tick, with no A*, no cache, and
+/// no allocation beyond the sample itself.
+///
+/// Returns "clear" whenever the terrain can't be read. Combat movement has
+/// always been terrain-blind, so failing open leaves the bot exactly as it
+/// was rather than freezing it.
+async fn probe_hazards(
+    minecraft: &MinecraftClient,
+    inner: &Inner,
+    bot_position: crate::minecraft::world_state::PositionSnapshot,
+    target_position: crate::minecraft::world_state::PositionSnapshot,
+) -> LocalHazards {
+    use crate::pathfinding::grid::GridBounds;
+
+    let feet = bot_position.block();
+    let bounds = GridBounds {
+        min: crate::minecraft::world_state::BlockPosition {
+            x: feet.x - HAZARD_PROBE_RADIUS,
+            y: feet.y - HAZARD_PROBE_HEIGHT,
+            z: feet.z - HAZARD_PROBE_RADIUS,
+        },
+        max: crate::minecraft::world_state::BlockPosition {
+            x: feet.x + HAZARD_PROBE_RADIUS + 1,
+            y: feet.y + HAZARD_PROBE_HEIGHT + 1,
+            z: feet.z + HAZARD_PROBE_RADIUS + 1,
+        },
+    };
+    let Ok(grid) = minecraft.sample_terrain(bounds).await else {
+        return LocalHazards::default();
+    };
+    if grid.known_cells() == 0 {
+        return LocalHazards::default();
+    }
+    crate::combat::terrain_probe::evaluate(
+        &grid,
+        feet,
+        Vec2::of(bot_position),
+        Vec2::of(target_position),
+        inner.movement.heading(),
+    )
+}
+
+/// Translates the user's `[killbot]` settings into the movement
+/// controller's own tuning.
+fn movement_tuning(inner: &Inner) -> MovementTuning {
+    let defaults = MovementTuning::default();
+    MovementTuning {
+        band: movement::DistanceBand {
+            preferred_min: inner.config.preferred_range.min(inner.config.attack_range),
+            preferred_max: inner
+                .config
+                .preferred_range
+                .max(defaults.band.preferred_max)
+                .min(inner.config.attack_range),
+            ..defaults.band
+        },
+        lead_seconds: if inner.config.prediction_enabled {
+            defaults.lead_seconds
+        } else {
+            0.0
+        },
+        strafe_enabled: inner.config.strafe_enabled,
+        sprint_reset_enabled: inner.config.sprint_reset_enabled,
+        ..defaults
     }
 }
 
@@ -708,9 +912,9 @@ async fn apply_weapon_selection(
     // this function is about to equip: the swap can fail, and swinging on
     // the clock of a weapon the bot isn't holding is exactly the
     // partial-charge damage loss the automatic cadence exists to avoid.
-    let held_id = current.map(|item| item.item_id.as_str());
-    inner.held_weapon_cooldown = Some(crits::weapon_cooldown(held_id));
-    inner.held_weapon_is_sword = crits::is_sword(held_id);
+    inner.held_weapon_cooldown = Some(crits::weapon_cooldown(
+        current.map(|item| item.item_id.as_str()),
+    ));
     let sword_available = tools::best_candidate(
         ToolRankingMode::Score,
         ToolCategory::Sword,
@@ -828,11 +1032,11 @@ async fn apply_attack(
     }
     // Ready, on the ground, and no crit set up -- the pre-jump was on its
     // own retry spacing, or the bot only just came into range. With
-    // `always_crit_with_sword`, hold the swing and jump for it rather than
-    // taking a flat hit worth two thirds as much.
+    // `always_crit`, hold the swing and jump for it rather than taking a
+    // flat hit worth two thirds as much. Applies to whatever is in hand: an
+    // axe's longer cooldown makes the hold cheaper, not less worthwhile.
     if inner.config.crit_enabled
-        && inner.config.always_crit_with_sword
-        && inner.held_weapon_is_sword
+        && inner.config.always_crit
         && crits::should_force_crit_jump(
             on_ground,
             within_attack_range,
@@ -881,11 +1085,10 @@ async fn swing(
     inner.sprint_released_at = Some(now);
     inner.snapshot.hits_landed += 1;
     inner.snapshot.phase = state::CombatPhase::Attack;
-    // Combo pressure: circle noticeably faster right after landing a hit
-    // instead of settling back into the lazier baseline cadence -- see
-    // `movement::COMBO_STRAFE_FLIP_INTERVAL`'s doc comment.
-    inner.strafe_interval = movement::COMBO_STRAFE_FLIP_INTERVAL;
-    inner.strafe_since = now;
+    // Sprint reset and combo pressure both live in the movement controller:
+    // it drops sprint for a moment without releasing the keys, and tightens
+    // the orbit while the combo is live.
+    inner.movement.note_attack(now);
     if is_crit {
         inner.snapshot.crits_landed += 1;
         logging::progress("Critical hit landed");
@@ -925,11 +1128,12 @@ async fn apply_defense(
 /// own scope rather than round-tripping it through this snapshot.
 async fn lose_target(
     minecraft: &MinecraftClient,
+    movement: &MovementService,
     look: &LookController,
     inner: &mut Inner,
     name: &str,
 ) {
-    stop_all(minecraft, look).await;
+    stop_all(minecraft, movement, look).await;
     inner.snapshot.state = state::KillState::Failed;
     inner.snapshot.phase = state::CombatPhase::Abort;
     inner.snapshot.failure_reason = Some(format!("Target lost: {name}"));
@@ -941,12 +1145,13 @@ async fn lose_target(
 /// `App::await_kill_terminal`, ultimately logged) says why.
 async fn abort(
     minecraft: &MinecraftClient,
+    movement: &MovementService,
     look: &LookController,
     inner: &mut Inner,
     name: &str,
     reason: &str,
 ) {
-    stop_all(minecraft, look).await;
+    stop_all(minecraft, movement, look).await;
     inner.snapshot.state = state::KillState::Failed;
     inner.snapshot.phase = state::CombatPhase::Abort;
     inner.snapshot.failure_reason = Some(format!("Target lost: {name} ({reason})"));
@@ -954,11 +1159,12 @@ async fn abort(
 
 async fn eliminate(
     minecraft: &MinecraftClient,
+    movement: &MovementService,
     look: &LookController,
     inner: &mut Inner,
     name: &str,
 ) {
-    stop_all(minecraft, look).await;
+    stop_all(minecraft, movement, look).await;
     inner.snapshot.state = state::KillState::Completed;
     inner.snapshot.phase = state::CombatPhase::Finish;
     logging::success(format!("Target eliminated: {name}"));
@@ -967,10 +1173,17 @@ async fn eliminate(
 /// Releases raw movement input, any raised shield, and the camera --
 /// shared by every terminal transition (`lose_target`, `abort`,
 /// `eliminate`, `disconnect`) and by `kill::KillController::cancel`.
-pub(crate) async fn stop_all(minecraft: &MinecraftClient, look: &LookController) {
+pub(crate) async fn stop_all(
+    minecraft: &MinecraftClient,
+    movement_service: &MovementService,
+    look: &LookController,
+) {
     let _ = minecraft
         .set_combat_walk(movement::CombatWalk::None, false)
         .await;
+    // Whichever system was driving, both are released: the raw input above,
+    // and the pathfinder here if the fight ended during a long approach.
+    let _ = movement_service.stop(minecraft).await;
     let _ = minecraft.release_use_item().await;
     look.cancel().await;
     restore_weapon(minecraft).await;

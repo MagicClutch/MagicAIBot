@@ -541,18 +541,19 @@ pub struct KillbotConfig {
     pub preferred_range: f64,
     #[serde(default = "default_true")]
     pub crit_enabled: bool,
-    /// Never take a sword swing flat-footed: if the attack cooldown comes up
-    /// while the bot is standing on the ground, jump and hold the hit until
-    /// it lands as a critical (1.5x damage) instead of swinging immediately.
+    /// Never take a swing flat-footed, whatever the bot is holding: if the
+    /// attack cooldown comes up while it is standing on the ground, jump and
+    /// hold the hit until it lands as a critical (1.5x damage) instead of
+    /// swinging immediately.
     ///
     /// Costs about a third of a second on the hits where it applies and pays
-    /// for it several times over in damage. Bounded, so a bot that cannot
-    /// jump (a low ceiling, a one-block tunnel) swings normally after a
-    /// moment rather than freezing -- see `combat::crits::CRIT_HOLD_TIMEOUT`.
-    /// Sword-only: an axe's slower cooldown already leaves room for the
-    /// ordinary crit jump. Requires `crit_enabled`.
+    /// for it several times over in damage -- proportionally more on an axe,
+    /// whose longer cooldown makes the hold a smaller share of the cycle.
+    /// Bounded, so a bot that cannot jump (a low ceiling, a one-block
+    /// tunnel) swings normally after a moment rather than freezing -- see
+    /// `combat::crits::CRIT_HOLD_TIMEOUT`. Requires `crit_enabled`.
     #[serde(default = "default_true")]
-    pub always_crit_with_sword: bool,
+    pub always_crit: bool,
     #[serde(default = "default_true")]
     pub shield_break_enabled: bool,
     #[serde(default = "default_true")]
@@ -580,6 +581,18 @@ pub struct KillbotConfig {
     /// throwing a punch. Set to 0 to chain bites back to back.
     #[serde(default = "default_killbot_eat_cooldown_ms")]
     pub eat_cooldown_ms: u64,
+    /// Distance (blocks) at which `#kill` stops using the project's normal
+    /// pathfinder and switches to its own combat movement controller (see
+    /// `combat::movement`).
+    ///
+    /// Beyond it the target is somewhere to *get to*, which is what the
+    /// pathfinder is for -- it knows about terrain, water and cliffs.
+    /// Inside it the target is someone to fight, and a route recomputed to
+    /// block centres is the opposite of what that needs. The switch is
+    /// sticky in both directions so a target hovering on the line doesn't
+    /// flip the bot between the two systems.
+    #[serde(default = "default_killbot_engage_range")]
+    pub engage_range: f64,
     /// Target health (HP, 0-20) at or below which the bot stops caring about
     /// its own: no eating, just damage until the target is down.
     ///
@@ -621,6 +634,9 @@ fn default_killbot_eat_cooldown_ms() -> u64 {
 fn default_killbot_finisher_health() -> f64 {
     8.0
 }
+fn default_killbot_engage_range() -> f64 {
+    6.0
+}
 fn default_killbot_max_chase_distance() -> f64 {
     128.0
 }
@@ -649,12 +665,13 @@ impl Default for KillbotConfig {
             attack_cooldown_ms: default_killbot_attack_cooldown_ms(),
             preferred_range: default_killbot_preferred_range(),
             crit_enabled: true,
-            always_crit_with_sword: true,
+            always_crit: true,
             shield_break_enabled: true,
             shield_use_enabled: true,
             heal_threshold: default_killbot_heal_threshold(),
             eat_cooldown_ms: default_killbot_eat_cooldown_ms(),
             finisher_health: default_killbot_finisher_health(),
+            engage_range: default_killbot_engage_range(),
             sprint_reset_enabled: true,
             strafe_enabled: true,
             prediction_enabled: true,
@@ -1802,13 +1819,15 @@ impl Config {
             || !(killbot.preferred_range > 0.0 && killbot.preferred_range <= killbot.attack_range)
             || !(0.0..=20.0).contains(&killbot.heal_threshold)
             || !(0.0..=20.0).contains(&killbot.finisher_health)
+            || !(killbot.engage_range >= killbot.attack_range
+                && killbot.engage_range <= killbot.max_chase_distance)
             || !(killbot.max_chase_distance > 0.0 && killbot.max_chase_distance <= 1024.0)
             || !(killbot.attack_cooldown_ms == 0
                 || (50..=10_000).contains(&killbot.attack_cooldown_ms))
             || killbot.eat_cooldown_ms > 60_000
         {
             return Err(AppError::InvalidKillbotConfiguration(
-                "attack_range, attack_cooldown_ms, preferred_range, heal_threshold, finisher_health, or max_chase_distance is out of range".into(),
+                "attack_range, attack_cooldown_ms, preferred_range, heal_threshold, finisher_health, engage_range, or max_chase_distance is out of range".into(),
             ));
         }
         let pathfinding = &self.pathfinding;
@@ -2174,8 +2193,8 @@ mod tests {
         config.validate().expect("the default must be valid");
 
         assert!(
-            config.killbot.always_crit_with_sword,
-            "sword swings default to holding out for a critical"
+            config.killbot.always_crit,
+            "every swing defaults to holding out for a critical"
         );
         assert_eq!(
             config.killbot.eat_cooldown_ms, 5000,
