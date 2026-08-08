@@ -60,7 +60,7 @@ use tracing::debug;
 
 use crate::{
     config::SurvivalConfig,
-    equipment::{manager::swap_into_slot, model::HOTBAR_PROTOCOL_SLOTS},
+    equipment::{manager::swap_into_slot_during_consume, model::HOTBAR_PROTOCOL_SLOTS},
     interaction::{
         InteractionController,
         faces::{BlockFace, BlockFacePurpose, face_hit_points},
@@ -327,11 +327,17 @@ impl SurvivalController {
     /// there (disabled in config, or the hotbar was full right up until
     /// this exact tick). Unlike that proactive stocking, this is an active
     /// emergency: if no hotbar slot is empty, it evicts the first hotbar
-    /// slot instead of giving up -- `swap_into_slot` never destroys the
-    /// displaced item, only relocates it to wherever the bucket was.
+    /// slot instead of giving up -- `swap_into_slot_during_consume` never
+    /// destroys the displaced item, only relocates it to wherever the
+    /// bucket was.
     async fn equip_water_bucket_now(&self, minecraft: &MinecraftClient) -> bool {
+        // Emergency: allowed to move the hand even if a golden apple bite
+        // happens to be mid-flight right now -- drowning in lava beats
+        // finishing a snack. See `MinecraftClient::select_item_in_hotbar_during_consume`.
         if matches!(
-            minecraft.select_item_in_hotbar(WATER_BUCKET_ID).await,
+            minecraft
+                .select_item_in_hotbar_during_consume(WATER_BUCKET_ID)
+                .await,
             Ok(true)
         ) {
             return true;
@@ -356,11 +362,13 @@ impl SurvivalController {
         let destination = hotbar_slots
             .find(|slot| !occupied.contains(slot))
             .unwrap_or(*HOTBAR_PROTOCOL_SLOTS.start());
-        if !swap_into_slot(minecraft, source.slot, destination).await {
+        if !swap_into_slot_during_consume(minecraft, source.slot, destination).await {
             return false;
         }
         matches!(
-            minecraft.select_item_in_hotbar(WATER_BUCKET_ID).await,
+            minecraft
+                .select_item_in_hotbar_during_consume(WATER_BUCKET_ID)
+                .await,
             Ok(true)
         )
     }
@@ -508,9 +516,13 @@ impl SurvivalController {
         // Last-moment guarantees, right at the placement window rather than
         // trusted from arming time: something else could in principle have
         // reselected the hotbar since then (this is idempotent and cheap --
-        // a no-op if it's already selected).
+        // a no-op if it's already selected). Uses the consume-guard bypass
+        // for the same reason `equip_water_bucket_now` does: a new fight
+        // could in principle have started and begun eating since arming.
         if !matches!(
-            minecraft.select_item_in_hotbar(WATER_BUCKET_ID).await,
+            minecraft
+                .select_item_in_hotbar_during_consume(WATER_BUCKET_ID)
+                .await,
             Ok(true)
         ) {
             self.abort(minecraft, look, "water bucket no longer selectable")
@@ -656,7 +668,7 @@ impl SurvivalController {
             slot
         };
         if let Some(slot) = previous_slot {
-            let _ = minecraft.select_hotbar_slot(slot).await;
+            let _ = minecraft.select_hotbar_slot_during_consume(slot).await;
         }
         let _ = look.release_precise(minecraft).await;
         if success {
@@ -680,7 +692,7 @@ impl SurvivalController {
             slot
         };
         if let Some(slot) = previous_slot {
-            let _ = minecraft.select_hotbar_slot(slot).await;
+            let _ = minecraft.select_hotbar_slot_during_consume(slot).await;
         }
         let _ = look.release_precise(minecraft).await;
     }
@@ -824,7 +836,7 @@ mod tests {
     }
 
     fn combat() -> CombatController {
-        CombatController::new()
+        CombatController::default()
     }
 
     #[tokio::test]

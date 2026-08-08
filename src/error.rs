@@ -55,6 +55,8 @@ pub enum AppError {
     InvalidSurvivalConfiguration(String),
     #[error("invalid killbot configuration: {0}")]
     InvalidKillbotConfiguration(String),
+    #[error("invalid pathfinding configuration: {0}")]
+    InvalidPathfindingConfiguration(String),
     #[error("invalid equipment configuration: {0}")]
     InvalidEquipmentConfiguration(String),
     #[error("invalid vertical-navigation configuration: {0}")]

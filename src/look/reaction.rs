@@ -140,7 +140,18 @@ mod tests {
         let first = random_delay(&config, &mut a);
         let second = random_delay(&config, &mut b);
         assert_eq!(first, second);
-        assert!((20..=55).contains(&first.as_millis()));
+        // Bounded by whatever the configured window is, rather than by the
+        // numbers that happened to be the defaults when this was written --
+        // the aim profile gets retuned, and a delay inside its own window is
+        // the property that actually matters.
+        let window =
+            u128::from(config.reaction_delay_min_ms)..=u128::from(config.reaction_delay_max_ms);
+        assert!(
+            window.contains(&first.as_millis()),
+            "delay {}ms outside the configured {:?}",
+            first.as_millis(),
+            window
+        );
     }
     #[test]
     fn movement_waits_then_coalesces_to_newest_point() {

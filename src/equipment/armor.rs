@@ -4,7 +4,10 @@
 
 use crate::{
     config::ArmorMode,
-    equipment::{model::EquipmentItem, scoring::penalize_for_durability},
+    equipment::{
+        model::EquipmentItem,
+        scoring::{ARMOR_ENCHANTMENT_WEIGHTS, enchantment_bonus, penalize_for_durability},
+    },
 };
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -160,12 +163,18 @@ pub fn best_candidate<'a>(
     best
 }
 
+/// [`score`] plus any combat-relevant enchantment bonus (see
+/// [`crate::equipment::scoring::ARMOR_ENCHANTMENT_WEIGHTS`]), added on top
+/// rather than folded in before `score`'s 1.0-10.0 clamp -- otherwise two
+/// full-durability Netherite pieces (already at the ceiling) could never be
+/// told apart by enchantment even though one is strictly better.
+fn full_score(item: &EquipmentItem, material: ArmorMaterial) -> f32 {
+    score(material, item.current_durability, item.max_durability)
+        + enchantment_bonus(&item.enchantments, ARMOR_ENCHANTMENT_WEIGHTS)
+}
+
 fn rank_score(candidate: Candidate) -> f32 {
-    score(
-        candidate.material,
-        candidate.item.current_durability,
-        candidate.item.max_durability,
-    )
+    full_score(candidate.item, candidate.material)
 }
 
 /// Whether `candidate` should replace whatever (if anything) is currently
@@ -177,9 +186,9 @@ pub fn should_replace(mode: ArmorMode, worn: Option<&EquipmentItem>, candidate: 
     let worn_material = worn.and_then(|item| classify(&item.item_id).map(|(_, material)| material));
     match mode {
         ArmorMode::Score => {
-            let worn_score = worn.zip(worn_material).map_or(0.0, |(item, material)| {
-                score(material, item.current_durability, item.max_durability)
-            });
+            let worn_score = worn
+                .zip(worn_material)
+                .map_or(0.0, |(item, material)| full_score(item, material));
             rank_score(candidate) >= worn_score + 0.2
         }
         ArmorMode::Rarity => worn_material.is_none_or(|material| candidate.material > material),
@@ -191,11 +200,25 @@ mod tests {
     use super::*;
 
     fn item(slot: usize, id: &str, current: u32, max: u32) -> EquipmentItem {
+        enchanted_item(slot, id, current, max, &[])
+    }
+
+    fn enchanted_item(
+        slot: usize,
+        id: &str,
+        current: u32,
+        max: u32,
+        enchantments: &[(&str, u32)],
+    ) -> EquipmentItem {
         EquipmentItem {
             slot,
             item_id: id.into(),
             current_durability: current,
             max_durability: max,
+            enchantments: enchantments
+                .iter()
+                .map(|(name, level)| ((*name).to_owned(), *level))
+                .collect(),
         }
     }
 
@@ -333,5 +356,80 @@ mod tests {
             Some(&worn_pumpkin),
             candidate
         ));
+    }
+
+    #[test]
+    fn a_protection_piece_outranks_a_bare_one_of_the_same_material() {
+        let bare = item(0, "minecraft:diamond_chestplate", 100, 100);
+        let protected = enchanted_item(
+            1,
+            "minecraft:diamond_chestplate",
+            100,
+            100,
+            &[("protection", 4)],
+        );
+        let bare_candidate = Candidate {
+            item: &bare,
+            material: ArmorMaterial::Diamond,
+        };
+        let protected_candidate = Candidate {
+            item: &protected,
+            material: ArmorMaterial::Diamond,
+        };
+        assert!(rank_score(protected_candidate) > rank_score(bare_candidate));
+    }
+
+    #[test]
+    fn best_candidate_in_score_mode_prefers_the_protection_piece() {
+        let inventory = vec![
+            item(10, "minecraft:diamond_chestplate", 100, 100),
+            enchanted_item(
+                11,
+                "minecraft:diamond_chestplate",
+                100,
+                100,
+                &[("protection", 4)],
+            ),
+        ];
+        let best = best_candidate(ArmorMode::Score, ArmorSlot::Chest, &inventory).unwrap();
+        assert_eq!(best.item.slot, 11);
+    }
+
+    #[test]
+    fn should_replace_recognizes_an_enchantment_upgrade_on_the_same_piece() {
+        let worn = item(5, "minecraft:diamond_chestplate", 100, 100); // 8.0
+        let candidate_item = enchanted_item(
+            1,
+            "minecraft:diamond_chestplate",
+            100,
+            100,
+            &[("protection", 4)], // 8.0 + 1.6 = 9.6
+        );
+        let candidate = Candidate {
+            item: &candidate_item,
+            material: ArmorMaterial::Diamond,
+        };
+        assert!(should_replace(ArmorMode::Score, Some(&worn), candidate));
+    }
+
+    #[test]
+    fn a_weapon_only_enchantment_does_not_affect_armor_score() {
+        let bare = item(0, "minecraft:diamond_chestplate", 100, 100);
+        let with_sharpness = enchanted_item(
+            1,
+            "minecraft:diamond_chestplate",
+            100,
+            100,
+            &[("sharpness", 5)],
+        );
+        let bare_candidate = Candidate {
+            item: &bare,
+            material: ArmorMaterial::Diamond,
+        };
+        let sharp_candidate = Candidate {
+            item: &with_sharpness,
+            material: ArmorMaterial::Diamond,
+        };
+        assert_eq!(rank_score(bare_candidate), rank_score(sharp_candidate));
     }
 }

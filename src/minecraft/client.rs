@@ -6,6 +6,7 @@
 use std::{
     cmp::Ordering,
     collections::{HashMap, HashSet},
+    ops::RangeInclusive,
     path::PathBuf,
     sync::Arc,
     time::{Duration, SystemTime},
@@ -173,6 +174,20 @@ pub struct MinecraftClient {
     shutdown: CancellationToken,
     supervisor: Option<JoinHandle<()>>,
     inventory_actions: InventoryActionService,
+    /// Raised while `crate::combat::consume` has a bite in flight.
+    ///
+    /// Vanilla item use is cancelled by a hotbar selection or an inventory
+    /// click, and this bot has two background services -- the hotbar
+    /// equipment scan and the armor/offhand manager -- that mutate the
+    /// inventory whenever its revision changes. Eating *changes the
+    /// revision*, so a bite reliably woke them and they cancelled it: the
+    /// bot ended up holding an apple it never ate.
+    ///
+    /// While this is set, every inventory mutation that could cancel a use
+    /// refuses with `AppError::InventoryBusy`, which those services already
+    /// treat as "try again next tick". The consume path itself goes through
+    /// the `*_during_consume` variants, which bypass it.
+    consume_guard: Arc<std::sync::atomic::AtomicBool>,
     /// Debounces [`crate::bridging::NO_SAFE_SCAFFOLD_MESSAGE`] so it logs
     /// once when the bot runs out of usable scaffold material rather than
     /// every `repath_interval_ms` (as often as every 150ms) while a route
@@ -207,6 +222,31 @@ pub struct NavigationStatus {
     /// destination itself keeps moving) must not resubmit while this is
     /// true, regardless of how much the destination has changed.
     pub mid_build_action: bool,
+}
+
+/// Returned by [`MinecraftClient::active_menu_window`]. Translates a slot
+/// index given in the player's own inventory menu's numbering into the slot
+/// index of whatever menu the server currently has open, so an equip/hotbar
+/// swap keeps landing on the right slot even while e.g. a chest is open.
+#[derive(Clone, Debug)]
+pub(crate) struct ActiveMenuWindow {
+    pub window_id: i32,
+    player_range: RangeInclusive<usize>,
+    active_range: RangeInclusive<usize>,
+}
+
+impl ActiveMenuWindow {
+    /// `None` only for armor (`5..=8`) or the offhand (`45`) while a
+    /// non-player menu is open (`window_id != 0`) -- a chest, furnace, or
+    /// any other container simply has no equivalent slot for those, only
+    /// for the trailing main-inventory+hotbar block every menu shares.
+    pub(crate) fn translate(&self, player_menu_slot: usize) -> Option<usize> {
+        if self.player_range.contains(&player_menu_slot) {
+            let offset = player_menu_slot - self.player_range.start();
+            return Some(self.active_range.start() + offset);
+        }
+        (self.window_id == 0).then_some(player_menu_slot)
+    }
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -291,6 +331,7 @@ impl MinecraftClient {
             shutdown: CancellationToken::new(),
             supervisor: None,
             inventory_actions: InventoryActionService::default(),
+            consume_guard: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             no_scaffold_warned: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         }
     }
@@ -596,6 +637,109 @@ impl MinecraftClient {
             .collect())
     }
 
+    /// Copies every loaded block in `bounds` into an owned
+    /// [`TerrainGrid`](crate::pathfinding::grid::TerrainGrid) for the
+    /// pathfinder, clamping the requested Y range to the world's real
+    /// height limits.
+    ///
+    /// This is the only place Azalea's world is read on the pathfinder's
+    /// behalf, and it is deliberately a *copy*: the search that consumes the
+    /// grid runs for up to a second on a blocking thread (see
+    /// `crate::pathfinding::planner`), which it could not do while holding
+    /// the world lock. Cells in chunks that aren't loaded are simply left
+    /// `Unknown`, which is what makes the planner treat render-distance edge
+    /// as a frontier rather than as walkable ground.
+    ///
+    /// Cost: one world lock, held for the duration of a linear walk over the
+    /// requested cells (~300k for a default-sized sample). Block states are
+    /// memoized by state id, and a chunk's palette rarely holds more than a
+    /// few dozen distinct states, so the expensive part -- resolving a state
+    /// to a block id string and classifying it -- runs a handful of times
+    /// per chunk rather than once per block.
+    pub(crate) async fn sample_terrain(
+        &self,
+        bounds: crate::pathfinding::grid::GridBounds,
+    ) -> Result<crate::pathfinding::grid::TerrainGrid, AppError> {
+        use crate::pathfinding::{grid::TerrainGrid, terrain};
+        use azalea::core::position::ChunkBlockPos;
+
+        if self.connection_state() != ConnectionState::Connected {
+            return Err(AppError::MovementUnavailable);
+        }
+        let client = self
+            .current_client
+            .lock()
+            .await
+            .clone()
+            .ok_or(AppError::MovementUnavailable)?;
+        let world = client
+            .world()
+            .map_err(|error| AppError::WorldStateUpdateFailure(error.to_string()))?;
+        let world_guard = world.read();
+        let world_min_y = world_guard.chunks.min_y();
+        let world_max_y = world_min_y + world_guard.chunks.height() as i32 - 1;
+
+        let bounds = crate::pathfinding::grid::GridBounds {
+            min: BlockPosition {
+                y: bounds.min.y.max(world_min_y),
+                ..bounds.min
+            },
+            max: BlockPosition {
+                y: bounds.max.y.min(world_max_y + 1),
+                ..bounds.max
+            },
+        };
+        let mut grid = TerrainGrid::empty(bounds);
+        if bounds.height() <= 0 {
+            return Ok(grid);
+        }
+
+        let min_chunk = ChunkPos::new(
+            chunk_coordinate(bounds.min.x),
+            chunk_coordinate(bounds.min.z),
+        );
+        let max_chunk = ChunkPos::new(
+            chunk_coordinate(bounds.max.x - 1),
+            chunk_coordinate(bounds.max.z - 1),
+        );
+        let mut classified: HashMap<u32, terrain::TerrainClass> = HashMap::new();
+        for chunk_x in min_chunk.x..=max_chunk.x {
+            for chunk_z in min_chunk.z..=max_chunk.z {
+                let Some(chunk) = world_guard.chunks.get(&ChunkPos::new(chunk_x, chunk_z)) else {
+                    continue;
+                };
+                let chunk_guard = chunk.read();
+                let start_x = (chunk_x * 16).max(bounds.min.x);
+                let end_x = (chunk_x * 16 + 16).min(bounds.max.x);
+                let start_z = (chunk_z * 16).max(bounds.min.z);
+                let end_z = (chunk_z * 16 + 16).min(bounds.max.z);
+                for y in bounds.min.y..bounds.max.y {
+                    for x in start_x..end_x {
+                        for z in start_z..end_z {
+                            let local = ChunkBlockPos::new(
+                                x.rem_euclid(16) as u8,
+                                y,
+                                z.rem_euclid(16) as u8,
+                            );
+                            let Some(state) = chunk_guard.get_block_state(&local, world_min_y)
+                            else {
+                                continue;
+                            };
+                            let class =
+                                *classified.entry(u32::from(state.id())).or_insert_with(|| {
+                                    terrain::classify(Some(
+                                        state.to_trait().as_block_kind().to_str(),
+                                    ))
+                                });
+                            grid.set(BlockPosition { x, y, z }, class);
+                        }
+                    }
+                }
+            }
+        }
+        Ok(grid)
+    }
+
     pub(crate) async fn block_ids_at(
         &self,
         positions: &[BlockPosition],
@@ -878,6 +1022,114 @@ impl MinecraftClient {
         Ok(())
     }
 
+    /// Sends the real vanilla "use item" packet directly, for items whose
+    /// right-click action is throwing/launching themselves (Wind Charge,
+    /// Ender Pearl, ...) rather than interacting with whatever block is
+    /// underfoot.
+    ///
+    /// [`Self::start_use_main_hand`] (`Client::start_use_item`) goes through
+    /// `azalea_client::interact::handle_start_use_item_queued`, which -- for
+    /// a raycast that hits a block within reach, exactly what aiming
+    /// straight down at the ground under the bot's own feet produces --
+    /// only ever sends `ServerboundUseItemOn` for that block and never
+    /// falls through to the generic `ServerboundUseItem`. Real vanilla
+    /// clients send both when the block doesn't consume the click, but this
+    /// crate's Azalea only implements the block half, so a Wind Charge
+    /// thrown at the ground via `start_use_main_hand` never leaves the
+    /// bot's hand. This sends the item-use packet unconditionally instead
+    /// of relying on that fallback. Used by `crate::combat::wind_launch`.
+    pub(crate) async fn throw_main_hand_item(&self) -> Result<(), AppError> {
+        let client = self
+            .current_client
+            .lock()
+            .await
+            .clone()
+            .ok_or(AppError::MovementUnavailable)?;
+        let (y_rot, x_rot) = client
+            .query_self::<&LookDirection, _>(|direction| (direction.y_rot(), direction.x_rot()))
+            .map_err(|error| AppError::LookUnavailableWithReason(error.to_string()))?;
+        client.write_packet(azalea::protocol::packets::game::s_use_item::ServerboundUseItem {
+            hand: azalea::protocol::packets::game::s_interact::InteractionHand::MainHand,
+            seq: 0,
+            y_rot,
+            x_rot,
+        });
+        Ok(())
+    }
+
+    /// Claims the bot's hand for a consume. Every other inventory mutation
+    /// is refused until [`Self::end_consume_guard`] -- see
+    /// `MinecraftClient::consume_guard`.
+    pub(crate) fn begin_consume_guard(&self) {
+        self.consume_guard
+            .store(true, std::sync::atomic::Ordering::Release);
+    }
+
+    /// Releases the hand. Safe to call when the guard isn't held.
+    pub(crate) fn end_consume_guard(&self) {
+        self.consume_guard
+            .store(false, std::sync::atomic::Ordering::Release);
+    }
+
+    #[must_use]
+    pub(crate) fn consume_guard_active(&self) -> bool {
+        self.consume_guard
+            .load(std::sync::atomic::Ordering::Acquire)
+    }
+
+    fn refuse_while_consuming(&self) -> Result<(), AppError> {
+        if self.consume_guard_active() {
+            return Err(AppError::InventoryBusy);
+        }
+        Ok(())
+    }
+
+    /// Holds or releases sneak. Used by `crate::combat::movement` for edge
+    /// safety; harmless to call with the value it already has, since Azalea
+    /// only sends a packet when the state actually changes.
+    pub(crate) async fn set_sneaking(&self, sneaking: bool) -> Result<(), AppError> {
+        let client = self
+            .current_client
+            .lock()
+            .await
+            .clone()
+            .ok_or(AppError::MovementUnavailable)?;
+        client
+            .set_crouching(sneaking)
+            .map_err(|_| AppError::MovementUnavailable)
+    }
+
+    /// Which hotbar slot the *server* has been told the bot is holding, as
+    /// opposed to the one the bot has locally decided on
+    /// ([`Self::select_hotbar_slot`] updates that immediately, but the
+    /// `ServerboundSetCarriedItem` packet only goes out on the next game
+    /// tick).
+    ///
+    /// This distinction is load-bearing for eating. Azalea sends the
+    /// carried-item packet *after* the use-item packet within a tick
+    /// (`ensure_has_sent_carried_item` is explicitly ordered
+    /// `.after(handle_start_use_item_queued)`), so selecting food and
+    /// starting to use it in the same tick makes the server apply the use to
+    /// whatever was held *before* -- the sword -- and only then switch to the
+    /// food. The bot ends up holding an apple it never started eating. See
+    /// `crate::combat::executor`'s `apply_eating`, which waits for this to
+    /// confirm the swap before sending the use.
+    ///
+    /// `None` means the client has not sent one yet (nothing selected since
+    /// joining).
+    pub(crate) async fn acknowledged_hotbar_slot(&self) -> Result<Option<u8>, AppError> {
+        let client = self
+            .current_client
+            .lock()
+            .await
+            .clone()
+            .ok_or(AppError::InventoryUnavailable)?;
+        Ok(client
+            .component::<azalea_client::inventory::LastSentSelectedHotbarSlot>()
+            .ok()
+            .map(|last_sent| last_sent.slot))
+    }
+
     /// Like [`Self::start_use_main_hand`], but for the off hand -- raising
     /// a shield for `crate::combat::defense`. Vanilla shield-blocking
     /// activates whichever hand is actually holding the shield; this bot's
@@ -1065,9 +1317,10 @@ impl MinecraftClient {
     /// `Inventory::inventory_menu` -- the player's own menu, which (unlike
     /// `Client::menu()`) stays `Menu::Player` even while a chest is open, so
     /// scoring/decision work never has to wait for a container to close.
-    /// Only the resulting *clicks* need window id 0 (see
-    /// `EquipmentService::equip`), since armor/offhand slots aren't part of
-    /// whatever menu is actually open at click time.
+    /// The resulting *clicks* still have to land on whatever menu is
+    /// actually open at click time -- see [`Self::active_menu_window`],
+    /// which `equipment::manager::swap_into_slot_inner` uses to translate
+    /// slot numbers from this snapshot's numbering into that menu's own.
     pub(crate) async fn equipment_snapshot(
         &self,
     ) -> Result<crate::equipment::model::EquipmentSnapshot, AppError> {
@@ -1089,27 +1342,52 @@ impl MinecraftClient {
             .inventory_menu
             .clone();
         let slots = menu.slots();
-        let read = |index: usize| -> Option<EquipmentItem> {
-            let item = slots.get(index)?;
-            let data = item.as_present()?;
-            let max_durability = item
-                .get_component::<MaxDamage>()
-                .map_or(0, |component| component.amount.max(0) as u32);
-            let damage = item
-                .get_component::<Damage>()
-                .map_or(0, |component| component.amount.max(0) as u32);
-            Some(EquipmentItem {
-                slot: index,
-                item_id: data.kind.to_string(),
-                current_durability: max_durability.saturating_sub(damage),
-                max_durability,
+        // Enchantment names are a data-driven registry, not a fixed enum
+        // (see `enchantment_name`'s doc comment) -- resolving one requires
+        // the connection's `RegistryHolder`, fetched once up front and
+        // reused for every slot below rather than re-locking the world
+        // per-item.
+        client
+            .with_registry_holder(|registries| {
+                let read = |index: usize| -> Option<EquipmentItem> {
+                    let item = slots.get(index)?;
+                    let data = item.as_present()?;
+                    let max_durability = item
+                        .get_component::<MaxDamage>()
+                        .map_or(0, |component| component.amount.max(0) as u32);
+                    let damage = item
+                        .get_component::<Damage>()
+                        .map_or(0, |component| component.amount.max(0) as u32);
+                    let enchantments = item
+                        .get_component::<Enchantments>()
+                        .map(|enchantments| {
+                            enchantments
+                                .levels
+                                .iter()
+                                .filter_map(|(kind, level)| {
+                                    Some((
+                                        enchantment_name(kind, registries)?,
+                                        (*level).max(0) as u32,
+                                    ))
+                                })
+                                .collect()
+                        })
+                        .unwrap_or_default();
+                    Some(EquipmentItem {
+                        slot: index,
+                        item_id: data.kind.to_string(),
+                        current_durability: max_durability.saturating_sub(damage),
+                        max_durability,
+                        enchantments,
+                    })
+                };
+                EquipmentSnapshot {
+                    armor_worn: ArmorSlot::ALL.map(|slot| read(slot.protocol_slot())),
+                    offhand_worn: read(OFFHAND_PROTOCOL_SLOT),
+                    inventory: INVENTORY_PROTOCOL_SLOTS.filter_map(read).collect(),
+                }
             })
-        };
-        Ok(EquipmentSnapshot {
-            armor_worn: ArmorSlot::ALL.map(|slot| read(slot.protocol_slot())),
-            offhand_worn: read(OFFHAND_PROTOCOL_SLOT),
-            inventory: INVENTORY_PROTOCOL_SLOTS.filter_map(read).collect(),
-        })
+            .map_err(|_| AppError::InventoryUnavailable)
     }
 
     /// Every held item (main inventory + hotbar, mirroring
@@ -1192,7 +1470,60 @@ impl MinecraftClient {
         }))
     }
 
+    /// The currently active menu's window id, plus enough of its slot
+    /// layout to translate a slot index given in the player's own inventory
+    /// menu's numbering (armor `5..=8`, main-inventory+hotbar `9..=44`,
+    /// offhand `45` -- the numbering every equip/hotbar caller works in,
+    /// since `equipment_snapshot` always reads `inventory_menu`, which stays
+    /// `Menu::Player` regardless of what's actually open).
+    ///
+    /// Used by `equipment::manager::swap_into_slot_inner` so an automatic
+    /// equip/hotbar swap keeps working while e.g. a chest is open instead of
+    /// always targeting a hardcoded window 0 -- see [`ActiveMenuWindow::translate`].
+    pub(crate) async fn active_menu_window(&self) -> Result<ActiveMenuWindow, AppError> {
+        let client = self
+            .current_client
+            .lock()
+            .await
+            .clone()
+            .ok_or(AppError::InventoryUnavailable)?;
+        let inventory = client
+            .component::<Inventory>()
+            .map_err(|_| AppError::InventoryUnavailable)?;
+        let window_id = inventory.id;
+        // `player_slots_range()` on `Menu::Player` itself is the reference
+        // numbering every caller already works in (`9..=44`, matching
+        // `equipment::model::INVENTORY_PROTOCOL_SLOTS`).
+        let player_range = inventory.inventory_menu.player_slots_range();
+        // Every menu but `Menu::Player` appends the same 36 player-inventory
+        // slots at whatever offset its own contents occupy (see
+        // `azalea_inventory`'s `declare_menus!` doc comment) -- so a chest's
+        // `player_slots_range()` covers the identical main-inventory+hotbar
+        // items, just shifted.
+        let active_range = inventory
+            .container_menu
+            .as_ref()
+            .unwrap_or(&inventory.inventory_menu)
+            .player_slots_range();
+        Ok(ActiveMenuWindow {
+            window_id,
+            player_range,
+            active_range,
+        })
+    }
+
     pub(crate) async fn container_click(
+        &self,
+        window_id: i32,
+        click: crate::container::model::InventoryClick,
+    ) -> Result<(), AppError> {
+        self.refuse_while_consuming()?;
+        self.container_click_during_consume(window_id, click).await
+    }
+
+    /// [`Self::container_click`] without the consume guard -- see
+    /// [`Self::select_hotbar_slot_during_consume`].
+    pub(crate) async fn container_click_during_consume(
         &self,
         window_id: i32,
         click: crate::container::model::InventoryClick,
@@ -1321,6 +1652,18 @@ impl MinecraftClient {
     }
 
     pub(crate) async fn select_item_in_hotbar(&self, item_id: &str) -> Result<bool, AppError> {
+        self.refuse_while_consuming()?;
+        self.select_item_in_hotbar_during_consume(item_id).await
+    }
+
+    /// [`Self::select_item_in_hotbar`] without the consume guard -- for
+    /// `crate::survival`'s fall clutch, which is allowed to grab a water
+    /// bucket even mid-bite: see [`Self::select_hotbar_slot_during_consume`]
+    /// for why (drowning in lava beats finishing a snack).
+    pub(crate) async fn select_item_in_hotbar_during_consume(
+        &self,
+        item_id: &str,
+    ) -> Result<bool, AppError> {
         self.inventory_actions
             .mutate(|| async {
                 let client = self
@@ -1356,6 +1699,15 @@ impl MinecraftClient {
     /// selected before it grabbed the water bucket, regardless of what item
     /// (if any) is sitting there now.
     pub(crate) async fn select_hotbar_slot(&self, slot: u8) -> Result<(), AppError> {
+        self.refuse_while_consuming()?;
+        self.select_hotbar_slot_during_consume(slot).await
+    }
+
+    /// [`Self::select_hotbar_slot`] without the consume guard -- for the
+    /// consume path itself (moving the bot's hand while a bite is being set
+    /// up) and `crate::survival`'s fall clutch (the other caller allowed to
+    /// break in mid-bite; see [`Self::select_item_in_hotbar_during_consume`]).
+    pub(crate) async fn select_hotbar_slot_during_consume(&self, slot: u8) -> Result<(), AppError> {
         self.inventory_actions
             .mutate(|| async {
                 let client = self
@@ -2147,6 +2499,34 @@ fn container_from_component(inventory: &Inventory) -> Option<MenuObservation> {
     })
 }
 
+/// Resolves one enchantment entry from an item's `Enchantments` component to
+/// its stable vanilla id (e.g. `"sharpness"`), for
+/// `crate::equipment::{tools, armor}`'s enchantment-aware scoring.
+///
+/// Unlike `ToolKind`/`BlockKind`/every other identifier this codebase reads
+/// off an item, enchantments are a *data-driven* registry (sent by the
+/// server on join, not a fixed client-side enum) -- the component only
+/// stores a per-connection numeric id, so recovering the name requires
+/// looking it up against the connection's `RegistryHolder`. `None` for any
+/// enchantment id the server's registry doesn't recognize (never true on
+/// vanilla) or a non-`minecraft:` namespaced one (a datapack enchantment
+/// this scoring has no opinion on).
+fn enchantment_name(
+    kind: &azalea::registry::data::Enchantment,
+    registries: &azalea::core::registry_holder::RegistryHolder,
+) -> Option<String> {
+    use azalea::registry::DataRegistryKey;
+    use azalea::{core::data_registry::DataRegistryWithKey, registry::data::EnchantmentKey};
+    match kind.key_owned(registries)? {
+        EnchantmentKey::Other(_) => None,
+        // `into_ident().path()` is the registry's own canonical snake_case
+        // id (e.g. `"bane_of_arthropods"`), not a Debug-derived guess --
+        // this is what `equipment::scoring::WEAPON_ENCHANTMENTS`/
+        // `ARMOR_ENCHANTMENTS` match against.
+        known => Some(DataRegistryKey::into_ident(known).path().to_owned()),
+    }
+}
+
 fn inventory_slot(slot: usize, item: &azalea::inventory::ItemStack) -> InventorySlot {
     let (item_id, count) = if item.is_empty() {
         (None, 0)
@@ -2290,6 +2670,88 @@ mod tests {
             client().send_chat(&message).await,
             Err(AppError::ChatMessageTooLong { .. })
         ));
+    }
+
+    /// The consume guard is what stops the hotbar and armor services --
+    /// which wake on every inventory-revision change, including the one
+    /// eating itself causes -- from cancelling a bite in progress. These
+    /// assert the mechanism directly: while it is held, every mutation that
+    /// can cancel vanilla item use is refused.
+    #[tokio::test]
+    async fn the_consume_guard_refuses_every_mutation_that_cancels_eating() {
+        use crate::container::model::{ClickButton, InventoryClick};
+
+        let client = client();
+        assert!(!client.consume_guard_active());
+        client.begin_consume_guard();
+        assert!(client.consume_guard_active());
+
+        // A weapon swap or tool selection.
+        assert!(matches!(
+            client.select_hotbar_slot(3).await,
+            Err(AppError::InventoryBusy)
+        ));
+        assert!(matches!(
+            client
+                .select_item_in_hotbar("minecraft:diamond_sword")
+                .await,
+            Err(AppError::InventoryBusy)
+        ));
+        // The hotbar/armor services' inventory clicks.
+        assert!(matches!(
+            client
+                .container_click(
+                    0,
+                    InventoryClick {
+                        slot: 9,
+                        button: ClickButton::Left
+                    }
+                )
+                .await,
+            Err(AppError::InventoryBusy)
+        ));
+    }
+
+    #[tokio::test]
+    async fn the_consume_path_itself_is_not_refused_by_its_own_guard() {
+        use crate::container::model::{ClickButton, InventoryClick};
+
+        let client = client();
+        client.begin_consume_guard();
+        // These are the variants the eating code uses. They must get past
+        // the guard and fail for the ordinary reason instead -- there is no
+        // connection in a test.
+        assert!(matches!(
+            client.select_hotbar_slot_during_consume(7).await,
+            Err(AppError::InventoryUnavailable)
+        ));
+        assert!(matches!(
+            client
+                .container_click_during_consume(
+                    0,
+                    InventoryClick {
+                        slot: 9,
+                        button: ClickButton::Left
+                    }
+                )
+                .await,
+            Err(AppError::InventoryUnavailable)
+        ));
+    }
+
+    #[tokio::test]
+    async fn releasing_the_guard_hands_the_inventory_back() {
+        let client = client();
+        client.begin_consume_guard();
+        client.end_consume_guard();
+        assert!(!client.consume_guard_active());
+        assert!(matches!(
+            client.select_hotbar_slot(3).await,
+            Err(AppError::InventoryUnavailable)
+        ));
+        // Idempotent: releasing a guard that isn't held is harmless.
+        client.end_consume_guard();
+        assert!(!client.consume_guard_active());
     }
 
     #[tokio::test]

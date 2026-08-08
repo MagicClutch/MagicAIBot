@@ -1,5 +1,12 @@
 //! Standalone PvP combat: `#kill <player>`.
 //!
+//! The fight is **full aggression** end to end: the bot closes the gap,
+//! stays in the target's face, eats mid-fight without ever backing off, and
+//! keeps swinging until the target is dead. Nothing in here retreats,
+//! flees, or ends a fight because the bot is hurt -- see [`executor`]'s
+//! module doc comment for the one thing that briefly pauses attacking (a
+//! bite in progress) and why.
+//!
 //! Deliberately independent of `crate::movement`/`crate::navigation` (the
 //! pathfinder-backed systems every other command -- `/goto`, `/follow`,
 //! `#get`, `#mine` -- shares) and of `crate::mobs::combat` (the
@@ -23,29 +30,43 @@
 //! - [`state`] -- plain state/snapshot data, including the
 //!   [`state::CombatPhase`] state machine.
 //! - [`targeting`] -- pure distance/prediction/staleness math.
-//! - [`movement`] -- pure strafe/approach/sprint decisions (combat's own
-//!   movement model).
+//! - [`movement`] -- the combat-only continuous steering controller (see
+//!   its own module doc comment for why `#kill` does not share the
+//!   project's navigation stack).
+//! - [`terrain_probe`] -- lightweight local obstacle/hazard reading for
+//!   that controller.
 //! - [`crits`] -- pure attack-cooldown and critical-hit-timing decisions.
+//! - [`mace`] -- pure Mace smash-attack detection: whether a swing lands
+//!   during a fall deep enough to trigger the bonus.
+//! - [`wind_launch`] -- the state machine that engineers that fall by
+//!   throwing a Wind Charge straight down at the bot's own feet, then hands
+//!   off to [`mace`] for the landing.
 //! - [`shield_break`] -- pure axe-switch policy for breaking the *target's*
 //!   shield.
 //! - [`defense`] -- pure policy for the bot's *own* shield use.
 //! - [`health`] -- pure health-based behavior mode
 //!   ([`health::CombatMode`]).
 //! - [`heal`] -- pure food-selection policy.
+//! - [`consume`] -- the six-state machine that makes eating an atomic
+//!   action nothing but an emergency may interrupt.
 //! - [`executor`] -- per-tick async orchestration: turns the pure
 //!   decisions above into actual client calls.
 //! - [`kill`] -- [`kill::KillController`], the public controller `App`
 //!   drives for `#kill`/`/kill`.
 
+pub mod consume;
 pub mod crits;
 pub mod defense;
 pub mod executor;
 pub mod heal;
 pub mod health;
 pub mod kill;
+pub mod mace;
 pub mod movement;
 pub mod shield_break;
 pub mod state;
 pub mod targeting;
+pub mod terrain_probe;
+pub mod wind_launch;
 
 pub use kill::KillController;

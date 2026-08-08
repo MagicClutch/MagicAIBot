@@ -22,13 +22,6 @@ pub const PREDICTION_MAX_LEAD_BLOCKS: f64 = 1.5;
 /// lost rather than chased indefinitely on stale data.
 pub const STALE_OBSERVATION_SECONDS: f64 = 3.0;
 
-/// How far past the bot's own position the "face away and run" look point
-/// ([`flee_point`]) sits. Only needs to be far enough that the resulting
-/// yaw reliably points directly away from the target -- the exact
-/// magnitude otherwise doesn't matter, since the bot never actually tries
-/// to reach this point, just face it.
-pub const FLEE_LOOK_DISTANCE: f64 = 10.0;
-
 pub fn distance(a: PositionSnapshot, b: PositionSnapshot) -> f64 {
     ((a.x - b.x).powi(2) + (a.y - b.y).powi(2) + (a.z - b.z).powi(2)).sqrt()
 }
@@ -95,32 +88,6 @@ pub fn is_approaching(
     // Closing speed is more than half the target's total horizontal
     // speed -- i.e. moving mostly toward the bot, not just clipping past.
     dot > speed * 0.5
-}
-
-/// A point directly behind the bot, opposite `target` from `bot`.
-/// Facing this (via `look::LookTarget::World`) and walking `Forward` is
-/// how this bot actually flees at a sprint: vanilla can only sprint moving
-/// forward (or forward-diagonally), never backward, so retreating by
-/// walking `Backward` while still facing the target -- what
-/// `crate::combat::movement`'s normal distance bands do -- caps out at
-/// plain walk speed and lets a sprinting target simply catch back up.
-/// Falls back to an arbitrary fixed direction if `bot` and `target` are at
-/// (or extremely near) the same position, since there's no meaningful
-/// "away" direction then.
-pub fn flee_point(bot: PositionSnapshot, target: PositionSnapshot) -> PositionSnapshot {
-    let dx = bot.x - target.x;
-    let dz = bot.z - target.z;
-    let length = dx.hypot(dz);
-    let (dx, dz) = if length < 1e-6 {
-        (1.0, 0.0)
-    } else {
-        (dx / length, dz / length)
-    };
-    PositionSnapshot {
-        x: bot.x + dx * FLEE_LOOK_DISTANCE,
-        y: bot.y,
-        z: bot.z + dz * FLEE_LOOK_DISTANCE,
-    }
 }
 
 #[cfg(test)]
@@ -213,32 +180,5 @@ mod tests {
         let bot = position(0.0, 64.0, 0.0);
         let target = position(5.0, 64.0, 0.0);
         assert!(!is_approaching(bot, target, [0.0, -5.0, 0.0]));
-    }
-
-    #[test]
-    fn flee_point_is_directly_opposite_the_target_from_the_bot() {
-        let bot = position(0.0, 64.0, 0.0);
-        let target = position(5.0, 64.0, 0.0);
-        // Target is in +x from the bot, so fleeing should head further -x.
-        let flee = flee_point(bot, target);
-        assert!(flee.x < bot.x);
-        assert!((flee.z - bot.z).abs() < 1e-9);
-        assert_eq!(flee.y, bot.y);
-    }
-
-    #[test]
-    fn flee_point_falls_back_to_a_fixed_direction_at_zero_distance() {
-        let bot = position(3.0, 64.0, 3.0);
-        let flee = flee_point(bot, bot);
-        assert!((flee.x - bot.x - FLEE_LOOK_DISTANCE).abs() < 1e-9);
-        assert_eq!(flee.z, bot.z);
-    }
-
-    #[test]
-    fn flee_point_is_the_configured_distance_away() {
-        let bot = position(0.0, 64.0, 0.0);
-        let target = position(0.0, 64.0, 7.0);
-        let flee = flee_point(bot, target);
-        assert!((distance(bot, flee) - FLEE_LOOK_DISTANCE).abs() < 1e-9);
     }
 }

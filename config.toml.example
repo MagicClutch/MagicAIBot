@@ -39,22 +39,144 @@ chat = "info"
 
 # Standalone PvP (`#kill <player>`/`/kill <player>`, `src/combat/`) --
 # entirely independent of movement/pathfinding, see that module's doc
-# comment. `preferred_range` is the center of the bot's 1.7-1.9 hold band
-# (see `combat::movement`); `heal_threshold`/`reengage_threshold` are HP on
-# the vanilla 0-20 scale, with a gap between them so the bot doesn't flip
-# straight back into a trade the moment it lands one more hit.
+# comment. The bot fights in full aggression: it never retreats and never
+# breaks off a fight to heal, it just keeps closing the gap and swinging
+# until the target is dead. `preferred_range` is the hold distance it
+# circles at once it's there (see `combat::movement`).
+# `heal_threshold` and `finisher_health` are HP on the vanilla 0-20 scale
+# (4 hearts = 8). Eating happens mid-fight without disengaging: one bite when
+# the bot drops below `heal_threshold`, then it commits to the fight for
+# `eat_cooldown_ms` before considering another. Once the *target* falls to
+# `finisher_health` the bot stops eating altogether and just finishes them.
 [killbot]
-attack_range = 2.0
+# Vanilla survival melee reach is 3.0 blocks (attack and block-interact reach
+# both -- see the Minecraft Wiki's combat mechanics page); anything lower
+# gives away real range to an opponent who can already hit the bot at 2-3
+# blocks while it stands there unable to swing back.
+attack_range = 3.0
+# Milliseconds between hits, or 0 (the default) for automatic: swing exactly
+# when the weapon in hand finishes recharging -- 625ms for any sword, 1000ms
+# for a netherite axe. Automatic is the maximum-damage setting: Java scales
+# each hit by 0.2 + 0.8*(charge^2), so hitting at half charge deals 40%
+# damage at twice the rate, i.e. 0.8x the DPS of just waiting. Set an
+# explicit value only if you want a specific cadence; anything below the
+# weapon's real recharge time costs damage. Governs `#kill` and `#get <mob>`
+# alike.
+attack_cooldown_ms = 0
 preferred_range = 1.8
 crit_enabled = true
+# Never swing flat-footed, whatever is in hand: if the cooldown comes up
+# while the bot is standing on the ground, jump and hold the hit until it
+# lands as a critical (1.5x damage) instead of the default sprint-reset
+# knockback hit. Off by default: vanilla makes sprint knockback and crits
+# mutually exclusive per swing, so holding every neutral-exchange swing for
+# a crit means giving up the knockback spacing that keeps the target from
+# landing a return hit -- see combat::executor::apply_attack's doc comment.
+# A finishing blow (below finisher_health) always holds for the crit
+# regardless of this setting. Turn this on for more damage per hit at the
+# cost of spacing control. Costs ~0.3s on the hits where it applies -- more
+# on an axe, whose longer cooldown makes the hold a smaller share of the
+# cycle. A bot that physically cannot jump (low ceiling, one-block tunnel)
+# swings normally after a moment instead of freezing.
+always_crit = false
 shield_break_enabled = true
 shield_use_enabled = true
 heal_threshold = 8.0
-reengage_threshold = 14.0
+# One bite at a time: after swallowing, the bot goes straight back to
+# fighting and won't reach for food again for this long. Defaults to a golden
+# apple's own Regeneration II duration -- a gap heals 4 HP gradually over 5s,
+# so without this wait the bot re-checks its health the moment the apple
+# lands, still sees it low, and eats another, chewing through a whole stack
+# instead of fighting. 0 chains bites back to back.
+eat_cooldown_ms = 5000
+# Target HP at or below which the bot ignores its own health and just
+# attacks -- a target this close to death dies to the next couple of hits,
+# and stopping to eat hands them the fight. 0 disables the rule.
+finisher_health = 8.0
+# Eating is an atomic action: while a bite is in flight the bot's hand is
+# claimed and no other subsystem may move an item (the hotbar and armor
+# services would otherwise cancel it, since eating changes the inventory
+# revision they watch). If a bite is cancelled anyway, it retries this many
+# times with this pause between attempts.
+eat_retry_delay_ms = 150
+eat_retry_limit = 3
+# Back off and circle while chewing rather than eating where it stands. Note
+# the bot walks rather than sprints while retreating: sprinting cancels
+# vanilla item use, so a sprinting retreat could never finish the bite.
+allow_retreat_while_eating = true
+# Distance at which the bot stops using the normal pathfinder and switches to
+# its own continuous combat movement (see src/combat/movement/). Further away
+# the target is somewhere to walk to; closer, it is someone to fight.
+engage_range = 6.0
 sprint_reset_enabled = true
 strafe_enabled = true
 prediction_enabled = true
 max_chase_distance = 128.0
+# Fight with a sword/axe as usual, but reach for the Mace whenever there is a
+# fall to capitalize on -- on by default. Opportunistically, any time an
+# incidental fall (jumping down onto the target, a Wind Burst Mace's own
+# re-launch, a Breeze's wind charge, ...) gets the bot airborne far enough;
+# deliberately, once every few (randomized) ordinary hits, by throwing a Wind
+# Charge straight down at its own feet, launching itself into the air, and
+# hitting the target on the way back down -- costing a Wind Charge and a
+# couple of seconds standing still per attempt. Either way the Mace is only
+# ever held for that one swing: the bot reverts to its normal sword/axe the
+# instant the smash lands (or the fall never materializes) rather than eating
+# the Mace's much slower recharge (0.6/s vs. a sword's 1.6/s) on every
+# ordinary hit.
+prefer_mace = true
+
+# Baritone-style long-distance navigation (`src/pathfinding/`). Plans the
+# route and slices it into segments; each segment is still walked by
+# `[movement]`/`[vertical_navigation]` below. `/goto <x> <y> <z>` uses this
+# automatically once the destination is farther than
+# `long_distance_threshold`; shorter hops go straight to the movement layer
+# exactly as before. `debug_pathfinding` turns on the `[Pathfinder]`
+# narration (route plans, per-segment progress, every replan and its
+# reason). `/pathstatus` reports the current segment either way.
+[pathfinding]
+enabled = true
+debug_pathfinding = false
+long_distance_threshold = 96.0
+segment_length = 48.0
+sample_margin = 24
+vertical_window = 32
+max_search_nodes = 20000
+search_timeout_ms = 1500
+arrival_radius = 1.5
+segment_arrival_radius = 3.0
+segment_stuck_seconds = 12
+max_consecutive_replans = 8
+cache_capacity = 4096
+cache_max_age = 8192
+allow_breaking = true
+# Intersected with [vertical_navigation]'s own build permissions: turning
+# building off there also stops the planner routing bridges.
+allow_bridging = true
+allow_swimming = true
+max_drop = 8
+
+# What each kind of movement is worth, in units of "one block of easy
+# walking" -- so `break_block = 6.0` reads as "mining one block out of the
+# way is worth walking six blocks around it". Raise `lava_avoidance` or
+# `hazard` to make the bot more cautious, lower `break_block` to make it dig
+# more readily. Every weight must be greater than zero.
+[pathfinding.costs]
+walk = 1.0
+diagonal = 1.41
+jump_up = 1.8
+drop_per_block = 1.1
+max_safe_drop = 3
+fall_damage_penalty = 20.0
+swim = 3.0
+break_block = 6.0
+bridge_block = 8.0
+climb = 2.5
+hazard = 40.0
+lava_avoidance = 200.0
+hazard_proximity = 6.0
+ledge_proximity = 1.0
+entity_hazard = 25.0
 
 # A player can run a real console command directly from Minecraft chat with
 # a `#` prefix, e.g. `#goto 100 64 20` runs exactly what `/goto 100 64 20`
@@ -150,9 +272,10 @@ maximum_navigation_seconds = 120
 repath_interval_ms = 1000
 
 [look]
-update_rate = 20
-reaction_delay_min_ms = 35
-reaction_delay_max_ms = 90
+update_rate = 30
+# Human reaction latency before the aim starts moving toward a new target.
+reaction_delay_min_ms = 10
+reaction_delay_max_ms = 28
 moving_target_prediction = true
 prediction_strength = 0.35
 minimum_target_movement = 0.03
@@ -168,16 +291,26 @@ minimum_hold_time_ms = 350
 maximum_hold_time_ms = 1200
 retarget_chance_per_second = 0.35
 
+# Fast, human-like aim: quick to accelerate up to a snappy top speed and
+# quick to brake into the target, rather than a slow drifting turn -- but
+# still eased motion with overshoot/micro-correction, not an instant snap
+# (see `look.randomization`/`precision::LookPrecision::Instant` for that).
+#
+# Speeds are 2x the original profile and accelerations 4x, which together
+# halve the time of a turn whether it is short (acceleration-limited, where
+# d = a*t^2/2 means halving the time needs 4x the acceleration) or long
+# (top-speed-limited, where it needs 2x). Halve every number in this block to
+# get the old, calmer aim back.
 [look.motion]
-minimum_yaw_speed = 25.0
-maximum_yaw_speed = 220.0
-minimum_pitch_speed = 20.0
-maximum_pitch_speed = 160.0
-yaw_acceleration = 600.0
-pitch_acceleration = 450.0
-yaw_deceleration = 700.0
-pitch_deceleration = 550.0
-slowdown_angle = 18.0
+minimum_yaw_speed = 120.0
+maximum_yaw_speed = 960.0
+minimum_pitch_speed = 100.0
+maximum_pitch_speed = 760.0
+yaw_acceleration = 8800.0
+pitch_acceleration = 7200.0
+yaw_deceleration = 10400.0
+pitch_deceleration = 8400.0
+slowdown_angle = 14.0
 arrival_tolerance = 1.2
 micro_correction_enabled = true
 micro_correction_strength = 0.35

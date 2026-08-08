@@ -20,6 +20,7 @@ use crate::{
     logging,
     look::LookController,
     minecraft::client::MinecraftClient,
+    movement::MovementService,
 };
 
 #[derive(Clone)]
@@ -58,6 +59,14 @@ impl KillController {
         let player = world
             .find_player_by_name(&name)
             .ok_or_else(|| AppError::UnknownPlayer(name.clone()))?;
+        // Defensive, same reasoning as `executor::stop_all`: this call site
+        // is exempt from the normal pre-start `pvp.cancel()` (a `#kill`
+        // restarts pvp itself -- see `App::execute_console_input`'s
+        // exemption list), so if the previous fight ended mid-bite or
+        // mid-Wind-Charge-throw without going through `cancel`/`stop_all`,
+        // a brand new fight must not inherit a stuck guard that would
+        // refuse its own first hotbar swap.
+        minecraft.end_consume_guard();
         {
             let mut inner = self.inner.lock().await;
             inner.reset_for_new_fight();
@@ -82,21 +91,36 @@ impl KillController {
     /// An idle (or already-terminal) controller is a no-op, the same
     /// contract every other controller in this codebase follows -- callers
     /// defensively cancel before starting something new.
-    pub async fn cancel(&self, minecraft: &MinecraftClient, look: &LookController) {
+    ///
+    /// `movement` is taken because a fight cancelled during its approach may
+    /// still hold a pathfinding goal (see `crate::combat::movement`'s
+    /// long-distance handoff); releasing only the raw combat input would
+    /// leave the bot walking to where the target used to be.
+    pub async fn cancel(
+        &self,
+        minecraft: &MinecraftClient,
+        movement: &MovementService,
+        look: &LookController,
+    ) {
         let active = { self.inner.lock().await.snapshot.state == KillState::Running };
         if !active {
             return;
         }
-        executor::stop_all(minecraft, look).await;
+        executor::stop_all(minecraft, movement, look).await;
         let mut inner = self.inner.lock().await;
         inner.snapshot.state = KillState::Cancelled;
         inner.snapshot.failure_reason = None;
         logging::info("Kill task cancelled");
     }
 
-    pub async fn tick(&self, minecraft: &MinecraftClient, look: &LookController) {
+    pub async fn tick(
+        &self,
+        minecraft: &MinecraftClient,
+        movement: &MovementService,
+        look: &LookController,
+    ) {
         let mut inner = self.inner.lock().await;
-        executor::tick(minecraft, look, &mut inner).await;
+        executor::tick(minecraft, movement, look, &mut inner).await;
     }
 }
 
@@ -130,6 +154,13 @@ mod tests {
         )
     }
 
+    fn movement() -> MovementService {
+        MovementService::new(
+            crate::config::MovementConfig::default(),
+            crate::config::MultitaskingConfig::default(),
+        )
+    }
+
     fn look() -> LookController {
         LookController::new(LookConfig::default(), BlockSearchService::new(32, 20, 32))
     }
@@ -143,8 +174,33 @@ mod tests {
     #[tokio::test]
     async fn cancel_on_an_idle_controller_is_a_no_op() {
         let kill = KillController::default();
-        kill.cancel(&minecraft(), &look()).await;
+        kill.cancel(&minecraft(), &movement(), &look()).await;
         assert_eq!(kill.snapshot().await.state, KillState::Created);
+    }
+
+    /// `apply_eating` raises the consume guard and only lowers it again from
+    /// inside `tick` -- which `cancel` stops driving forever the instant it
+    /// runs. Without `stop_all` releasing the guard itself, a `#kill`
+    /// cancelled mid-bite (e.g. `crate::survival`'s water-clutch arming)
+    /// would leave every hotbar/container mutation in the bot permanently
+    /// refused with `InventoryBusy`.
+    #[tokio::test]
+    async fn cancelling_mid_bite_releases_the_stuck_consume_guard() {
+        let minecraft = minecraft();
+        let kill = KillController::default();
+        minecraft.begin_consume_guard();
+        assert!(minecraft.consume_guard_active());
+
+        // `cancel` only acts when the snapshot is `Running`.
+        {
+            let mut inner = kill.inner.lock().await;
+            inner.snapshot.state = KillState::Running;
+        }
+
+        kill.cancel(&minecraft, &movement(), &look()).await;
+
+        assert!(!minecraft.consume_guard_active());
+        assert_eq!(kill.snapshot().await.state, KillState::Cancelled);
     }
 
     #[tokio::test]
@@ -158,7 +214,7 @@ mod tests {
     #[tokio::test]
     async fn ticking_an_untouched_controller_does_not_panic() {
         let kill = KillController::default();
-        kill.tick(&minecraft(), &look()).await;
+        kill.tick(&minecraft(), &movement(), &look()).await;
         assert_eq!(kill.snapshot().await.state, KillState::Created);
     }
 }

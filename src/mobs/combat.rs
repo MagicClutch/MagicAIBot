@@ -37,10 +37,14 @@ const ATTACK_RANGE: f64 = 3.0;
 /// probably-momentary overshoot -- only resume chasing once genuinely out of
 /// range.
 const REENGAGE_RANGE: f64 = ATTACK_RANGE * 1.6;
-/// Paces how often the client bothers to send another attack packet;
-/// Azalea's own `AttackStrengthScale`/cooldown machinery still governs
-/// server-side damage regardless of how often this fires.
-const ATTACK_INTERVAL: Duration = Duration::from_millis(600);
+/// Fallback pacing for how often the client sends another attack packet,
+/// used only by `CombatController::default()` (tests and the emergency-stop
+/// harness). The live controller is built from
+/// `KillbotConfig::attack_cooldown_ms` instead -- see
+/// [`CombatController::new`] -- so mob combat and PvP swing at the same
+/// configured rate. Azalea's own `AttackStrengthScale`/cooldown machinery
+/// still governs server-side damage regardless of how often this fires.
+const DEFAULT_ATTACK_INTERVAL: Duration = crate::combat::crits::SWORD_COOLDOWN;
 /// `LookTarget::Entity` tracks a moving target continuously and therefore
 /// (see `look::look_controller::keeps_ticking`) never reports `Completed` --
 /// waiting for that would hang forever. Give the rotation a short, bounded
@@ -121,18 +125,25 @@ struct Inner {
 #[derive(Clone)]
 pub struct CombatController {
     inner: Arc<Mutex<Inner>>,
+    /// Spacing between attack packets -- see `KillbotConfig::attack_cooldown_ms`.
+    attack_interval: Duration,
 }
 
 impl Default for CombatController {
     fn default() -> Self {
-        Self::new()
+        Self::new(DEFAULT_ATTACK_INTERVAL)
     }
 }
 
 impl CombatController {
-    pub fn new() -> Self {
+    /// `attack_interval` is the bot's configured hit cadence
+    /// (`KillbotConfig::attack_cooldown_ms`), shared with `#kill`'s PvP
+    /// combat: the same swing on the same weapon should not be paced
+    /// differently just because the target is a zombie.
+    pub fn new(attack_interval: Duration) -> Self {
         Self {
             inner: Arc::new(Mutex::new(Inner::default())),
+            attack_interval,
         }
     }
 
@@ -431,7 +442,7 @@ impl CombatController {
         };
         if ready {
             let _ = minecraft.attack_entity(target_entity_id).await;
-            self.inner.lock().await.next_attack_at = Some(SystemTime::now() + ATTACK_INTERVAL);
+            self.inner.lock().await.next_attack_at = Some(SystemTime::now() + self.attack_interval);
         }
     }
 
@@ -665,13 +676,13 @@ mod tests {
 
     #[tokio::test]
     async fn starts_idle() {
-        let combat = CombatController::new();
+        let combat = CombatController::default();
         assert_eq!(combat.snapshot().await.state, CombatState::Idle);
     }
 
     #[tokio::test]
     async fn cancel_on_an_idle_controller_is_a_no_op() {
-        let combat = CombatController::new();
+        let combat = CombatController::default();
         combat.cancel(&minecraft(), &movement(), &look()).await;
         assert_eq!(combat.snapshot().await.state, CombatState::Idle);
     }
@@ -681,7 +692,7 @@ mod tests {
         // No live connection, so the bot has no known position -- must
         // report an error rather than panicking (never crash on missing
         // world state, matching the block-gathering path's contract).
-        let combat = CombatController::new();
+        let combat = CombatController::default();
         let result = combat
             .kill_nearest(&minecraft(), &movement(), "minecraft:cow".into(), 32)
             .await;
