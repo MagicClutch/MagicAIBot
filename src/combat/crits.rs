@@ -2,11 +2,17 @@
 //!
 //! Vanilla awards a critical hit (1.5x damage, the little star particles)
 //! when the attacker hits while falling (not on the ground, moving
-//! downward) and isn't otherwise disqualified (sprinting *into* the hit,
-//! climbing, blind, etc. -- none of which this bot ever does mid-swing, so
-//! those exclusions don't need modeling here). The only lever available is
-//! *when* to attack relative to a jump: jump, let gravity take over for a
-//! couple of ticks, then swing while still airborne and descending.
+//! downward) and isn't otherwise disqualified: sprinting into the hit,
+//! climbing, or blind. [`is_critical_window`] does not itself check for a
+//! live sprint (the movement controller's own sprint decision isn't
+//! plumbed in here) -- a swing that happens to line up with both an
+//! airborne fall *and* the bot still sprinting from closing distance in the
+//! same tick is misreported as a crit in the bot's own logging/counters
+//! even though vanilla would actually apply sprint knockback instead. Both
+//! outcomes are real, useful hits either way; only the bot's own telemetry
+//! about which one landed can be wrong. The only lever genuinely available
+//! here is *when* to attack relative to a jump: jump, let gravity take over
+//! for a couple of ticks, then swing while still airborne and descending.
 //!
 //! # Maximum damage means swinging at exactly 100% charge
 //!
@@ -25,15 +31,21 @@
 //! land every hit at ~62% charge -- the single biggest damage loss available
 //! to a bot that switches to an axe to break shields.
 //!
-//! # A hit that isn't a crit is a wasted hit
+//! # A held-for crit is not always the right hit
 //!
-//! With `always_crit` on (the default), no swing is ever taken flat-footed,
-//! whatever is in the bot's hand: if the cooldown comes up while it is
-//! standing on the ground with no jump in flight, it jumps *and holds the
-//! swing* until it is falling ([`should_force_crit_jump`]). That costs
-//! ~0.3s on that one hit and buys 1.5x damage -- a net DPS gain even on a
-//! sword's short cooldown, and a larger one on an axe's long one, where the
-//! hold is a smaller fraction of the cycle.
+//! With `always_crit` on (off by default -- see
+//! `combat::executor::apply_attack`'s doc comment for why), no swing is
+//! ever taken flat-footed, whatever is in the bot's hand: if the cooldown
+//! comes up while it is standing on the ground with no jump in flight, it
+//! jumps *and holds the swing* until it is falling
+//! ([`should_force_crit_jump`]). That costs ~0.3s on that one hit and buys
+//! 1.5x damage -- more damage on that swing even on a sword's short
+//! cooldown, and more still on an axe's long one, where the hold is a
+//! smaller fraction of the cycle. What it does *not* buy is the sprint
+//! knockback that swing would otherwise have landed (vanilla forces the two
+//! apart -- see [`is_critical_window`]'s note below), which is why holding
+//! for it on every neutral-exchange swing is off by default and reserved
+//! for a finishing blow instead.
 //!
 //! It is bounded by [`CRIT_HOLD_TIMEOUT`] rather than unconditional, because
 //! "jump" is a request the world can refuse: under a low ceiling, in a
@@ -71,6 +83,11 @@ pub fn weapon_cooldown(item_id: Option<&str>) -> Duration {
     };
     let speed = match id.trim_start_matches("minecraft:") {
         id if id.ends_with("_sword") => 1.6,
+        // The slowest of any melee weapon -- see `mace::MACE_COOLDOWN`'s
+        // doc comment for why leaving this unrecognized (falling through
+        // to the 4.0 default below) was a real damage bug, not a cosmetic
+        // one, for any fight where the bot ends up holding one.
+        "mace" => 0.6,
         "trident" => 1.1,
         "wooden_axe" | "stone_axe" => 0.8,
         "iron_axe" => 0.9,
@@ -305,6 +322,22 @@ mod tests {
             Duration::from_millis(1250)
         );
         assert!(weapon_cooldown(Some("minecraft:diamond_axe")) > SWORD_COOLDOWN);
+    }
+
+    #[test]
+    fn a_mace_recharges_slower_than_any_axe_or_sword() {
+        // The bug this guards against: an unrecognized "mace" id used to
+        // fall through to the 4.0 default (250ms), landing hits at roughly
+        // a seventh of the real recharge time.
+        assert_eq!(
+            weapon_cooldown(Some("minecraft:mace")),
+            Duration::from_secs_f64(1.0 / 0.6)
+        );
+        assert!(
+            weapon_cooldown(Some("minecraft:mace"))
+                > weapon_cooldown(Some("minecraft:netherite_axe"))
+        );
+        assert!(weapon_cooldown(Some("minecraft:mace")) > SWORD_COOLDOWN);
     }
 
     #[test]

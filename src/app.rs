@@ -1584,16 +1584,23 @@ impl App {
                         }
                         ConsoleCommand::ContainerStatus => {
                             let s = self.container.status().await;
+                            let detail = s
+                                .detail
+                                .as_deref()
+                                .map_or_else(String::new, |d| format!(" ({d})"));
                             println!(
-                                "Container: {:?}; target={:?}; menu={:?}; transferred={}/{}; outcome={:?}{}",
+                                "Container: {:?}; target={:?}; menu={:?}; transferred={}/{}; outcome={:?}{detail}",
                                 s.phase,
                                 s.target,
                                 s.window_id,
                                 s.transferred,
                                 s.requested,
                                 s.outcome,
-                                s.detail.map(|d| format!(" ({d})")).unwrap_or_default()
                             );
+                            logging::info(format!(
+                                "Container: {:?} target={:?} transferred={}/{} outcome={:?}{detail}",
+                                s.phase, s.target, s.transferred, s.requested, s.outcome,
+                            ));
                         }
                         ConsoleCommand::CloseContainer => {
                             self.container.close(&self.minecraft).await
@@ -1737,6 +1744,14 @@ impl App {
             "  opened: {:?}  observed: {:?}  closed: {:?}",
             snapshot.opened_at, snapshot.observed_at, snapshot.closed_at
         );
+        logging::info(format!(
+            "Container: open={} synced={} state={:?} slots={}/{}",
+            snapshot.is_open,
+            snapshot.is_synced,
+            snapshot.sync_state,
+            snapshot.container_slots.len(),
+            snapshot.player_slots.len()
+        ));
     }
 
     async fn find_blocks(&self, block_id: String, radius: Option<u32>, limit: Option<usize>) {
@@ -1773,6 +1788,7 @@ impl App {
         let snapshot = self.block_navigation.snapshot().await;
         if matches!(snapshot.state, BlockNavigationState::Idle) {
             println!("No block navigation task is active.");
+            logging::info("No block navigation task is active");
             return;
         }
         let state = match snapshot.state {
@@ -1839,6 +1855,15 @@ impl App {
                 .start_time
                 .map_or(0, |started| started.elapsed().unwrap_or_default().as_secs())
         );
+        logging::info(format!(
+            "GotoBlock: {state} block={} distance={}{}",
+            snapshot.requested_block_id.as_deref().unwrap_or("unknown"),
+            distance.map_or_else(|| "unknown".into(), |value| format!("{value:.1}")),
+            snapshot
+                .failure_reason
+                .as_deref()
+                .map_or_else(String::new, |reason| format!(" ({reason})"))
+        ));
         if let Some(reason) = snapshot.failure_reason {
             println!("Failure reason: {reason}");
         }
@@ -1853,19 +1878,22 @@ impl App {
         if navigation.state != NavigationState::Idle {
             println!("{}", crate::pathfinding::debug::format_status(&navigation));
         }
-        match self.minecraft.navigation_status().await {
-            Ok(status) if status.calculating => println!("Pathfinder: calculating"),
-            Ok(status) if status.executing => println!("Pathfinder: following path"),
-            Ok(status) if status.reached => println!("Pathfinder: completed"),
-            Ok(_) => println!("Pathfinder: idle or no path"),
-            Err(error) => println!("Pathfinder unavailable: {error}"),
-        }
+        let pathfinder_summary = match self.minecraft.navigation_status().await {
+            Ok(status) if status.calculating => "calculating".to_owned(),
+            Ok(status) if status.executing => "following path".to_owned(),
+            Ok(status) if status.reached => "completed".to_owned(),
+            Ok(_) => "idle or no path".to_owned(),
+            Err(error) => format!("unavailable ({error})"),
+        };
+        println!("Pathfinder: {pathfinder_summary}");
+        logging::info(format!("Pathfinder: {pathfinder_summary}"));
     }
 
     async fn print_look_status(&self) {
         let snapshot = self.look.snapshot().await;
         if snapshot.state == LookState::Idle {
             println!("No look task is active.");
+            logging::info("No look task is active");
             return;
         }
         let state = match snapshot.state {
@@ -1906,6 +1934,16 @@ impl App {
                 .unwrap_or_default()
                 .as_secs_f64())
         );
+        logging::info(format!(
+            "Look: {state} target={} yaw={} pitch={}{}",
+            snapshot.target.as_deref().unwrap_or("unknown"),
+            fmt_opt(snapshot.yaw),
+            fmt_opt(snapshot.pitch),
+            snapshot
+                .failure_reason
+                .as_deref()
+                .map_or_else(String::new, |reason| format!(" ({reason})"))
+        ));
         if let Some(reason) = snapshot.failure_reason {
             println!("Failure reason: {reason}");
         }
@@ -1915,6 +1953,7 @@ impl App {
         let snapshot = self.interaction.snapshot().await;
         if snapshot.state == InteractionState::Idle {
             println!("No interaction is active.");
+            logging::info("No interaction is active");
             return;
         }
         println!("State: {:?}", snapshot.state);
@@ -1942,6 +1981,18 @@ impl App {
                 .as_secs_f64())
         );
         println!("Retries: {}", snapshot.retries);
+        logging::info(format!(
+            "Interaction: {:?} target={} progress={}{}",
+            snapshot.state,
+            snapshot.target.as_deref().unwrap_or("unknown"),
+            snapshot
+                .progress_percent
+                .map_or_else(|| "not available".into(), |value| format!("{value}%")),
+            snapshot
+                .failure_reason
+                .as_deref()
+                .map_or_else(String::new, |reason| format!(" ({reason})"))
+        ));
         if let Some(reason) = snapshot.failure_reason {
             println!("Failure reason: {reason}");
         }
@@ -2031,6 +2082,25 @@ impl App {
             "Application uptime: {} seconds",
             self.started_at.elapsed().as_secs()
         );
+        logging::info(format!(
+            "Status: {:?} pos={} dim={} health={}/{} food={} task={}",
+            status.connection_state,
+            world.bot.position.map_or_else(
+                || "unknown".into(),
+                |p| format!("{:.1} {:.1} {:.1}", p.x, p.y, p.z)
+            ),
+            world.bot.dimension.as_deref().unwrap_or("unknown"),
+            fmt_opt(world.bot.health),
+            fmt_opt(world.bot.maximum_health),
+            world
+                .bot
+                .food_level
+                .map_or_else(|| "unknown".into(), |v| v.to_string()),
+            world
+                .current_task
+                .as_ref()
+                .map_or("none", |t| t.name.as_str())
+        ));
     }
 
     async fn print_where(&self) {
@@ -2072,9 +2142,13 @@ impl App {
         let world = self.minecraft.world_state_snapshot().await;
         if world.players.is_empty() {
             println!("No known players.");
+            logging::info("No known players nearby");
             return;
         }
-        for player in world.players {
+        const CHAT_NAME_LIMIT: usize = 5;
+        let mut names: Vec<&str> = Vec::with_capacity(world.players.len());
+        for player in &world.players {
+            names.push(&player.username);
             let distance = player
                 .distance
                 .map_or_else(|| "unknown".into(), |d| format!("{d:.1}"));
@@ -2087,6 +2161,22 @@ impl App {
                 player.username, player.uuid, distance, position, player.loaded
             );
         }
+        let shown = names
+            .iter()
+            .take(CHAT_NAME_LIMIT)
+            .copied()
+            .collect::<Vec<_>>()
+            .join(", ");
+        let more = names.len().saturating_sub(CHAT_NAME_LIMIT);
+        logging::info(format!(
+            "Players nearby: {} ({shown}{})",
+            names.len(),
+            if more > 0 {
+                format!(", +{more} more")
+            } else {
+                String::new()
+            }
+        ));
     }
 
     async fn print_inventory(&self) {
@@ -2147,6 +2237,20 @@ impl App {
                 name
             );
         }
+        logging::info(format!(
+            "Inventory: slot={} holding={} occupied={}/{} distinct={}",
+            world
+                .inventory
+                .selected_hotbar_slot
+                .map_or_else(|| "unknown".into(), |v| v.to_string()),
+            world.inventory.selected_item().map_or_else(
+                || "unknown".into(),
+                |i| format!("{} x{}", i.item_id.as_deref().unwrap_or("unknown"), i.count)
+            ),
+            used_slots,
+            world.inventory.slots.len(),
+            world.inventory.total_counts.len()
+        ));
     }
 
     /// Lets a player run a real console command directly from Minecraft chat
@@ -2268,15 +2372,18 @@ impl App {
         let radius = f64::from(radius.unwrap_or(64));
         if !(radius > 0.0 && radius <= 256.0) {
             println!("Entity query error: radius must be between 0 and 256");
+            logging::warning("Entity query error: radius must be between 0 and 256");
             return;
         }
-        for entity in world
+        const CHAT_TYPE_LIMIT: usize = 5;
+        let nearby: Vec<_> = world
             .entities
             .iter()
             .filter(|e| e.alive != Some(false) && e.health.is_none_or(|health| health > 0.0))
             .filter(|e| e.distance <= radius)
             .take(64)
-        {
+            .collect();
+        for entity in &nearby {
             println!(
                 "{} | distance {:.1} | {:.2} {:.2} {:.2}",
                 entity.entity_type,
@@ -2286,6 +2393,24 @@ impl App {
                 entity.position.z
             );
         }
+        let types = nearby
+            .iter()
+            .map(|e| e.entity_type.as_str())
+            .take(CHAT_TYPE_LIMIT)
+            .collect::<Vec<_>>()
+            .join(", ");
+        let more = nearby.len().saturating_sub(CHAT_TYPE_LIMIT);
+        logging::info(format!(
+            "Entities within {radius:.0}m: {}{}",
+            nearby.len(),
+            if nearby.is_empty() {
+                String::new()
+            } else if more > 0 {
+                format!(" ({types}, +{more} more)")
+            } else {
+                format!(" ({types})")
+            }
+        ));
     }
 
     async fn print_movement(&self) {
@@ -2332,6 +2457,21 @@ impl App {
             local_input.sprint,
             local_input.speed_multiplier * 100.0,
         );
+        logging::info(format!(
+            "Movement: {:?} dest={} remaining={}{}",
+            movement.status,
+            movement.destination.map_or_else(
+                || "unknown".into(),
+                |p| format!("{:.1} {:.1} {:.1}", p.x, p.y, p.z)
+            ),
+            movement
+                .estimated_distance
+                .map_or_else(|| "unknown".into(), |d| format!("{d:.1}")),
+            movement
+                .failure_reason
+                .as_deref()
+                .map_or_else(String::new, |reason| format!(" ({reason})"))
+        ));
         if let Some(reason) = movement.failure_reason {
             println!("Failure reason: {reason}");
         }
@@ -3524,16 +3664,18 @@ impl App {
                 }
                 ConsoleCommand::ContainerStatus => {
                     let s = self.container.status().await;
+                    let detail = s
+                        .detail
+                        .as_deref()
+                        .map_or_else(String::new, |d| format!(" ({d})"));
                     println!(
-                        "Container: {:?}; target={:?}; menu={:?}; transferred={}/{}; outcome={:?}{}",
-                        s.phase,
-                        s.target,
-                        s.window_id,
-                        s.transferred,
-                        s.requested,
-                        s.outcome,
-                        s.detail.map(|d| format!(" ({d})")).unwrap_or_default()
+                        "Container: {:?}; target={:?}; menu={:?}; transferred={}/{}; outcome={:?}{detail}",
+                        s.phase, s.target, s.window_id, s.transferred, s.requested, s.outcome,
                     );
+                    logging::info(format!(
+                        "Container: {:?} target={:?} transferred={}/{} outcome={:?}{detail}",
+                        s.phase, s.target, s.transferred, s.requested, s.outcome,
+                    ));
                     true
                 }
                 _ => false,

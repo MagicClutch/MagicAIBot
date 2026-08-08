@@ -169,6 +169,23 @@ impl Default for DistanceBand {
     }
 }
 
+/// The same policy, rewritten to hold the bot *away* from the target.
+///
+/// Used while eating: the fight distance becomes the crowding distance, so
+/// every steering term that normally closes the gap now opens it, and the
+/// orbit carries on unchanged. Nothing else about the controller changes --
+/// the camera stays locked on the opponent, the strafe keeps its jitter, and
+/// the bot re-engages the moment the band goes back to normal.
+#[must_use]
+pub fn retreat_band(band: &DistanceBand) -> DistanceBand {
+    DistanceBand {
+        too_close: band.chase * 2.0,
+        preferred_min: band.chase * 2.4,
+        preferred_max: band.chase * 2.8,
+        chase: band.chase * 3.2,
+    }
+}
+
 /// Relative pull of each steering contribution. Tunable so the bot can be
 /// made to orbit harder or commit straighter without touching the geometry.
 #[derive(Clone, Copy, Debug)]
@@ -545,6 +562,45 @@ mod tests {
         steering.avoidance = Vec2::new(3.0, 3.0);
         let desired = desired_velocity(steering, &band, &SteeringWeights::default());
         assert!(desired.length() <= 1.0 + 1e-9);
+    }
+
+    #[test]
+    fn the_retreat_band_turns_a_fighting_distance_into_a_crowding_one() {
+        let band = DistanceBand::default();
+        let retreat = retreat_band(&band);
+        assert!(
+            retreat.too_close > band.chase,
+            "melee range now counts as too close"
+        );
+        assert!(retreat.preferred_min < retreat.preferred_max);
+        assert!(retreat.preferred_max < retreat.chase);
+    }
+
+    #[test]
+    fn retreating_from_melee_range_drives_the_bot_backwards_while_still_circling() {
+        let band = retreat_band(&DistanceBand::default());
+        let desired = desired_velocity(
+            input(Vec2::new(0.0, 0.0), Vec2::new(0.0, 2.0), 1.0),
+            &band,
+            &SteeringWeights::default(),
+        );
+        assert!(desired.z < 0.0, "should be opening the gap: {desired:?}");
+        assert!(desired.x.abs() > 0.1, "and still circling: {desired:?}");
+    }
+
+    #[test]
+    fn the_retreat_settles_at_a_distance_rather_than_running_forever() {
+        let band = retreat_band(&DistanceBand::default());
+        let mid = (band.preferred_min + band.preferred_max) / 2.0;
+        let desired = desired_velocity(
+            input(Vec2::new(0.0, 0.0), Vec2::new(0.0, mid), 1.0),
+            &band,
+            &SteeringWeights::default(),
+        );
+        assert!(
+            desired.z.abs() < 1e-6,
+            "no closing or opening component left"
+        );
     }
 
     #[test]

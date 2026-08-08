@@ -29,6 +29,12 @@ pub struct EquipmentItem {
     pub item_id: String,
     pub current_durability: u32,
     pub max_durability: u32,
+    /// `(vanilla enchantment id, level)` pairs, e.g. `("sharpness", 5)`.
+    /// Empty for an unenchanted item. See
+    /// `MinecraftClient::equipment_snapshot`'s doc comment for why this is a
+    /// list of plain ids rather than an Azalea enchantment type -- this
+    /// module stays Azalea-free.
+    pub enchantments: Vec<(String, u32)>,
 }
 
 /// A snapshot of everything the equipment system needs to decide what

@@ -49,7 +49,11 @@ chat = "info"
 # `eat_cooldown_ms` before considering another. Once the *target* falls to
 # `finisher_health` the bot stops eating altogether and just finishes them.
 [killbot]
-attack_range = 2.0
+# Vanilla survival melee reach is 3.0 blocks (attack and block-interact reach
+# both -- see the Minecraft Wiki's combat mechanics page); anything lower
+# gives away real range to an opponent who can already hit the bot at 2-3
+# blocks while it stands there unable to swing back.
+attack_range = 3.0
 # Milliseconds between hits, or 0 (the default) for automatic: swing exactly
 # when the weapon in hand finishes recharging -- 625ms for any sword, 1000ms
 # for a netherite axe. Automatic is the maximum-damage setting: Java scales
@@ -63,12 +67,18 @@ preferred_range = 1.8
 crit_enabled = true
 # Never swing flat-footed, whatever is in hand: if the cooldown comes up
 # while the bot is standing on the ground, jump and hold the hit until it
-# lands as a critical (1.5x damage). Costs ~0.3s on those hits and more than
-# pays for it -- proportionally more on an axe, whose longer cooldown makes
-# the hold a smaller share of the cycle. A bot that physically cannot jump
-# (low ceiling, one-block tunnel) swings normally after a moment instead of
-# freezing.
-always_crit = true
+# lands as a critical (1.5x damage) instead of the default sprint-reset
+# knockback hit. Off by default: vanilla makes sprint knockback and crits
+# mutually exclusive per swing, so holding every neutral-exchange swing for
+# a crit means giving up the knockback spacing that keeps the target from
+# landing a return hit -- see combat::executor::apply_attack's doc comment.
+# A finishing blow (below finisher_health) always holds for the crit
+# regardless of this setting. Turn this on for more damage per hit at the
+# cost of spacing control. Costs ~0.3s on the hits where it applies -- more
+# on an axe, whose longer cooldown makes the hold a smaller share of the
+# cycle. A bot that physically cannot jump (low ceiling, one-block tunnel)
+# swings normally after a moment instead of freezing.
+always_crit = false
 shield_break_enabled = true
 shield_use_enabled = true
 heal_threshold = 8.0
@@ -83,6 +93,17 @@ eat_cooldown_ms = 5000
 # attacks -- a target this close to death dies to the next couple of hits,
 # and stopping to eat hands them the fight. 0 disables the rule.
 finisher_health = 8.0
+# Eating is an atomic action: while a bite is in flight the bot's hand is
+# claimed and no other subsystem may move an item (the hotbar and armor
+# services would otherwise cancel it, since eating changes the inventory
+# revision they watch). If a bite is cancelled anyway, it retries this many
+# times with this pause between attempts.
+eat_retry_delay_ms = 150
+eat_retry_limit = 3
+# Back off and circle while chewing rather than eating where it stands. Note
+# the bot walks rather than sprints while retreating: sprinting cancels
+# vanilla item use, so a sprinting retreat could never finish the bite.
+allow_retreat_while_eating = true
 # Distance at which the bot stops using the normal pathfinder and switches to
 # its own continuous combat movement (see src/combat/movement/). Further away
 # the target is somewhere to walk to; closer, it is someone to fight.
@@ -91,6 +112,19 @@ sprint_reset_enabled = true
 strafe_enabled = true
 prediction_enabled = true
 max_chase_distance = 128.0
+# Fight with a sword/axe as usual, but reach for the Mace whenever there is a
+# fall to capitalize on -- on by default. Opportunistically, any time an
+# incidental fall (jumping down onto the target, a Wind Burst Mace's own
+# re-launch, a Breeze's wind charge, ...) gets the bot airborne far enough;
+# deliberately, once every few (randomized) ordinary hits, by throwing a Wind
+# Charge straight down at its own feet, launching itself into the air, and
+# hitting the target on the way back down -- costing a Wind Charge and a
+# couple of seconds standing still per attempt. Either way the Mace is only
+# ever held for that one swing: the bot reverts to its normal sword/axe the
+# instant the smash lands (or the fall never materializes) rather than eating
+# the Mace's much slower recharge (0.6/s vs. a sword's 1.6/s) on every
+# ordinary hit.
+prefer_mace = true
 
 # Baritone-style long-distance navigation (`src/pathfinding/`). Plans the
 # route and slices it into segments; each segment is still walked by

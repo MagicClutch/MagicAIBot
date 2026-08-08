@@ -36,27 +36,37 @@
 //! - [`terrain_probe`] -- lightweight local obstacle/hazard reading for
 //!   that controller.
 //! - [`crits`] -- pure attack-cooldown and critical-hit-timing decisions.
+//! - [`mace`] -- pure Mace smash-attack detection: whether a swing lands
+//!   during a fall deep enough to trigger the bonus.
+//! - [`wind_launch`] -- the state machine that engineers that fall by
+//!   throwing a Wind Charge straight down at the bot's own feet, then hands
+//!   off to [`mace`] for the landing.
 //! - [`shield_break`] -- pure axe-switch policy for breaking the *target's*
 //!   shield.
 //! - [`defense`] -- pure policy for the bot's *own* shield use.
 //! - [`health`] -- pure health-based behavior mode
 //!   ([`health::CombatMode`]).
 //! - [`heal`] -- pure food-selection policy.
+//! - [`consume`] -- the six-state machine that makes eating an atomic
+//!   action nothing but an emergency may interrupt.
 //! - [`executor`] -- per-tick async orchestration: turns the pure
 //!   decisions above into actual client calls.
 //! - [`kill`] -- [`kill::KillController`], the public controller `App`
 //!   drives for `#kill`/`/kill`.
 
+pub mod consume;
 pub mod crits;
 pub mod defense;
 pub mod executor;
 pub mod heal;
 pub mod health;
 pub mod kill;
+pub mod mace;
 pub mod movement;
 pub mod shield_break;
 pub mod state;
 pub mod targeting;
 pub mod terrain_probe;
+pub mod wind_launch;
 
 pub use kill::KillController;

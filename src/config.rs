@@ -546,13 +546,26 @@ pub struct KillbotConfig {
     /// hold the hit until it lands as a critical (1.5x damage) instead of
     /// swinging immediately.
     ///
-    /// Costs about a third of a second on the hits where it applies and pays
-    /// for it several times over in damage -- proportionally more on an axe,
-    /// whose longer cooldown makes the hold a smaller share of the cycle.
-    /// Bounded, so a bot that cannot jump (a low ceiling, a one-block
-    /// tunnel) swings normally after a moment rather than freezing -- see
-    /// `combat::crits::CRIT_HOLD_TIMEOUT`. Requires `crit_enabled`.
-    #[serde(default = "default_true")]
+    /// **Off by default.** Vanilla makes sprint knockback and critical hits
+    /// mutually exclusive per swing (a sprinting attacker never crits), so
+    /// holding every single neutral-exchange swing for a crit means giving
+    /// up the sprint-reset knockback that pushes the target out of their
+    /// own attack range every hit -- the actual mechanism that keeps a
+    /// fight one-sided (see `combat::executor::apply_attack`'s doc
+    /// comment). A finishing blow (see `finisher_health`) always jump-holds
+    /// for the crit regardless of this setting, since a target that close
+    /// to death has no meaningful comeback to punish the hold. Turn this on
+    /// to jump-hold *every* swing anyway -- more damage per hit, less
+    /// control of spacing.
+    ///
+    /// Costs about a third of a second on the hits where it applies and
+    /// pays for it several times over in damage when it does trigger --
+    /// proportionally more on an axe, whose longer cooldown makes the hold
+    /// a smaller share of the cycle. Bounded, so a bot that cannot jump (a
+    /// low ceiling, a one-block tunnel) swings normally after a moment
+    /// rather than freezing -- see `combat::crits::CRIT_HOLD_TIMEOUT`.
+    /// Requires `crit_enabled`.
+    #[serde(default)]
     pub always_crit: bool,
     #[serde(default = "default_true")]
     pub shield_break_enabled: bool,
@@ -581,6 +594,26 @@ pub struct KillbotConfig {
     /// throwing a punch. Set to 0 to chain bites back to back.
     #[serde(default = "default_killbot_eat_cooldown_ms")]
     pub eat_cooldown_ms: u64,
+    /// How long to wait after a failed consume before trying again, in
+    /// milliseconds. A bite can be cancelled by something outside the bot's
+    /// control (server lag, a mob knocking it about); retrying instantly
+    /// would just be cancelled again in the same way.
+    #[serde(default = "default_killbot_eat_retry_delay_ms")]
+    pub eat_retry_delay_ms: u64,
+    /// How many consume attempts one decision to eat gets, including the
+    /// first. Past this the bot stops trying until the next time it drops
+    /// below `heal_threshold`, rather than spending the fight retrying.
+    #[serde(default = "default_killbot_eat_retry_limit")]
+    pub eat_retry_limit: u32,
+    /// Whether the bot backs off and circles while it chews, instead of
+    /// eating where it stands.
+    ///
+    /// Note this deliberately re-introduces retreating, which the rest of
+    /// the combat model does not do (see `crate::combat`'s full-aggression
+    /// doc comment) -- it applies *only* while a bite is in flight, and the
+    /// bot re-engages the moment it swallows.
+    #[serde(default = "default_true")]
+    pub allow_retreat_while_eating: bool,
     /// Distance (blocks) at which `#kill` stops using the project's normal
     /// pathfinder and switches to its own combat movement controller (see
     /// `combat::movement`).
@@ -615,9 +648,41 @@ pub struct KillbotConfig {
     /// the whole map.
     #[serde(default = "default_killbot_max_chase_distance")]
     pub max_chase_distance: f64,
+    /// Fight with a sword/axe as usual, but reach for the Mace whenever
+    /// there is a fall to capitalize on. **On by default.** Two ways a
+    /// Mace swing happens:
+    ///
+    /// - **Opportunistically**, any time the bot is airborne and either
+    ///   already falling far enough for `combat::mace::SMASH_ATTACK_MIN_FALL`
+    ///   or was just launched hard enough to plausibly get there (see
+    ///   `apply_weapon_selection`'s `opportunistic_fall`) -- covers a
+    ///   Wind Burst Mace's own re-launch off a landed smash, a Breeze's wind
+    ///   charge, fall damage from simply jumping down onto the target, or
+    ///   anything else that produces a real fall, not just this bot's own
+    ///   combo below.
+    /// - **Deliberately**, once every `MACE_ATTEMPT_HIT_RANGE` (see
+    ///   `combat::executor`) ordinary hits land: the bot throws a Wind
+    ///   Charge straight down at its own feet, launches itself into the
+    ///   air, and hits the target on the way back down (see
+    ///   `combat::wind_launch`'s module doc comment) -- costing a Wind
+    ///   Charge and a couple of seconds standing still per attempt, so it
+    ///   is spaced out rather than attempted on cooldown.
+    ///
+    /// Either way, the Mace is only ever held for that one swing -- the
+    /// bot reverts to its normal sword/axe the instant the smash lands (or
+    /// the fall never materializes), rather than eating the Mace's much
+    /// slower recharge (0.6/s vs. a sword's 1.6/s) on every ordinary hit.
+    /// A Mace can't disable a shield the way an axe does, so shield-breaking
+    /// still takes priority over reaching for it either way.
+    #[serde(default = "default_true")]
+    pub prefer_mace: bool,
 }
 fn default_killbot_attack_range() -> f64 {
-    2.0
+    // Vanilla survival melee reach (and block-interact reach) is 3.0 blocks
+    // -- see the Minecraft Wiki's combat mechanics page. 2.0 was giving away
+    // a full block of reach to any opponent who could already hit the bot
+    // uncontested at 2-3 blocks.
+    3.0
 }
 fn default_killbot_attack_cooldown_ms() -> u64 {
     0
@@ -637,6 +702,12 @@ fn default_killbot_finisher_health() -> f64 {
 fn default_killbot_engage_range() -> f64 {
     6.0
 }
+fn default_killbot_eat_retry_delay_ms() -> u64 {
+    150
+}
+fn default_killbot_eat_retry_limit() -> u32 {
+    3
+}
 fn default_killbot_max_chase_distance() -> f64 {
     128.0
 }
@@ -645,6 +716,12 @@ impl KillbotConfig {
     #[must_use]
     pub fn eat_cooldown(&self) -> std::time::Duration {
         std::time::Duration::from_millis(self.eat_cooldown_ms)
+    }
+
+    /// [`Self::eat_retry_delay_ms`] as a `Duration`.
+    #[must_use]
+    pub fn eat_retry_delay(&self) -> std::time::Duration {
+        std::time::Duration::from_millis(self.eat_retry_delay_ms)
     }
 
     /// [`Self::attack_cooldown_ms`] as an explicit override, or `None` for
@@ -665,17 +742,21 @@ impl Default for KillbotConfig {
             attack_cooldown_ms: default_killbot_attack_cooldown_ms(),
             preferred_range: default_killbot_preferred_range(),
             crit_enabled: true,
-            always_crit: true,
+            always_crit: false,
             shield_break_enabled: true,
             shield_use_enabled: true,
             heal_threshold: default_killbot_heal_threshold(),
             eat_cooldown_ms: default_killbot_eat_cooldown_ms(),
             finisher_health: default_killbot_finisher_health(),
             engage_range: default_killbot_engage_range(),
+            eat_retry_delay_ms: default_killbot_eat_retry_delay_ms(),
+            eat_retry_limit: default_killbot_eat_retry_limit(),
+            allow_retreat_while_eating: true,
             sprint_reset_enabled: true,
             strafe_enabled: true,
             prediction_enabled: true,
             max_chase_distance: default_killbot_max_chase_distance(),
+            prefer_mace: true,
         }
     }
 }
@@ -1819,6 +1900,9 @@ impl Config {
             || !(killbot.preferred_range > 0.0 && killbot.preferred_range <= killbot.attack_range)
             || !(0.0..=20.0).contains(&killbot.heal_threshold)
             || !(0.0..=20.0).contains(&killbot.finisher_health)
+            || killbot.eat_retry_limit == 0
+            || killbot.eat_retry_limit > 20
+            || killbot.eat_retry_delay_ms > 10_000
             || !(killbot.engage_range >= killbot.attack_range
                 && killbot.engage_range <= killbot.max_chase_distance)
             || !(killbot.max_chase_distance > 0.0 && killbot.max_chase_distance <= 1024.0)
@@ -2025,7 +2109,7 @@ mod tests {
         assert_eq!(config.equipment.offhand.priority, OffhandPriority::Totem);
         assert_eq!(config.output.console, OutputMode::Info);
         assert_eq!(config.output.chat, OutputMode::Info);
-        assert_eq!(config.killbot.attack_range, 2.0);
+        assert_eq!(config.killbot.attack_range, 3.0);
         assert_eq!(config.killbot.preferred_range, 1.8);
         assert_eq!(config.killbot.heal_threshold, 8.0);
         assert_eq!(config.killbot.finisher_health, 8.0);
@@ -2193,8 +2277,9 @@ mod tests {
         config.validate().expect("the default must be valid");
 
         assert!(
-            config.killbot.always_crit,
-            "every swing defaults to holding out for a critical"
+            !config.killbot.always_crit,
+            "sprint-reset knockback, not a jump-held crit, is the default neutral-game hit -- \
+             see combat::executor::apply_attack's doc comment"
         );
         assert_eq!(
             config.killbot.eat_cooldown_ms, 5000,
@@ -2204,6 +2289,23 @@ mod tests {
             config.killbot.eat_cooldown(),
             std::time::Duration::from_millis(5000)
         );
+        assert_eq!(config.killbot.eat_retry_limit, 3);
+        assert_eq!(
+            config.killbot.eat_retry_delay(),
+            std::time::Duration::from_millis(150)
+        );
+        assert!(config.killbot.allow_retreat_while_eating);
+        for invalid in [0, 21] {
+            config.killbot.eat_retry_limit = invalid;
+            assert!(
+                matches!(
+                    config.validate(),
+                    Err(AppError::InvalidKillbotConfiguration(_))
+                ),
+                "a retry limit of {invalid} makes no sense"
+            );
+        }
+        config.killbot.eat_retry_limit = 3;
         config.killbot.eat_cooldown_ms = 60_001;
         assert!(
             matches!(

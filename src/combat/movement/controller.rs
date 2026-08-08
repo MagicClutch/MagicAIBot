@@ -111,6 +111,10 @@ pub struct MovementSnapshot {
     /// while the camera stays locked on the target.
     pub camera_yaw: f32,
     pub hazards: LocalHazards,
+    /// Hold the target at arm's length instead of closing on it -- set while
+    /// the bot is eating (see `KillbotConfig::allow_retreat_while_eating`).
+    /// The aim is unaffected: it keeps facing the opponent throughout.
+    pub retreat: bool,
     pub now: Instant,
 }
 
@@ -214,6 +218,11 @@ impl CombatMovementController {
             self.strafe.force_switch();
         }
 
+        let band = if snapshot.retreat {
+            crate::combat::movement::steering::retreat_band(&tuning.band)
+        } else {
+            tuning.band
+        };
         let desired = desired_velocity(
             SteeringInput {
                 bot: snapshot.bot,
@@ -221,7 +230,7 @@ impl CombatMovementController {
                 orbit_sign: orbit.sign(),
                 avoidance: snapshot.hazards.avoidance,
             },
-            &tuning.band,
+            &band,
             &tuning.weights,
         );
         let smoothed = self.smoother.advance(desired, &tuning.limits, elapsed);
@@ -256,10 +265,14 @@ impl CombatMovementController {
         // Sprint whenever the bot is actually travelling forward and has
         // ground to cover. Vanilla only sprints on a forward key, so the
         // projection has already decided most of this.
+        // Never while retreating: the retreat exists to cover a bite, and
+        // sprinting cancels vanilla item use outright. Backing off at a walk
+        // is the fastest retreat that still lets the bot swallow.
         let sprint = walk.allows_sprint()
             && !sprint_reset
+            && !snapshot.retreat
             && !snapshot.hazards.blocked_ahead
-            && distance > tuning.band.preferred_max;
+            && distance > band.preferred_max;
 
         let jump = self.should_jump(&snapshot, walk, closing);
         if jump {
@@ -317,6 +330,7 @@ mod tests {
             // does during a fight.
             camera_yaw: target.minus(bot).yaw_degrees(),
             hazards: LocalHazards::default(),
+            retreat: false,
             now,
         }
     }
@@ -350,6 +364,45 @@ mod tests {
             path.push((bot, command));
         }
         path
+    }
+
+    #[test]
+    fn retreating_opens_the_gap_while_still_facing_the_target() {
+        let mut controller = CombatMovementController::new();
+        let tuning = MovementTuning::default();
+        let mut rng = rng();
+        let target = Vec2::new(0.0, 0.0);
+        let mut bot = Vec2::new(0.0, -1.8);
+        let mut sprinted = false;
+        for index in 0..40 {
+            let mut view = snapshot(bot, target, tick(index));
+            view.retreat = true;
+            let command = controller.update(view, &tuning, &mut rng);
+            sprinted |= command.sprint;
+            bot = bot.plus(controller.heading().scaled(4.3 * 0.05));
+        }
+        let distance = target.minus(bot).length();
+        assert!(distance > 3.0, "should have created distance: {distance}");
+        assert!(
+            !sprinted,
+            "sprinting cancels item use -- a retreat that covers a bite must walk"
+        );
+    }
+
+    #[test]
+    fn the_bot_closes_again_the_moment_the_retreat_ends() {
+        let mut controller = CombatMovementController::new();
+        let tuning = MovementTuning::default();
+        let mut rng = rng();
+        let target = Vec2::new(0.0, 0.0);
+        let mut bot = Vec2::new(0.0, -6.0);
+        for index in 0..40 {
+            let view = snapshot(bot, target, tick(index));
+            controller.update(view, &tuning, &mut rng);
+            bot = bot.plus(controller.heading().scaled(5.6 * 0.05));
+        }
+        let distance = target.minus(bot).length();
+        assert!(distance < 3.0, "should be back in the fight: {distance}");
     }
 
     #[test]

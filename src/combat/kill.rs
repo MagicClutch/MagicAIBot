@@ -59,6 +59,14 @@ impl KillController {
         let player = world
             .find_player_by_name(&name)
             .ok_or_else(|| AppError::UnknownPlayer(name.clone()))?;
+        // Defensive, same reasoning as `executor::stop_all`: this call site
+        // is exempt from the normal pre-start `pvp.cancel()` (a `#kill`
+        // restarts pvp itself -- see `App::execute_console_input`'s
+        // exemption list), so if the previous fight ended mid-bite or
+        // mid-Wind-Charge-throw without going through `cancel`/`stop_all`,
+        // a brand new fight must not inherit a stuck guard that would
+        // refuse its own first hotbar swap.
+        minecraft.end_consume_guard();
         {
             let mut inner = self.inner.lock().await;
             inner.reset_for_new_fight();
@@ -168,6 +176,31 @@ mod tests {
         let kill = KillController::default();
         kill.cancel(&minecraft(), &movement(), &look()).await;
         assert_eq!(kill.snapshot().await.state, KillState::Created);
+    }
+
+    /// `apply_eating` raises the consume guard and only lowers it again from
+    /// inside `tick` -- which `cancel` stops driving forever the instant it
+    /// runs. Without `stop_all` releasing the guard itself, a `#kill`
+    /// cancelled mid-bite (e.g. `crate::survival`'s water-clutch arming)
+    /// would leave every hotbar/container mutation in the bot permanently
+    /// refused with `InventoryBusy`.
+    #[tokio::test]
+    async fn cancelling_mid_bite_releases_the_stuck_consume_guard() {
+        let minecraft = minecraft();
+        let kill = KillController::default();
+        minecraft.begin_consume_guard();
+        assert!(minecraft.consume_guard_active());
+
+        // `cancel` only acts when the snapshot is `Running`.
+        {
+            let mut inner = kill.inner.lock().await;
+            inner.snapshot.state = KillState::Running;
+        }
+
+        kill.cancel(&minecraft, &movement(), &look()).await;
+
+        assert!(!minecraft.consume_guard_active());
+        assert_eq!(kill.snapshot().await.state, KillState::Cancelled);
     }
 
     #[tokio::test]

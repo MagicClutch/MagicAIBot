@@ -4,11 +4,15 @@
 //! `Food` component data) supplies the candidates [`best_food`] ranks.
 
 /// Exact-match priority order for the foods the spec calls out by name
-/// (golden apple first for its regeneration effect, then roughly
-/// highest-to-lowest nutrition among common meats) -- checked before
-/// falling back to nutrition alone for anything else edible. Earlier
-/// entries win.
+/// (enchanted golden apple first -- Absorption IV plus a much stronger
+/// Regeneration II than the plain apple's, at the same nutrition, so it
+/// must never lose the tiebreak to a regular golden apple or fall through
+/// to the nutrition-only fallback below it; then golden apple for its
+/// regeneration effect; then roughly highest-to-lowest nutrition among
+/// common meats) -- checked before falling back to nutrition alone for
+/// anything else edible. Earlier entries win.
 const NAMED_PRIORITY: &[&str] = &[
+    "minecraft:enchanted_golden_apple",
     "minecraft:golden_apple",
     "minecraft:cooked_beef",
     "minecraft:cooked_porkchop",
@@ -87,6 +91,28 @@ mod tests {
         let candidates = [
             option(0, "minecraft:rabbit_stew", 10),
             option(1, "minecraft:bread", 5),
+        ];
+        assert_eq!(best_food(&candidates), Some(candidates[1]));
+    }
+
+    #[test]
+    fn prefers_enchanted_golden_apple_over_the_regular_one() {
+        let candidates = [
+            option(0, "minecraft:golden_apple", 4),
+            option(1, "minecraft:enchanted_golden_apple", 4),
+        ];
+        assert_eq!(best_food(&candidates), Some(candidates[1]));
+    }
+
+    #[test]
+    fn enchanted_golden_apple_does_not_fall_through_to_the_nutrition_fallback() {
+        // Before `enchanted_golden_apple` was added to `NAMED_PRIORITY`,
+        // this fell all the way through to `best_food`'s nutrition-only
+        // fallback, where cooked_beef's higher nutrition (8 vs. 4) beat the
+        // single best healing item in the game.
+        let candidates = [
+            option(0, "minecraft:cooked_beef", 8),
+            option(1, "minecraft:enchanted_golden_apple", 4),
         ];
         assert_eq!(best_food(&candidates), Some(candidates[1]));
     }
