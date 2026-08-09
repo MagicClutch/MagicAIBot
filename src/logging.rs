@@ -2,8 +2,33 @@ use std::{
     cell::{Cell, RefCell},
     collections::VecDeque,
     fmt::Display,
+    io::Write,
     time::{Duration, Instant},
 };
+
+/// `println!` alone is not enough of a guarantee here: `Stdout` is only
+/// unconditionally line-buffered when connected to a real terminal. Once
+/// output is piped -- a Docker/Pelican deployment, `> logfile`, a process
+/// manager capturing the child's stdout, all of which this project ships
+/// support for -- it can fall back to block buffering, so lines sit in an
+/// internal buffer and never reach whatever is reading them until it fills
+/// or the process exits. That looks exactly like the bot having frozen
+/// even though it's still running fine underneath. Explicitly flushing
+/// after every printed line removes the ambiguity entirely, at the cost of
+/// one syscall per line -- console output here is human-readable status
+/// narration, not a hot path.
+fn flush_console() {
+    let _ = std::io::stdout().flush();
+}
+
+/// Public catch-all for the many direct `println!` call sites outside this
+/// module (status/inventory/etc. printers in `app.rs`) that don't go
+/// through [`emit_tiered`] and so don't get [`flush_console`]'s per-line
+/// flush automatically. `App`'s tick loops call this on a bounded cadence
+/// so none of that output can sit in a stdout buffer indefinitely either.
+pub fn flush() {
+    flush_console();
+}
 
 use crate::config::OutputMode;
 
@@ -118,9 +143,11 @@ pub fn error(message: impl Display) {
 }
 pub fn chat_incoming(sender: &str, message: &str) {
     println!("[CHAT] {sender}: {message}");
+    flush_console();
 }
 pub fn chat_outgoing(username: &str, message: &str) {
     println!("[CHAT] <{username}> {message}");
+    flush_console();
 }
 
 /// How many times in a row a line (or a short back-and-forth cycle, e.g.
@@ -155,10 +182,12 @@ fn emit_tiered(prefix: &str, tier: Tier, message: String) {
             // `fulldebug` exists specifically to show every repetition a
             // stuck loop produces, so it must bypass the collapsing below.
             println!("{line}");
+            flush_console();
         } else {
             CONSOLE_REPEAT_GUARD.with(|guard| {
                 if let Some(line) = decide(&mut guard.borrow_mut(), line.clone()) {
                     println!("{line}");
+                    flush_console();
                 }
             });
         }
