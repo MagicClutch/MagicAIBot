@@ -29,7 +29,17 @@ struct NavigationInner {
     candidates: Vec<BlockSnapshot>,
     failed_blocks: HashSet<BlockPosition>,
     failed_approaches: HashSet<(BlockPosition, BlockPosition)>,
+    /// Whether `maybe_topup_candidates` has already fired (or doesn't need
+    /// to) for the currently selected target. Reset every time
+    /// `try_next_target` selects a new target, so at most one background
+    /// top-up scan happens per target leg -- see that method's doc comment.
+    topup_attempted: bool,
 }
+
+/// `maybe_topup_candidates` only bothers scanning once the cached candidate
+/// list is down to this many still-viable entries -- a leg started with
+/// plenty of cache left has no need to pay for a scan yet.
+const TOPUP_LOW_WATER_MARK: usize = 3;
 
 #[derive(Clone)]
 pub struct BlockNavigationService {
@@ -48,6 +58,7 @@ impl BlockNavigationService {
                 candidates: Vec::new(),
                 failed_blocks: HashSet::new(),
                 failed_approaches: HashSet::new(),
+                topup_attempted: false,
             })),
         }
     }
@@ -112,6 +123,7 @@ impl BlockNavigationService {
             inner.candidates.clear();
             inner.failed_blocks.clear();
             inner.failed_approaches.clear();
+            inner.topup_attempted = false;
             generation
         };
 
@@ -215,6 +227,11 @@ impl BlockNavigationService {
             }];
             inner.failed_blocks.clear();
             inner.failed_approaches.clear();
+            // A single exact-position target, not a radius search -- there
+            // is nothing for a background top-up to usefully scan for, so
+            // pre-mark it done rather than have `maybe_topup_candidates`
+            // try a zero-radius search.
+            inner.topup_attempted = true;
             generation
         };
         let _ = movement.stop(minecraft).await;
@@ -257,6 +274,7 @@ impl BlockNavigationService {
         inner.candidates.clear();
         inner.failed_blocks.clear();
         inner.failed_approaches.clear();
+        inner.topup_attempted = true;
         drop(inner);
         if was_active {
             let _ = movement.stop(minecraft).await;
@@ -462,6 +480,10 @@ impl BlockNavigationService {
                 candidate
             };
             let mode = self.inner.lock().await.snapshot.mode;
+            // Fetched once per candidate (not per approach): a live read of
+            // local state, not a network round trip, so it's cheap even
+            // when several approaches get tried against it below.
+            let bot_position = minecraft.world_state_snapshot().await.bot.position;
             for approach in approach_positions(candidate.position) {
                 let approach_key = (candidate.position, approach);
                 if self
@@ -488,11 +510,43 @@ impl BlockNavigationService {
                         .await;
                     continue;
                 }
-                let attempt = {
+                let _attempt = {
                     let mut inner = self.inner.lock().await;
                     inner.snapshot.current_attempt += 1;
                     inner.snapshot.current_attempt
                 };
+
+                // Immediate-break fast path: the bot is already standing
+                // close enough to this (already validated) approach cell
+                // and within interaction range of the target, so a
+                // pathfind/goto for an essentially zero-distance trip would
+                // just add latency for nothing -- skip straight to
+                // `Reached` and let the caller start breaking immediately.
+                // Uses the same arrival check `tick` uses to detect a
+                // completed approach, just evaluated up front instead of
+                // after a movement round trip.
+                if bot_position.is_some_and(|position| {
+                    arrival_valid(
+                        Some(position),
+                        approach,
+                        candidate.position,
+                        self.config.arrival_distance,
+                        self.config.interaction_distance,
+                    )
+                }) {
+                    let _ = movement.stop(minecraft).await;
+                    let mut inner = self.inner.lock().await;
+                    inner.snapshot.state = BlockNavigationState::Reached;
+                    inner.snapshot.selected_block_position = Some(candidate.position);
+                    inner.snapshot.selected_approach_position = Some(approach);
+                    inner.snapshot.selected_block_id = Some(candidate.block_id.clone());
+                    inner.snapshot.last_progress_time = Some(SystemTime::now());
+                    inner.snapshot.last_position = bot_position;
+                    inner.topup_attempted = false;
+                    logging::info(format!("{} in range, mining immediately", candidate.block_id));
+                    return Ok(true);
+                }
+
                 if mode == NavigationMode::AllowMining {
                     logging::info("Pathfinding with mining enabled");
                 }
@@ -512,6 +566,7 @@ impl BlockNavigationService {
                 inner.snapshot.selected_block_id = Some(candidate.block_id.clone());
                 inner.snapshot.last_progress_time = Some(SystemTime::now());
                 inner.snapshot.last_position = None;
+                inner.topup_attempted = false;
                 logging::info(format!(
                     "Going to {} at ({}, {}, {})",
                     candidate.block_id,
@@ -523,7 +578,6 @@ impl BlockNavigationService {
                     "Selected interaction position: {} {} {}",
                     approach.x, approach.y, approach.z
                 ));
-                let _ = attempt;
                 return Ok(true);
             }
             self.mark_target_failed(generation, candidate.position)
@@ -552,6 +606,34 @@ impl BlockNavigationService {
         {
             return;
         }
+        if self
+            .rescan_and_try_next(minecraft, movement, generation)
+            .await
+            .unwrap_or(false)
+        {
+            return;
+        }
+        {
+            self.fail(generation, reason.into()).await;
+            let _ = movement.stop(minecraft).await;
+            let label = display_ids(&self.snapshot().await.requested_block_ids);
+            logging::warning(format!("Cannot reach {label}: {reason}"));
+        }
+    }
+
+    /// Fresh `scan_loaded_blocks` pass merged into the existing candidate
+    /// list (skipping anything already known-failed or already present),
+    /// followed by one more `try_next_target` attempt against the merged
+    /// set. Shared by `retry_or_fail` (an approach turned out unreachable)
+    /// and `continue_after_mined` (the cached candidate list ran out) --
+    /// both need the same "the cheap cached path is exhausted, do one real
+    /// scan before giving up" fallback.
+    async fn rescan_and_try_next(
+        &self,
+        minecraft: &MinecraftClient,
+        movement: &MovementService,
+        generation: u64,
+    ) -> Result<bool, AppError> {
         let (block_ids, radius) = {
             let inner = self.inner.lock().await;
             (
@@ -559,36 +641,155 @@ impl BlockNavigationService {
                 inner.snapshot.search_radius,
             )
         };
-        if let Some(radius) = radius
-            && !block_ids.is_empty()
+        let Some(radius) = radius else {
+            return Ok(false);
+        };
+        if block_ids.is_empty() {
+            return Ok(false);
+        }
+        let candidates = self.search_candidates(minecraft, &block_ids, radius).await;
         {
-            let candidates = self.search_candidates(minecraft, &block_ids, radius).await;
-            {
-                let mut inner = self.inner.lock().await;
-                for candidate in candidates {
-                    if !inner.failed_blocks.contains(&candidate.position)
-                        && !inner
-                            .candidates
-                            .iter()
-                            .any(|existing| existing.position == candidate.position)
-                    {
-                        inner.candidates.push(candidate);
-                    }
+            let mut inner = self.inner.lock().await;
+            for candidate in candidates {
+                if !inner.failed_blocks.contains(&candidate.position)
+                    && !inner
+                        .candidates
+                        .iter()
+                        .any(|existing| existing.position == candidate.position)
+                {
+                    inner.candidates.push(candidate);
                 }
             }
-            if self
-                .try_next_target(minecraft, movement, generation)
-                .await
-                .unwrap_or(false)
+        }
+        self.try_next_target(minecraft, movement, generation).await
+    }
+
+    /// Continues the current multi-id search after the previously selected
+    /// target block was successfully mined: marks that position gone (it no
+    /// longer exists) and advances to the next-nearest *already-cached*
+    /// candidate instead of redoing a full `scan_loaded_blocks` pass over
+    /// every loaded chunk -- only falling back to one fresh scan (via
+    /// `rescan_and_try_next`) once the cached list is actually exhausted.
+    /// This is what lets `#mine`/`#get` avoid paying a whole chunk scan for
+    /// every single block broken: callers use this in place of a second
+    /// `start_multi` call on every loop iteration after the first.
+    ///
+    /// Resets the same per-leg bookkeeping `start_multi` resets
+    /// (`current_attempt`, `start_time`, `last_progress_time`,
+    /// `last_position`) but keeps the same `generation` so the cached
+    /// `candidates`/`failed_blocks`/`failed_approaches` survive -- resetting
+    /// `current_attempt` in particular matters because otherwise
+    /// `maximum_target_attempts` would cap the *whole run's* total
+    /// candidate attempts instead of just this leg's.
+    pub async fn continue_after_mined(
+        &self,
+        minecraft: &MinecraftClient,
+        movement: &MovementService,
+    ) -> Result<(), AppError> {
+        let generation = {
+            let mut inner = self.inner.lock().await;
+            if let Some(target) = inner.snapshot.selected_block_position {
+                inner.failed_blocks.insert(target);
+            }
+            inner.snapshot.state = BlockNavigationState::SelectingTarget;
+            inner.snapshot.selected_block_position = None;
+            inner.snapshot.selected_approach_position = None;
+            inner.snapshot.selected_block_id = None;
+            inner.snapshot.current_attempt = 0;
+            inner.snapshot.start_time = Some(SystemTime::now());
+            inner.snapshot.last_progress_time = Some(SystemTime::now());
+            inner.snapshot.last_position = None;
+            inner.snapshot.generation
+        };
+        if self.try_next_target(minecraft, movement, generation).await? {
+            return Ok(());
+        }
+        if self
+            .rescan_and_try_next(minecraft, movement, generation)
+            .await?
+        {
+            return Ok(());
+        }
+        let label = display_ids(&self.snapshot().await.requested_block_ids);
+        self.fail(generation, "no matching block".into()).await;
+        logging::warning(format!("No loaded {label} block found"));
+        Ok(())
+    }
+
+    /// Opportunistically refreshes the cached candidate list with a fresh
+    /// `scan_loaded_blocks` pass while the bot is still travelling to the
+    /// *currently* selected target, instead of waiting for the cache to run
+    /// dry. Callers drive this from the same tick loop that already polls
+    /// movement progress toward that target
+    /// (`await_block_navigation_terminal` in `app.rs`), so the scan's cost
+    /// lands inside time the bot is already spending walking -- by the time
+    /// `continue_after_mined` needs a next candidate, one is very likely
+    /// already sitting in the cache instead of requiring its own
+    /// synchronous rescan.
+    ///
+    /// Deliberately does *not* also run while the bot is `Reached` and
+    /// actively breaking: that's exactly when the server is sending the
+    /// most block-update/chunk traffic for this position, i.e. the worst
+    /// time to add another reader of Azalea's (synchronous, non-async)
+    /// world lock on top of it.
+    ///
+    /// A cheap no-op on almost every call: only does real work once per
+    /// selected target (`NavigationInner::topup_attempted`) and only once
+    /// the cache is actually running low (`TOPUP_LOW_WATER_MARK`), so a
+    /// `#mine`/`#get` run with a full cache never pays for scans it
+    /// doesn't need.
+    pub async fn maybe_topup_candidates(&self, minecraft: &MinecraftClient) {
+        let (generation, block_ids, radius) = {
+            let mut inner = self.inner.lock().await;
+            if inner.topup_attempted
+                || !matches!(
+                    inner.snapshot.state,
+                    BlockNavigationState::Moving | BlockNavigationState::Repathing
+                )
             {
+                // Deliberately excludes `Reached` (the bot is now breaking
+                // the block, not moving): breaking is exactly when the
+                // server is sending the most block-update/chunk traffic for
+                // this position, i.e. the worst time to add another reader
+                // of Azalea's world lock on top of it.
                 return;
             }
+            let remaining = inner
+                .candidates
+                .iter()
+                .filter(|candidate| !inner.failed_blocks.contains(&candidate.position))
+                .count();
+            if remaining > TOPUP_LOW_WATER_MARK {
+                return;
+            }
+            // Marked before the scan even runs (not after) so the next tick
+            // -- which will land while this scan is still in flight -- sees
+            // it's already handled instead of firing a redundant second one.
+            inner.topup_attempted = true;
+            (
+                inner.snapshot.generation,
+                inner.snapshot.requested_block_ids.clone(),
+                inner.snapshot.search_radius,
+            )
+        };
+        let Some(radius) = radius else { return };
+        if block_ids.is_empty() {
+            return;
         }
-        {
-            self.fail(generation, reason.into()).await;
-            let _ = movement.stop(minecraft).await;
-            let label = display_ids(&self.snapshot().await.requested_block_ids);
-            logging::warning(format!("Cannot reach {label}: {reason}"));
+        let candidates = self.search_candidates(minecraft, &block_ids, radius).await;
+        let mut inner = self.inner.lock().await;
+        if inner.snapshot.generation != generation {
+            return;
+        }
+        for candidate in candidates {
+            if !inner.failed_blocks.contains(&candidate.position)
+                && !inner
+                    .candidates
+                    .iter()
+                    .any(|existing| existing.position == candidate.position)
+            {
+                inner.candidates.push(candidate);
+            }
         }
     }
 

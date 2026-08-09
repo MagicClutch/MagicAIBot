@@ -187,6 +187,11 @@ async fn await_block_navigation_terminal(app: &App, input_rx: &mut InputReceiver
         app.block_navigation
             .tick(&app.minecraft, &app.movement)
             .await;
+        // Piggybacks any needed top-up scan onto time the bot is already
+        // spending travelling to the current target, so `run_mine`/
+        // `run_get_item` rarely find the cache empty once they get here --
+        // see `maybe_topup_candidates`'s doc comment.
+        app.block_navigation.maybe_topup_candidates(&app.minecraft).await;
         app.survival
             .tick(
                 &app.minecraft,
@@ -256,6 +261,10 @@ async fn await_interaction_terminal(app: &App, input_rx: &mut InputReceiver) -> 
         app.block_navigation
             .tick(&app.minecraft, &app.movement)
             .await;
+        // No `maybe_topup_candidates` call here: this loop only ever runs
+        // once block navigation has already reached the target (breaking
+        // is happening), and top-up deliberately skips that state -- see
+        // its doc comment.
         app.look.tick(&app.minecraft).await;
         app.interaction
             .tick(&app.minecraft, &app.movement, &app.look)
@@ -480,10 +489,24 @@ async fn wait_tick(
     if let Some(input) = emergency_stop_from_chat(app).await {
         return Some(input);
     }
+    // Same reachability problem as `#stop` above, for `#status`/`#inventory`/
+    // etc.: without this, they'd sit in the incoming chat queue until
+    // whatever `#get`/`#mine`/... loop is currently running returns control
+    // to the top-level select loop. See `read_only_commands_from_chat`'s doc
+    // comment.
+    read_only_commands_from_chat(app).await;
     // Answered inline and the wait continues: a status request is not a
     // reason to interrupt whatever the bot is doing.
     answer_chat_status_queries(app).await;
     flush_outgoing_chat(&app.minecraft).await;
+    // Piped stdout (Docker/Pelican, `> logfile`, any process manager
+    // capturing this process) can fall back to block buffering instead of
+    // the line buffering a real terminal gets, so status output can sit
+    // unseen in a buffer -- looking exactly like the bot froze even though
+    // it's still running. This is the catch-all for the ~150 direct
+    // `println!` call sites (status/inventory/etc.) that don't already
+    // flush themselves via `logging::emit_tiered`.
+    logging::flush();
     let emergency = app.emergency_stop.token();
     tokio::select! {
         () = tokio::time::sleep(duration) => None,
@@ -626,6 +649,58 @@ async fn emergency_stop_from_chat(app: &App) -> Option<ConsoleInput> {
     }
     logging::info(format!("[Chat] {sender} ran: /stop"));
     Some(ConsoleInput::Command(ConsoleCommand::Stop))
+}
+
+/// Answers every read-only status query (`#status`, `#inventory`, `#where`,
+/// ...) currently sitting in the incoming player chat queue, the same way
+/// `emergency_stop_from_chat` answers `#stop` -- these must not wait for
+/// `App::tick_chat_commands` to become reachable again, since that only
+/// happens once whatever blocking command loop (`#get`/`#mine`/`/goto`/...)
+/// is currently running returns control to the top-level select loop.
+/// Scoped to `is_read_only_query` commands specifically: those are the only
+/// ones safe to run without the cancel-current-task handling
+/// `execute_console_input` does for everything else, so this never
+/// interrupts (or even touches) whatever task is actually in flight.
+/// Deliberately bypasses `App::tick_chat_commands`'s per-player rate limit,
+/// the same way `emergency_stop_from_chat` already does and for the same
+/// structural reason: mutating `App::chat_rate_limits` needs `&mut App`,
+/// which isn't available this deep inside a blocking wait.
+async fn read_only_commands_from_chat(app: &App) {
+    loop {
+        let Some(chat) = app
+            .minecraft
+            .take_matching_incoming_player_chat(|chat| {
+                chat.kind == crate::minecraft::world_state::ChatMessageKind::Player
+                    && chat.text.trim().strip_prefix('#').is_some_and(|text| {
+                        console::commands::parse_input(&format!("/{text}")).is_ok_and(|input| {
+                            matches!(
+                                input,
+                                ConsoleInput::Command(command) if is_read_only_query(&command)
+                            )
+                        })
+                    })
+            })
+            .await
+        else {
+            return;
+        };
+        let Some(sender) = chat.sender else { continue };
+        if !app.chat_access_allowed(&sender) {
+            logging::warning(format!(
+                "[Chat] Command from {sender} rejected: access denied"
+            ));
+            continue;
+        }
+        let Some(command_text) = chat.text.trim().strip_prefix('#') else {
+            continue;
+        };
+        let input_line = format!("/{command_text}");
+        let Ok(input) = console::commands::parse_input(&input_line) else {
+            continue;
+        };
+        logging::info(format!("[Chat] {sender} ran: {input_line}"));
+        app.handle_inert_input(&input).await;
+    }
 }
 
 /// Application composition root.
@@ -2727,6 +2802,15 @@ impl App {
             ));
         }
         let mut consecutive_failures: u32 = 0;
+        // Set once the first `start_multi` scan has run; every iteration
+        // after that reuses `continue_after_mined` (cached candidates, no
+        // full chunk rescan) instead of paying for another full scan on
+        // every single block. Reset to `false` on any failure path so a
+        // break/interaction error still falls back to the robust full
+        // rescan rather than trusting a candidate list that may now be
+        // stale.
+        let mut searched = false;
+        let mut last_progress = Instant::now();
         loop {
             let current = self
                 .minecraft
@@ -2740,18 +2824,34 @@ impl App {
                 return WaitOutcome::Finished(Ok(()));
             }
 
-            logging::info(format!("Scanning loaded chunks for {block_label}..."));
-            if let Err(error) = self
-                .block_navigation
-                .start_multi(
-                    &self.minecraft,
-                    &self.movement,
-                    block_ids.to_vec(),
-                    radius,
-                    NavigationMode::AllowMining,
-                )
-                .await
-            {
+            if last_progress.elapsed() >= PROGRESS_STALL_TIMEOUT {
+                logging::warning(format!(
+                    "No progress collecting {resource_label} for {}s, forcing a full rescan",
+                    PROGRESS_STALL_TIMEOUT.as_secs()
+                ));
+                searched = false;
+                consecutive_failures = 0;
+                last_progress = Instant::now();
+            }
+
+            let scan_result = if searched {
+                self.block_navigation
+                    .continue_after_mined(&self.minecraft, &self.movement)
+                    .await
+            } else {
+                logging::info(format!("Scanning loaded chunks for {block_label}..."));
+                self.block_navigation
+                    .start_multi(
+                        &self.minecraft,
+                        &self.movement,
+                        block_ids.to_vec(),
+                        radius,
+                        NavigationMode::AllowMining,
+                    )
+                    .await
+            };
+            searched = true;
+            if let Err(error) = scan_result {
                 return self.fail_get_item(&block_label, error).await;
             }
             match await_block_navigation_terminal(self, input_rx).await {
@@ -2790,6 +2890,7 @@ impl App {
                 if get_resource_should_abort(consecutive_failures) {
                     return self.fail_get_item(&block_label, error).await;
                 }
+                searched = false;
                 continue;
             }
             match await_interaction_terminal(self, input_rx).await {
@@ -2804,6 +2905,9 @@ impl App {
                         .await
                         .inventory
                         .count_item(resource_id);
+                    if new_count > current {
+                        last_progress = Instant::now();
+                    }
                     logging::progress(format!("Collected {resource_label} ({new_count}/{amount})"));
                 }
                 WaitOutcome::Finished(Err(error)) => {
@@ -2812,6 +2916,7 @@ impl App {
                     if get_resource_should_abort(consecutive_failures) {
                         return self.fail_get_item(&block_label, error).await;
                     }
+                    searched = false;
                 }
                 WaitOutcome::Interrupted(next) => return WaitOutcome::Interrupted(next),
             }
@@ -2868,24 +2973,45 @@ impl App {
         let label = join_labels(block_ids, ", ");
         let mut mined: u32 = 0;
         let mut consecutive_failures: u32 = 0;
+        // See the identical flag in `run_get_item`: after the first full
+        // scan, reuse the cached candidate list instead of rescanning every
+        // loaded chunk for every single block mined.
+        let mut searched = false;
+        let mut last_progress = Instant::now();
         loop {
             if mined >= amount {
                 logging::success(format!("Mined {mined} {label} blocks"));
                 return WaitOutcome::Finished(Ok(()));
             }
 
-            logging::info(format!("Scanning loaded chunks for {label}..."));
-            if let Err(error) = self
-                .block_navigation
-                .start_multi(
-                    &self.minecraft,
-                    &self.movement,
-                    block_ids.to_vec(),
-                    radius,
-                    NavigationMode::AllowMining,
-                )
-                .await
-            {
+            if last_progress.elapsed() >= PROGRESS_STALL_TIMEOUT {
+                logging::warning(format!(
+                    "No progress mining {label} for {}s, forcing a full rescan",
+                    PROGRESS_STALL_TIMEOUT.as_secs()
+                ));
+                searched = false;
+                consecutive_failures = 0;
+                last_progress = Instant::now();
+            }
+
+            let scan_result = if searched {
+                self.block_navigation
+                    .continue_after_mined(&self.minecraft, &self.movement)
+                    .await
+            } else {
+                logging::info(format!("Scanning loaded chunks for {label}..."));
+                self.block_navigation
+                    .start_multi(
+                        &self.minecraft,
+                        &self.movement,
+                        block_ids.to_vec(),
+                        radius,
+                        NavigationMode::AllowMining,
+                    )
+                    .await
+            };
+            searched = true;
+            if let Err(error) = scan_result {
                 return self.fail_mine(&label, mined, error).await;
             }
             match await_block_navigation_terminal(self, input_rx).await {
@@ -2921,12 +3047,14 @@ impl App {
                 if get_resource_should_abort(consecutive_failures) {
                     return self.fail_mine(&label, mined, error).await;
                 }
+                searched = false;
                 continue;
             }
             match await_interaction_terminal(self, input_rx).await {
                 WaitOutcome::Finished(Ok(())) => {
                     consecutive_failures = 0;
                     mined += 1;
+                    last_progress = Instant::now();
                     logging::progress(format!("Mined {mined_label} ({mined}/{amount})"));
                 }
                 WaitOutcome::Finished(Err(error)) => {
@@ -2935,6 +3063,7 @@ impl App {
                     if get_resource_should_abort(consecutive_failures) {
                         return self.fail_mine(&label, mined, error).await;
                     }
+                    searched = false;
                 }
                 WaitOutcome::Interrupted(next) => return WaitOutcome::Interrupted(next),
             }
@@ -3692,6 +3821,17 @@ impl App {
 /// a target that keeps disappearing right as it's reached) cannot spin the
 /// task indefinitely, per the "never enter an infinite loop" requirement.
 const GET_RESOURCE_MAX_CONSECUTIVE_FAILURES: u32 = 5;
+
+/// Independent of `GET_RESOURCE_MAX_CONSECUTIVE_FAILURES` above: that counter
+/// resets to zero on every single success, so a run alternating one success
+/// with a handful of failures (thrashing on a bad candidate, repeatedly
+/// falling back to the same stale part of the cache) never trips it while
+/// still barely progressing. This is a second, time-based backstop -- if
+/// `run_get_item`/`run_mine` haven't made *any* real progress (inventory
+/// count / mined count increasing) in this long, force a full rescan and a
+/// clean slate rather than trusting whatever cached state produced the
+/// thrashing in the first place.
+const PROGRESS_STALL_TIMEOUT: Duration = Duration::from_secs(45);
 
 fn get_resource_satisfied(current: u32, amount: u32) -> bool {
     current >= amount
