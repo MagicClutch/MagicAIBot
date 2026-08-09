@@ -1,0 +1,7 @@
+# Shell scripts must always have LF line endings -- a CRLF shebang line
+# (`#!/usr/bin/env bash\r`) fails on Linux with a confusing
+# "/usr/bin/env: 'bash\r': No such file or directory", which would silently
+# break the Pelican startup script (start.sh) for any contributor whose Git
+# config normalizes line endings differently than this repo currently
+# happens to.
+*.sh text eol=lf
