@@ -14,7 +14,10 @@
 
 use crate::{
     config::ToolRankingMode,
-    equipment::{model::EquipmentItem, scoring::penalize_for_durability},
+    equipment::{
+        model::EquipmentItem,
+        scoring::{WEAPON_ENCHANTMENT_WEIGHTS, enchantment_bonus, penalize_for_durability},
+    },
     interaction::tool_selection::{ToolCategory, category, tier},
 };
 
@@ -46,13 +49,15 @@ fn base_score(tier: u8) -> f32 {
 
 /// `Score` mode's rating for one tool: material tier sets the ceiling, a
 /// durability penalty pulls it down -- a badly damaged Netherite pickaxe
-/// can score below a pristine Diamond one.
+/// can score below a pristine Diamond one -- and any combat-relevant
+/// enchantment (see [`WEAPON_ENCHANTMENT_WEIGHTS`]) adds on top, uncapped,
+/// so a Sharpness weapon can still outrank a bare one of the same material.
 pub fn rank_score(item: &EquipmentItem) -> f32 {
     penalize_for_durability(
         base_score(tier(&item.item_id)),
         item.current_durability,
         item.max_durability,
-    )
+    ) + enchantment_bonus(&item.enchantments, WEAPON_ENCHANTMENT_WEIGHTS)
 }
 
 /// Finds the best-ranked candidate of `category` among `inventory`, per
@@ -113,11 +118,25 @@ mod tests {
     use super::*;
 
     fn item(slot: usize, id: &str, current: u32, max: u32) -> EquipmentItem {
+        enchanted_item(slot, id, current, max, &[])
+    }
+
+    fn enchanted_item(
+        slot: usize,
+        id: &str,
+        current: u32,
+        max: u32,
+        enchantments: &[(&str, u32)],
+    ) -> EquipmentItem {
         EquipmentItem {
             slot,
             item_id: id.into(),
             current_durability: current,
             max_durability: max,
+            enchantments: enchantments
+                .iter()
+                .map(|(name, level)| ((*name).to_owned(), *level))
+                .collect(),
         }
     }
 
@@ -201,5 +220,50 @@ mod tests {
             10.0
         );
         assert_eq!(rank_score(&item(0, "minecraft:wooden_hoe", 100, 100)), 1.0);
+    }
+
+    #[test]
+    fn a_sharpness_weapon_outranks_a_bare_one_of_the_same_material() {
+        let bare = item(0, "minecraft:diamond_sword", 100, 100);
+        let sharp = enchanted_item(1, "minecraft:diamond_sword", 100, 100, &[("sharpness", 5)]);
+        assert!(rank_score(&sharp) > rank_score(&bare));
+    }
+
+    #[test]
+    fn enchantment_bonus_can_beat_a_higher_material_tier() {
+        // Bare netherite (10.0) still beats an enchanted diamond sword
+        // (8.5 + 2.5 = 11.0)? No -- the point is the reverse can't happen:
+        // a *lower*-tier sword's enchantment bonus should never be enough
+        // to beat a strictly better bare weapon that's also enchantable.
+        // What score mode *should* do is prefer the enchanted diamond sword
+        // over a bare, undamaged netherite one once the bonus pushes it
+        // past 10.0.
+        let bare_netherite = item(0, "minecraft:netherite_sword", 100, 100); // 10.0
+        let sharp_diamond = enchanted_item(
+            1,
+            "minecraft:diamond_sword",
+            100,
+            100,
+            &[("sharpness", 5)], // 8.5 + 2.5 = 11.0
+        );
+        assert!(rank_score(&sharp_diamond) > rank_score(&bare_netherite));
+    }
+
+    #[test]
+    fn best_candidate_in_score_mode_prefers_the_sharpness_weapon() {
+        let inventory = vec![
+            item(10, "minecraft:diamond_sword", 100, 100),
+            enchanted_item(11, "minecraft:diamond_sword", 100, 100, &[("sharpness", 5)]),
+        ];
+        let best = best_candidate(ToolRankingMode::Score, ToolCategory::Sword, &inventory).unwrap();
+        assert_eq!(best.item.slot, 11);
+    }
+
+    #[test]
+    fn an_irrelevant_enchantment_does_not_affect_weapon_score() {
+        let bare = item(0, "minecraft:diamond_sword", 100, 100);
+        let with_unbreaking =
+            enchanted_item(1, "minecraft:diamond_sword", 100, 100, &[("unbreaking", 3)]);
+        assert_eq!(rank_score(&bare), rank_score(&with_unbreaking));
     }
 }

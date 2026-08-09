@@ -32,7 +32,7 @@ use crate::{
     config::{AutoDropConfig, HotbarEquipmentConfig, ToolEquipmentConfig},
     equipment::{
         autodrop::{drop_displaced_item, should_drop},
-        manager::swap_into_slot,
+        manager::swap_into_slot_during_consume,
         model::{EquipmentItem, HOTBAR_PROTOCOL_SLOTS},
         tools,
     },
@@ -206,7 +206,13 @@ impl HotbarEquipmentService {
         );
         let source_slot = candidate.item.slot;
         let displaced = held.map(|item| item.item_id.clone());
-        if !swap_into_slot(minecraft, source_slot, target).await {
+        // `_during_consume`: none of these target slots are the hand, so
+        // upgrading them can't disrupt a bite or a Wind Charge throw in
+        // progress -- and waiting for the consume guard to clear would
+        // otherwise leave a freshly-picked-up upgrade sitting unequipped
+        // through most of a `#kill` fight (see `combat::wind_launch`'s
+        // more frequent self-launches).
+        if !swap_into_slot_during_consume(minecraft, source_slot, target).await {
             return;
         }
         logging::info(format!(
@@ -252,7 +258,7 @@ impl HotbarEquipmentService {
             return;
         };
         debug!(block = %best_id, target_slot = slot_number, "hotbar: found a more preferred building block");
-        if swap_into_slot(minecraft, source.slot, target).await {
+        if swap_into_slot_during_consume(minecraft, source.slot, target).await {
             logging::info(format!("Equipped {best_id} in hotbar slot {slot_number}"));
         }
     }
@@ -284,7 +290,7 @@ impl HotbarEquipmentService {
             return;
         };
         debug!(item = %item_id, target_slot = slot_number, "hotbar: stocking configured item");
-        if swap_into_slot(minecraft, source.slot, target).await {
+        if swap_into_slot_during_consume(minecraft, source.slot, target).await {
             logging::info(format!("Stocked {item_id} in hotbar slot {slot_number}"));
         }
     }

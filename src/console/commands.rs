@@ -1560,4 +1560,5 @@ mod tests {
             Err(AppError::InvalidConsoleSyntax(_))
         ));
     }
+
 }

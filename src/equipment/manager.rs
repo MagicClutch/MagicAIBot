@@ -23,12 +23,6 @@ use crate::{
     minecraft::client::MinecraftClient,
 };
 
-/// Window id 0 is always the player's own inventory (see
-/// `MinecraftClient::container_click`'s doc comment) -- armor and offhand
-/// slots only exist in that menu, so equip actions never target anything
-/// else.
-const PLAYER_INVENTORY_WINDOW: i32 = 0;
-
 #[derive(Clone)]
 pub struct EquipmentService {
     config: EquipmentConfig,
@@ -60,7 +54,14 @@ impl EquipmentService {
             let source_slot = candidate.item.slot;
             let item_label = candidate.item.item_id.clone();
             let displaced = worn.map(|item| item.item_id.clone());
-            if swap_into_slot(minecraft, source_slot, slot.protocol_slot()).await {
+            // Same reasoning as the offhand swap below: an armor slot is
+            // never the hand, so upgrading it can't disrupt a bite or a
+            // Wind Charge throw in progress -- and `#kill`'s more frequent
+            // Wind Charge self-launches (see `combat::wind_launch`) mean the
+            // consume guard is now up often enough that waiting for it to
+            // clear would leave picked-up armor sitting unequipped through
+            // most of a fight.
+            if swap_into_slot_during_consume(minecraft, source_slot, slot.protocol_slot()).await {
                 logging::info(format!("Equipped {item_label}"));
                 if let Some(displaced_id) = displaced {
                     self.maybe_drop_armor(minecraft, &displaced_id, source_slot)
@@ -112,7 +113,15 @@ impl EquipmentService {
             return;
         };
         let source_slot = source.slot;
-        if swap_into_slot(minecraft, source_slot, OFFHAND_PROTOCOL_SLOT).await {
+        // Emergency, like `crate::survival`'s water-bucket restock: allowed
+        // to move the hand even mid-bite. A Totem of Undying can pop from a
+        // hit landed while the bot is also mid-consume (already eating for
+        // an unrelated `heal_threshold` dip when the killing blow arrives),
+        // which empties the offhand at the worst possible moment -- 1 HP,
+        // no totem, and up to ~2.7s (`consume::SLOT_ACK_TIMEOUT` +
+        // `consume::USE_TIMEOUT`) before the guarded path would even be
+        // allowed to restock it. A dead totem slot beats a dead bot.
+        if swap_into_slot_during_consume(minecraft, source_slot, OFFHAND_PROTOCOL_SLOT).await {
             logging::info(format!("Equipped {desired} in offhand"));
         }
     }
@@ -160,16 +169,60 @@ pub(crate) async fn swap_into_slot(
     source: usize,
     destination: usize,
 ) -> bool {
+    swap_into_slot_inner(minecraft, source, destination, false).await
+}
+
+/// [`swap_into_slot`] for the consume path, which is allowed to move items
+/// while the consume guard is held -- see
+/// `MinecraftClient::consume_guard`. Every other caller must use
+/// [`swap_into_slot`] and be refused mid-bite.
+pub(crate) async fn swap_into_slot_during_consume(
+    minecraft: &MinecraftClient,
+    source: usize,
+    destination: usize,
+) -> bool {
+    swap_into_slot_inner(minecraft, source, destination, true).await
+}
+
+async fn swap_into_slot_inner(
+    minecraft: &MinecraftClient,
+    source: usize,
+    destination: usize,
+    during_consume: bool,
+) -> bool {
+    // Resolved once, up front, against one consistent snapshot of whichever
+    // menu is currently open -- so all three clicks below land in the same
+    // window/slot mapping even if a container opens or closes right as this
+    // swap starts. Without this, every equip/hotbar swap hardcoded window 0
+    // and the player-menu's own slot numbers, which silently failed
+    // (`container_click`'s window-id check) for the entire time any other
+    // task -- `/getitem`, a chest transfer, ... -- had a container open,
+    // stalling auto-equip until it closed. See
+    // `MinecraftClient::active_menu_window`'s doc comment.
+    let Ok(active) = minecraft.active_menu_window().await else {
+        return false;
+    };
+    let (Some(source), Some(destination)) =
+        (active.translate(source), active.translate(destination))
+    else {
+        // Armor/offhand while a non-player menu is open -- no equivalent
+        // slot exists until it closes; retried fresh next tick like every
+        // other equip decision in this module.
+        return false;
+    };
     for slot in [source, destination, source] {
         let click = InventoryClick {
             slot,
             button: ClickButton::Left,
         };
-        if minecraft
-            .container_click(PLAYER_INVENTORY_WINDOW, click)
-            .await
-            .is_err()
-        {
+        let outcome = if during_consume {
+            minecraft
+                .container_click_during_consume(active.window_id, click)
+                .await
+        } else {
+            minecraft.container_click(active.window_id, click).await
+        };
+        if outcome.is_err() {
             return false;
         }
     }

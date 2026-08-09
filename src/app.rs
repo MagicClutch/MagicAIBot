@@ -1,6 +1,7 @@
 use std::{
     collections::{HashMap, VecDeque},
     path::Path,
+    sync::Mutex,
     time::{Duration, Instant, SystemTime},
 };
 
@@ -411,7 +412,11 @@ async fn await_navigation_terminal(app: &App, input_rx: &mut InputReceiver) -> W
 async fn await_kill_terminal(app: &App, input_rx: &mut InputReceiver) -> WaitOutcome {
     loop {
         app.look.tick(&app.minecraft).await;
-        app.pvp.tick(&app.minecraft, &app.look).await;
+        app.pvp.tick(&app.minecraft, &app.movement, &app.look).await;
+        // A long-range `#kill` approach hands control to the normal
+        // pathfinder (see `crate::combat::executor`), which needs this tick
+        // to refresh its goal and notice arrival just as `/goto` does.
+        app.movement.tick(&app.minecraft, false).await;
         app.survival
             .tick(
                 &app.minecraft,
@@ -490,6 +495,9 @@ async fn wait_tick(
     // to the top-level select loop. See `read_only_commands_from_chat`'s doc
     // comment.
     read_only_commands_from_chat(app).await;
+    // Answered inline and the wait continues: a status request is not a
+    // reason to interrupt whatever the bot is doing.
+    answer_chat_status_queries(app).await;
     flush_outgoing_chat(&app.minecraft).await;
     // Piped stdout (Docker/Pelican, `> logfile`, any process manager
     // capturing this process) can fall back to block buffering instead of
@@ -523,6 +531,75 @@ async fn wait_tick(
                 }
             }
         },
+    }
+}
+
+/// Parses a `#`-prefixed chat line into a read-only status query.
+///
+/// `None` for anything that isn't one -- an action command, a malformed
+/// command, or ordinary chat -- which is exactly what keeps `#goto` or
+/// `#kill` from starting while another task is already running. Only
+/// queries that cannot touch the bot's task get through here; everything
+/// else stays queued for the normal drain once the task finishes.
+fn chat_status_query(text: &str) -> Option<ConsoleInput> {
+    let command_text = text.trim().strip_prefix('#')?.trim();
+    if command_text.is_empty() {
+        return None;
+    }
+    let input = console::commands::parse_input(&format!("/{command_text}")).ok()?;
+    match &input {
+        ConsoleInput::Command(command) if is_read_only_query(command) => Some(input),
+        _ => None,
+    }
+}
+
+/// Answers status requests typed in chat *while a task is running*.
+///
+/// Every blocking command wait in this file is inline inside the single
+/// `select!` loop in `App::run`, so `App::tick_chat_commands` -- the normal
+/// chat drain -- cannot run for as long as a `#goto`, `#kill` or `#get` is
+/// in progress. Without this, asking the bot for its inventory mid-task got
+/// no answer until the task ended, which for a long trip could be minutes.
+///
+/// Deliberately narrow: it takes only messages that parse to a *read-only*
+/// query ([`chat_status_query`]) out of the incoming buffer and answers them
+/// through [`App::handle_inert_input`], the same executor the local console
+/// uses for queries during a wait. Anything that would start, redirect or
+/// stop work is left untouched in the buffer, so two actions can never run
+/// at once -- an in-game `#stop` is the one exception, and it has its own
+/// path (see [`emergency_stop_from_chat`]).
+///
+/// Access control and the per-player rate limit both still apply, exactly as
+/// they do for chat commands handled the normal way.
+async fn answer_chat_status_queries(app: &App) {
+    while let Some(chat) = app
+        .minecraft
+        .take_matching_incoming_player_chat(|chat| {
+            chat.kind == crate::minecraft::world_state::ChatMessageKind::Player
+                && chat_status_query(&chat.text).is_some()
+        })
+        .await
+    {
+        let Some(input) = chat_status_query(&chat.text) else {
+            continue;
+        };
+        let Some(sender) = chat.sender else {
+            continue;
+        };
+        if !app.chat_access_allowed(&sender) {
+            logging::warning(format!(
+                "[Chat] Status request from {sender} rejected: access denied"
+            ));
+            continue;
+        }
+        if !app.consume_chat_rate_limit(&sender, chat.sender_uuid) {
+            logging::warning(format!(
+                "[Chat] Status request from {sender} rejected: rate limited"
+            ));
+            continue;
+        }
+        logging::info(format!("[Chat] {sender} ran: {}", chat.text.trim()));
+        app.handle_inert_input(&input).await;
     }
 }
 
@@ -651,7 +728,12 @@ pub struct App {
     hotbar_equipment: HotbarEquipmentService,
     survival: SurvivalController,
     emergency_stop: EmergencyStop,
-    chat_rate_limits: HashMap<String, VecDeque<Instant>>,
+    /// Per-player chat-command rate limiter. Behind a lock rather than a
+    /// plain field because it is consumed from two places now: the normal
+    /// `&mut self` chat drain, and the read-only query path that answers
+    /// status requests mid-task through a shared `&App` (see
+    /// [`answer_chat_status_queries`]).
+    chat_rate_limits: Mutex<HashMap<String, VecDeque<Instant>>>,
     session_ready: bool,
     started_at: Instant,
 }
@@ -738,7 +820,7 @@ impl App {
             ),
             survival: SurvivalController::new(config.survival.clone()),
             emergency_stop: EmergencyStop::new(),
-            chat_rate_limits: HashMap::new(),
+            chat_rate_limits: Mutex::new(HashMap::new()),
             session_ready: false,
             config,
             shutdown: CancellationToken::new(),
@@ -787,7 +869,7 @@ impl App {
                             self.session_ready = false;
                             self.interaction.cancel(&self.minecraft, &self.movement, &self.look).await;
                             self.combat.cancel(&self.minecraft, &self.movement, &self.look).await;
-                            self.pvp.cancel(&self.minecraft, &self.look).await;
+                            self.pvp.cancel(&self.minecraft, &self.movement, &self.look).await;
                             self.pathfinding.cancel(&self.minecraft, &self.movement).await;
                             self.block_navigation.cancel(&self.minecraft, &self.movement).await;
                             self.look.cancel().await;
@@ -836,7 +918,7 @@ impl App {
                     self.block_navigation.tick(&self.minecraft, &self.movement).await;
                     self.interaction.tick(&self.minecraft, &self.movement, &self.look).await;
                     self.combat.tick(&self.minecraft, &self.movement, &self.look).await;
-                    self.pvp.tick(&self.minecraft, &self.look).await;
+                    self.pvp.tick(&self.minecraft, &self.movement, &self.look).await;
                     self.container.tick(&self.minecraft, &self.movement, &self.block_navigation, &self.look).await;
                     self.equipment.tick(&self.minecraft).await;
                     self.hotbar_equipment.tick(&self.minecraft).await;
@@ -883,7 +965,9 @@ impl App {
         self.combat
             .cancel(&self.minecraft, &self.movement, &self.look)
             .await;
-        self.pvp.cancel(&self.minecraft, &self.look).await;
+        self.pvp
+            .cancel(&self.minecraft, &self.movement, &self.look)
+            .await;
         let _ = self.movement.stop(&self.minecraft).await;
         self.minecraft.disconnect().await?;
         if let Some(task) = console_task {
@@ -938,7 +1022,9 @@ impl App {
                                 | ConsoleCommand::StopMovement
                         )
                     {
-                        self.pvp.cancel(&self.minecraft, &self.look).await;
+                        self.pvp
+                            .cancel(&self.minecraft, &self.movement, &self.look)
+                            .await;
                     }
                     // Exactly the same hazard for long-distance navigation
                     // (`crate::pathfinding`), which also keeps ticking in the
@@ -1215,7 +1301,9 @@ impl App {
                             self.combat
                                 .cancel(&self.minecraft, &self.movement, &self.look)
                                 .await;
-                            self.pvp.cancel(&self.minecraft, &self.look).await;
+                            self.pvp
+                                .cancel(&self.minecraft, &self.movement, &self.look)
+                                .await;
                             self.block_navigation
                                 .cancel(&self.minecraft, &self.movement)
                                 .await;
@@ -1242,7 +1330,9 @@ impl App {
                             self.combat
                                 .cancel(&self.minecraft, &self.movement, &self.look)
                                 .await;
-                            self.pvp.cancel(&self.minecraft, &self.look).await;
+                            self.pvp
+                                .cancel(&self.minecraft, &self.movement, &self.look)
+                                .await;
                             self.block_navigation
                                 .cancel(&self.minecraft, &self.movement)
                                 .await;
@@ -1268,7 +1358,9 @@ impl App {
                             self.combat
                                 .cancel(&self.minecraft, &self.movement, &self.look)
                                 .await;
-                            self.pvp.cancel(&self.minecraft, &self.look).await;
+                            self.pvp
+                                .cancel(&self.minecraft, &self.movement, &self.look)
+                                .await;
                             self.block_navigation
                                 .cancel(&self.minecraft, &self.movement)
                                 .await;
@@ -1567,16 +1659,23 @@ impl App {
                         }
                         ConsoleCommand::ContainerStatus => {
                             let s = self.container.status().await;
+                            let detail = s
+                                .detail
+                                .as_deref()
+                                .map_or_else(String::new, |d| format!(" ({d})"));
                             println!(
-                                "Container: {:?}; target={:?}; menu={:?}; transferred={}/{}; outcome={:?}{}",
+                                "Container: {:?}; target={:?}; menu={:?}; transferred={}/{}; outcome={:?}{detail}",
                                 s.phase,
                                 s.target,
                                 s.window_id,
                                 s.transferred,
                                 s.requested,
                                 s.outcome,
-                                s.detail.map(|d| format!(" ({d})")).unwrap_or_default()
                             );
+                            logging::info(format!(
+                                "Container: {:?} target={:?} transferred={}/{} outcome={:?}{detail}",
+                                s.phase, s.target, s.transferred, s.requested, s.outcome,
+                            ));
                         }
                         ConsoleCommand::CloseContainer => {
                             self.container.close(&self.minecraft).await
@@ -1720,6 +1819,14 @@ impl App {
             "  opened: {:?}  observed: {:?}  closed: {:?}",
             snapshot.opened_at, snapshot.observed_at, snapshot.closed_at
         );
+        logging::info(format!(
+            "Container: open={} synced={} state={:?} slots={}/{}",
+            snapshot.is_open,
+            snapshot.is_synced,
+            snapshot.sync_state,
+            snapshot.container_slots.len(),
+            snapshot.player_slots.len()
+        ));
     }
 
     async fn find_blocks(&self, block_id: String, radius: Option<u32>, limit: Option<usize>) {
@@ -1756,6 +1863,7 @@ impl App {
         let snapshot = self.block_navigation.snapshot().await;
         if matches!(snapshot.state, BlockNavigationState::Idle) {
             println!("No block navigation task is active.");
+            logging::info("No block navigation task is active");
             return;
         }
         let state = match snapshot.state {
@@ -1822,6 +1930,15 @@ impl App {
                 .start_time
                 .map_or(0, |started| started.elapsed().unwrap_or_default().as_secs())
         );
+        logging::info(format!(
+            "GotoBlock: {state} block={} distance={}{}",
+            snapshot.requested_block_id.as_deref().unwrap_or("unknown"),
+            distance.map_or_else(|| "unknown".into(), |value| format!("{value:.1}")),
+            snapshot
+                .failure_reason
+                .as_deref()
+                .map_or_else(String::new, |reason| format!(" ({reason})"))
+        ));
         if let Some(reason) = snapshot.failure_reason {
             println!("Failure reason: {reason}");
         }
@@ -1836,19 +1953,22 @@ impl App {
         if navigation.state != NavigationState::Idle {
             println!("{}", crate::pathfinding::debug::format_status(&navigation));
         }
-        match self.minecraft.navigation_status().await {
-            Ok(status) if status.calculating => println!("Pathfinder: calculating"),
-            Ok(status) if status.executing => println!("Pathfinder: following path"),
-            Ok(status) if status.reached => println!("Pathfinder: completed"),
-            Ok(_) => println!("Pathfinder: idle or no path"),
-            Err(error) => println!("Pathfinder unavailable: {error}"),
-        }
+        let pathfinder_summary = match self.minecraft.navigation_status().await {
+            Ok(status) if status.calculating => "calculating".to_owned(),
+            Ok(status) if status.executing => "following path".to_owned(),
+            Ok(status) if status.reached => "completed".to_owned(),
+            Ok(_) => "idle or no path".to_owned(),
+            Err(error) => format!("unavailable ({error})"),
+        };
+        println!("Pathfinder: {pathfinder_summary}");
+        logging::info(format!("Pathfinder: {pathfinder_summary}"));
     }
 
     async fn print_look_status(&self) {
         let snapshot = self.look.snapshot().await;
         if snapshot.state == LookState::Idle {
             println!("No look task is active.");
+            logging::info("No look task is active");
             return;
         }
         let state = match snapshot.state {
@@ -1889,6 +2009,16 @@ impl App {
                 .unwrap_or_default()
                 .as_secs_f64())
         );
+        logging::info(format!(
+            "Look: {state} target={} yaw={} pitch={}{}",
+            snapshot.target.as_deref().unwrap_or("unknown"),
+            fmt_opt(snapshot.yaw),
+            fmt_opt(snapshot.pitch),
+            snapshot
+                .failure_reason
+                .as_deref()
+                .map_or_else(String::new, |reason| format!(" ({reason})"))
+        ));
         if let Some(reason) = snapshot.failure_reason {
             println!("Failure reason: {reason}");
         }
@@ -1898,6 +2028,7 @@ impl App {
         let snapshot = self.interaction.snapshot().await;
         if snapshot.state == InteractionState::Idle {
             println!("No interaction is active.");
+            logging::info("No interaction is active");
             return;
         }
         println!("State: {:?}", snapshot.state);
@@ -1925,6 +2056,18 @@ impl App {
                 .as_secs_f64())
         );
         println!("Retries: {}", snapshot.retries);
+        logging::info(format!(
+            "Interaction: {:?} target={} progress={}{}",
+            snapshot.state,
+            snapshot.target.as_deref().unwrap_or("unknown"),
+            snapshot
+                .progress_percent
+                .map_or_else(|| "not available".into(), |value| format!("{value}%")),
+            snapshot
+                .failure_reason
+                .as_deref()
+                .map_or_else(String::new, |reason| format!(" ({reason})"))
+        ));
         if let Some(reason) = snapshot.failure_reason {
             println!("Failure reason: {reason}");
         }
@@ -2014,6 +2157,25 @@ impl App {
             "Application uptime: {} seconds",
             self.started_at.elapsed().as_secs()
         );
+        logging::info(format!(
+            "Status: {:?} pos={} dim={} health={}/{} food={} task={}",
+            status.connection_state,
+            world.bot.position.map_or_else(
+                || "unknown".into(),
+                |p| format!("{:.1} {:.1} {:.1}", p.x, p.y, p.z)
+            ),
+            world.bot.dimension.as_deref().unwrap_or("unknown"),
+            fmt_opt(world.bot.health),
+            fmt_opt(world.bot.maximum_health),
+            world
+                .bot
+                .food_level
+                .map_or_else(|| "unknown".into(), |v| v.to_string()),
+            world
+                .current_task
+                .as_ref()
+                .map_or("none", |t| t.name.as_str())
+        ));
     }
 
     async fn print_where(&self) {
@@ -2055,9 +2217,13 @@ impl App {
         let world = self.minecraft.world_state_snapshot().await;
         if world.players.is_empty() {
             println!("No known players.");
+            logging::info("No known players nearby");
             return;
         }
-        for player in world.players {
+        const CHAT_NAME_LIMIT: usize = 5;
+        let mut names: Vec<&str> = Vec::with_capacity(world.players.len());
+        for player in &world.players {
+            names.push(&player.username);
             let distance = player
                 .distance
                 .map_or_else(|| "unknown".into(), |d| format!("{d:.1}"));
@@ -2070,6 +2236,22 @@ impl App {
                 player.username, player.uuid, distance, position, player.loaded
             );
         }
+        let shown = names
+            .iter()
+            .take(CHAT_NAME_LIMIT)
+            .copied()
+            .collect::<Vec<_>>()
+            .join(", ");
+        let more = names.len().saturating_sub(CHAT_NAME_LIMIT);
+        logging::info(format!(
+            "Players nearby: {} ({shown}{})",
+            names.len(),
+            if more > 0 {
+                format!(", +{more} more")
+            } else {
+                String::new()
+            }
+        ));
     }
 
     async fn print_inventory(&self) {
@@ -2130,6 +2312,20 @@ impl App {
                 name
             );
         }
+        logging::info(format!(
+            "Inventory: slot={} holding={} occupied={}/{} distinct={}",
+            world
+                .inventory
+                .selected_hotbar_slot
+                .map_or_else(|| "unknown".into(), |v| v.to_string()),
+            world.inventory.selected_item().map_or_else(
+                || "unknown".into(),
+                |i| format!("{} x{}", i.item_id.as_deref().unwrap_or("unknown"), i.count)
+            ),
+            used_slots,
+            world.inventory.slots.len(),
+            world.inventory.total_counts.len()
+        ));
     }
 
     /// Lets a player run a real console command directly from Minecraft chat
@@ -2202,18 +2398,18 @@ impl App {
                 .any(|name| name.eq_ignore_ascii_case(player_name))
     }
 
-    fn consume_chat_rate_limit(
-        &mut self,
-        player_name: &str,
-        player_uuid: Option<uuid::Uuid>,
-    ) -> bool {
+    fn consume_chat_rate_limit(&self, player_name: &str, player_uuid: Option<uuid::Uuid>) -> bool {
         let limit = &self.config.chat_commands.rate_limit;
         if !limit.enabled {
             return true;
         }
         let key = player_uuid.map_or_else(|| player_name.to_ascii_lowercase(), |id| id.to_string());
         let now = Instant::now();
-        let entries = self.chat_rate_limits.entry(key).or_default();
+        let mut limits = self
+            .chat_rate_limits
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let entries = limits.entry(key).or_default();
         while entries
             .front()
             .is_some_and(|at| now.duration_since(*at) >= Duration::from_secs(limit.window_seconds))
@@ -2251,15 +2447,18 @@ impl App {
         let radius = f64::from(radius.unwrap_or(64));
         if !(radius > 0.0 && radius <= 256.0) {
             println!("Entity query error: radius must be between 0 and 256");
+            logging::warning("Entity query error: radius must be between 0 and 256");
             return;
         }
-        for entity in world
+        const CHAT_TYPE_LIMIT: usize = 5;
+        let nearby: Vec<_> = world
             .entities
             .iter()
             .filter(|e| e.alive != Some(false) && e.health.is_none_or(|health| health > 0.0))
             .filter(|e| e.distance <= radius)
             .take(64)
-        {
+            .collect();
+        for entity in &nearby {
             println!(
                 "{} | distance {:.1} | {:.2} {:.2} {:.2}",
                 entity.entity_type,
@@ -2269,6 +2468,24 @@ impl App {
                 entity.position.z
             );
         }
+        let types = nearby
+            .iter()
+            .map(|e| e.entity_type.as_str())
+            .take(CHAT_TYPE_LIMIT)
+            .collect::<Vec<_>>()
+            .join(", ");
+        let more = nearby.len().saturating_sub(CHAT_TYPE_LIMIT);
+        logging::info(format!(
+            "Entities within {radius:.0}m: {}{}",
+            nearby.len(),
+            if nearby.is_empty() {
+                String::new()
+            } else if more > 0 {
+                format!(" ({types}, +{more} more)")
+            } else {
+                format!(" ({types})")
+            }
+        ));
     }
 
     async fn print_movement(&self) {
@@ -2315,6 +2532,21 @@ impl App {
             local_input.sprint,
             local_input.speed_multiplier * 100.0,
         );
+        logging::info(format!(
+            "Movement: {:?} dest={} remaining={}{}",
+            movement.status,
+            movement.destination.map_or_else(
+                || "unknown".into(),
+                |p| format!("{:.1} {:.1} {:.1}", p.x, p.y, p.z)
+            ),
+            movement
+                .estimated_distance
+                .map_or_else(|| "unknown".into(), |d| format!("{d:.1}")),
+            movement
+                .failure_reason
+                .as_deref()
+                .map_or_else(String::new, |reason| format!(" ({reason})"))
+        ));
         if let Some(reason) = movement.failure_reason {
             println!("Failure reason: {reason}");
         }
@@ -3561,16 +3793,18 @@ impl App {
                 }
                 ConsoleCommand::ContainerStatus => {
                     let s = self.container.status().await;
+                    let detail = s
+                        .detail
+                        .as_deref()
+                        .map_or_else(String::new, |d| format!(" ({d})"));
                     println!(
-                        "Container: {:?}; target={:?}; menu={:?}; transferred={}/{}; outcome={:?}{}",
-                        s.phase,
-                        s.target,
-                        s.window_id,
-                        s.transferred,
-                        s.requested,
-                        s.outcome,
-                        s.detail.map(|d| format!(" ({d})")).unwrap_or_default()
+                        "Container: {:?}; target={:?}; menu={:?}; transferred={}/{}; outcome={:?}{detail}",
+                        s.phase, s.target, s.window_id, s.transferred, s.requested, s.outcome,
                     );
+                    logging::info(format!(
+                        "Container: {:?} target={:?} transferred={}/{} outcome={:?}{detail}",
+                        s.phase, s.target, s.transferred, s.requested, s.outcome,
+                    ));
                     true
                 }
                 _ => false,
@@ -3995,5 +4229,108 @@ mod drop_tests {
             drop_insufficient_error("diamond", 5, 3),
             AppError::InsufficientItemsForDrop { item, have: 3, need: 5 } if item == "diamond"
         ));
+    }
+}
+
+#[cfg(test)]
+mod concurrent_status_tests {
+    use super::*;
+
+    /// Everything a player can usefully ask for while the bot is busy.
+    const STATUS_QUERIES: &[&str] = &[
+        "#inventory",
+        "#status",
+        "#where",
+        "#health",
+        "#players",
+        "#entities",
+        "#entities 32",
+        "#path-status",
+        "#movement",
+        "#lookstatus",
+        "#interactionstatus",
+        "#container-status",
+        "#help",
+    ];
+
+    /// Everything that starts, redirects or stops work. None of these may
+    /// run while another task is in progress -- that is the whole point of
+    /// the gate.
+    const ACTIONS: &[&str] = &[
+        "#goto 100 64 -20",
+        "#goto Alex",
+        "#kill Alex",
+        "#follow Alex",
+        "#get diamond 5",
+        "#mine 10 20 30",
+        "#break 1 2 3",
+        "#place stone",
+        "#look 1 2 3",
+        "#drop diamond 1",
+        "#equip",
+        "#stop",
+        "#stopmovement",
+        "#quit",
+    ];
+
+    #[test]
+    fn every_status_request_is_answerable_while_busy() {
+        for text in STATUS_QUERIES {
+            assert!(
+                chat_status_query(text).is_some(),
+                "{text} should be answerable mid-task"
+            );
+        }
+    }
+
+    #[test]
+    fn no_action_command_can_start_while_another_task_runs() {
+        for text in ACTIONS {
+            assert!(
+                chat_status_query(text).is_none(),
+                "{text} must not run concurrently"
+            );
+        }
+    }
+
+    #[test]
+    fn the_two_sets_are_exactly_what_the_dispatcher_agrees_is_read_only() {
+        // `chat_status_query` and `is_read_only_query` must not drift apart:
+        // the first decides what runs concurrently, the second decides what
+        // is safe to run without cancelling a fight first.
+        for text in STATUS_QUERIES {
+            let Some(ConsoleInput::Command(command)) = chat_status_query(text) else {
+                panic!("{text} did not parse as a command");
+            };
+            assert!(is_read_only_query(&command), "{text}");
+        }
+    }
+
+    #[test]
+    fn ordinary_chat_is_never_mistaken_for_a_command() {
+        for text in [
+            "hello there",
+            "inventory",
+            "the # symbol mid sentence",
+            "",
+            "   ",
+            "#",
+            "#   ",
+        ] {
+            assert!(chat_status_query(text).is_none(), "{text:?}");
+        }
+    }
+
+    #[test]
+    fn a_malformed_status_request_is_ignored_rather_than_guessed_at() {
+        for text in ["#entities notanumber", "#outputmode nonsense mode"] {
+            assert!(chat_status_query(text).is_none(), "{text}");
+        }
+    }
+
+    #[test]
+    fn surrounding_whitespace_does_not_stop_a_request_being_answered() {
+        assert!(chat_status_query("  #inventory  ").is_some());
+        assert!(chat_status_query("#  inventory").is_some());
     }
 }

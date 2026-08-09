@@ -2,11 +2,17 @@
 //!
 //! Vanilla awards a critical hit (1.5x damage, the little star particles)
 //! when the attacker hits while falling (not on the ground, moving
-//! downward) and isn't otherwise disqualified (sprinting *into* the hit,
-//! climbing, blind, etc. -- none of which this bot ever does mid-swing, so
-//! those exclusions don't need modeling here). The only lever available is
-//! *when* to attack relative to a jump: jump, let gravity take over for a
-//! couple of ticks, then swing while still airborne and descending.
+//! downward) and isn't otherwise disqualified: sprinting into the hit,
+//! climbing, or blind. [`is_critical_window`] does not itself check for a
+//! live sprint (the movement controller's own sprint decision isn't
+//! plumbed in here) -- a swing that happens to line up with both an
+//! airborne fall *and* the bot still sprinting from closing distance in the
+//! same tick is misreported as a crit in the bot's own logging/counters
+//! even though vanilla would actually apply sprint knockback instead. Both
+//! outcomes are real, useful hits either way; only the bot's own telemetry
+//! about which one landed can be wrong. The only lever genuinely available
+//! here is *when* to attack relative to a jump: jump, let gravity take over
+//! for a couple of ticks, then swing while still airborne and descending.
 //!
 //! # Maximum damage means swinging at exactly 100% charge
 //!
@@ -25,14 +31,21 @@
 //! land every hit at ~62% charge -- the single biggest damage loss available
 //! to a bot that switches to an axe to break shields.
 //!
-//! # A sword hit that isn't a crit is a wasted hit
+//! # A held-for crit is not always the right hit
 //!
-//! With `always_crit_with_sword` on (the default), a sword swing is never
-//! taken flat-footed: if the cooldown comes up while the bot is standing on
-//! the ground with no jump in flight, it jumps *and holds the swing* until
-//! it is falling ([`should_force_crit_jump`]). That costs ~0.3s on that one
-//! hit and buys 1.5x damage, which is a small net DPS gain on its own and a
-//! large one against armor.
+//! With `always_crit` on (off by default -- see
+//! `combat::executor::apply_attack`'s doc comment for why), no swing is
+//! ever taken flat-footed, whatever is in the bot's hand: if the cooldown
+//! comes up while it is standing on the ground with no jump in flight, it
+//! jumps *and holds the swing* until it is falling
+//! ([`should_force_crit_jump`]). That costs ~0.3s on that one hit and buys
+//! 1.5x damage -- more damage on that swing even on a sword's short
+//! cooldown, and more still on an axe's long one, where the hold is a
+//! smaller fraction of the cycle. What it does *not* buy is the sprint
+//! knockback that swing would otherwise have landed (vanilla forces the two
+//! apart -- see [`is_critical_window`]'s note below), which is why holding
+//! for it on every neutral-exchange swing is off by default and reserved
+//! for a finishing blow instead.
 //!
 //! It is bounded by [`CRIT_HOLD_TIMEOUT`] rather than unconditional, because
 //! "jump" is a request the world can refuse: under a low ceiling, in a
@@ -70,6 +83,11 @@ pub fn weapon_cooldown(item_id: Option<&str>) -> Duration {
     };
     let speed = match id.trim_start_matches("minecraft:") {
         id if id.ends_with("_sword") => 1.6,
+        // The slowest of any melee weapon -- see `mace::MACE_COOLDOWN`'s
+        // doc comment for why leaving this unrecognized (falling through
+        // to the 4.0 default below) was a real damage bug, not a cosmetic
+        // one, for any fight where the bot ends up holding one.
+        "mace" => 0.6,
         "trident" => 1.1,
         "wooden_axe" | "stone_axe" => 0.8,
         "iron_axe" => 0.9,
@@ -84,14 +102,6 @@ pub fn weapon_cooldown(item_id: Option<&str>) -> Duration {
         _ => 4.0,
     };
     Duration::from_secs_f64(1.0 / speed)
-}
-
-/// Whether `item_id` is a sword -- the weapon `always_crit_with_sword`
-/// applies to. Deliberately narrow: an axe's 1.0s cooldown already leaves
-/// room for the ordinary pre-jump to line up, whereas a sword's 0.625s is
-/// tight enough that hits routinely come up while the bot is grounded.
-pub fn is_sword(item_id: Option<&str>) -> bool {
-    item_id.is_some_and(|id| id.trim_start_matches("minecraft:").ends_with("_sword"))
 }
 
 /// Whether to jump *now* and hold a ready swing until it can land as a crit.
@@ -315,6 +325,22 @@ mod tests {
     }
 
     #[test]
+    fn a_mace_recharges_slower_than_any_axe_or_sword() {
+        // The bug this guards against: an unrecognized "mace" id used to
+        // fall through to the 4.0 default (250ms), landing hits at roughly
+        // a seventh of the real recharge time.
+        assert_eq!(
+            weapon_cooldown(Some("minecraft:mace")),
+            Duration::from_secs_f64(1.0 / 0.6)
+        );
+        assert!(
+            weapon_cooldown(Some("minecraft:mace"))
+                > weapon_cooldown(Some("minecraft:netherite_axe"))
+        );
+        assert!(weapon_cooldown(Some("minecraft:mace")) > SWORD_COOLDOWN);
+    }
+
+    #[test]
     fn an_unknown_item_or_empty_hand_uses_the_default_attack_speed() {
         assert_eq!(weapon_cooldown(None), Duration::from_millis(250));
         assert_eq!(
@@ -411,16 +437,7 @@ mod tests {
     }
 
     #[test]
-    fn swords_are_recognized_and_other_weapons_are_not() {
-        assert!(is_sword(Some("minecraft:netherite_sword")));
-        assert!(is_sword(Some("wooden_sword")));
-        assert!(!is_sword(Some("minecraft:diamond_axe")));
-        assert!(!is_sword(Some("minecraft:trident")));
-        assert!(!is_sword(None));
-    }
-
-    #[test]
-    fn a_ready_sword_swing_on_the_ground_jumps_instead_of_hitting_flat() {
+    fn a_ready_swing_on_the_ground_jumps_instead_of_hitting_flat() {
         let now = Instant::now();
         assert!(should_force_crit_jump(true, true, None, now, None));
     }
@@ -486,10 +503,36 @@ mod tests {
     }
 
     #[test]
-    fn the_jump_cooldown_never_blocks_a_sword_crit() {
-        // A sword recharges in 625ms; the crit jump has to be available
-        // every cycle or hits land flat.
+    fn the_jump_cooldown_never_blocks_a_crit_on_the_fastest_weapon() {
+        // A sword recharges in 625ms -- the shortest cooldown of any real
+        // melee weapon -- and the crit jump has to be available every cycle
+        // or hits land flat. Anything slower has even more room.
         assert!(JUMP_COOLDOWN < SWORD_COOLDOWN);
+    }
+
+    #[test]
+    fn the_pre_jump_lines_up_on_an_axe_cadence_too() {
+        let now = Instant::now();
+        let axe = Duration::from_millis(1000);
+        assert!(
+            !should_prejump_for_crit(
+                true,
+                true,
+                Some(now),
+                None,
+                now + Duration::from_millis(400),
+                axe
+            ),
+            "too early in the cycle to jump"
+        );
+        assert!(should_prejump_for_crit(
+            true,
+            true,
+            Some(now),
+            None,
+            now + Duration::from_millis(800),
+            axe
+        ));
     }
 
     #[test]

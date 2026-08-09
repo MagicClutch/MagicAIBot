@@ -89,7 +89,10 @@ pub async fn execute(targets: &StopTargets<'_>, emergency: &EmergencyStop) {
         .combat
         .cancel(targets.minecraft, targets.movement, targets.look)
         .await;
-    targets.pvp.cancel(targets.minecraft, targets.look).await;
+    targets
+        .pvp
+        .cancel(targets.minecraft, targets.movement, targets.look)
+        .await;
 
     logging::info("Stopping interactions");
     targets
